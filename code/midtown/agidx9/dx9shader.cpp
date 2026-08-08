@@ -26,6 +26,7 @@
 #include "agiworld/meshlight.h"
 #include "agiworld/meshset.h"
 #include "agiworld/texsheet.h"
+#include "mmcityinfo/state.h"
 #include "stream/stream.h"
 #include "vector7/matrix34.h"
 
@@ -58,6 +59,77 @@ static mem::cmd_param PARAM_d3d9_glowpower {"d3d9glowpower", "Brightness of glow
 static mem::cmd_param PARAM_d3d9_flashpower {"d3d9flashpower", "Brightness of the lightning flash"};
 static mem::cmd_param PARAM_d3d9_cellsize {"d3d9cellsize", "Cluster grid cell size, in world units"};
 static mem::cmd_param PARAM_d3d9_lightspec {"d3d9lightspec", "Specular response from clustered point lights"};
+static mem::cmd_param PARAM_d3d9_sun {"d3d9sun", "Time-of-day and weather driven sun instead of the engine's"};
+
+// Sun direction and colour for the current MMSTATE.TimeOfDay x MMSTATE.Weather.
+//
+// Azimuth as well as elevation, so the sun crosses the sky over the day instead of pivoting in one
+// plane. Values are chosen to read correctly rather than to be astronomically right: the game has no
+// latitude, date or compass, so there is nothing to be accurate *to*, and the useful target is that
+// each preset be recognisable at a glance and that shadows and specular highlights fall somewhere
+// plausible for the hour.
+static void agiDX9ComputeSunLight(Vector3& out_dir, Vector3& out_color)
+{
+    struct SunPreset
+    {
+        f32 ElevationDeg; // above the horizon; negative is below it
+        f32 AzimuthDeg;   // 0 = +Z, increasing toward +X
+        f32 R, G, B;      // colour at full strength
+    };
+
+    // Night is a moon, not a sun. Giving it a below-horizon sun would be more literal and worse:
+    // the directional term would vanish entirely and the whole night rig would collapse onto the
+    // ambient hemisphere, flattening exactly the surfaces - car bodies - that the clustered street
+    // lighting is there to shape. A dim, cool, high key reads as moonlight and keeps the geometry.
+    static const SunPreset kByTime[4] {
+        {18.0f, 95.0f, 1.00f, 0.82f, 0.62f},  // Morning - low, warm, from the east
+        {74.0f, 195.0f, 1.00f, 0.97f, 0.92f}, // Noon - near overhead, almost white
+        {9.0f, 268.0f, 1.00f, 0.55f, 0.30f},  // Sunset - very low, heavily reddened, from the west
+        {52.0f, 25.0f, 0.32f, 0.38f, 0.55f},  // Night - moonlight, cool and dim
+    };
+
+    // Weather scales the sun's strength and pulls it toward the sky's own colour. Overcast does not
+    // merely dim a sunbeam, it converts it into a diffuse source, so the sensible knob here is how
+    // much key light survives as a directional term at all - the rest is already accounted for by
+    // the hemisphere irradiance above.
+    struct WeatherPreset
+    {
+        f32 Scale;
+        f32 Desaturate; // 0 = keep the sun's own hue, 1 = fully neutral
+    };
+
+    static const WeatherPreset kByWeather[4] {
+        {1.00f, 0.00f}, // Sun
+        {0.55f, 0.65f}, // Fog   - washed out and neutral
+        {0.38f, 0.75f}, // Rain  - the dimmest, and coldest
+        {0.70f, 0.55f}, // Snow  - dim sun, but snow scatters a lot back up
+    };
+
+    const i32 time_index = std::clamp(static_cast<i32>(MMSTATE.TimeOfDay), 0, 3);
+    const i32 weather_index = std::clamp(static_cast<i32>(MMSTATE.Weather), 0, 3);
+
+    const SunPreset& time = kByTime[time_index];
+    const WeatherPreset& weather = kByWeather[weather_index];
+
+    constexpr f32 kDeg = 3.14159265f / 180.0f;
+
+    const f32 elevation = time.ElevationDeg * kDeg;
+    const f32 azimuth = time.AzimuthDeg * kDeg;
+
+    // Pointing TOWARD the light, matching what agiMeshLighter* stores and what the shader expects.
+    const f32 horizontal = std::cos(elevation);
+
+    out_dir.x = horizontal * std::sin(azimuth);
+    out_dir.y = std::sin(elevation);
+    out_dir.z = horizontal * std::cos(azimuth);
+
+    const f32 luma = (time.R * 0.299f) + (time.G * 0.587f) + (time.B * 0.114f);
+    const f32 desat = weather.Desaturate;
+
+    out_color.x = (time.R + ((luma - time.R) * desat)) * weather.Scale;
+    out_color.y = (time.G + ((luma - time.G) * desat)) * weather.Scale;
+    out_color.z = (time.B + ((luma - time.B) * desat)) * weather.Scale;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Shader compilation
@@ -943,8 +1015,28 @@ void agiDX9WorldShader::Setup(IDirect3DDevice9* device, const agiDX9WorldDrawInf
     // The static sun/fill/fill rig, in world space. agiMeshLighter* directions already point toward
     // the light, which is what the shader wants - no negation here, unlike the D3DLIGHT9 path in
     // dx9rsys.cpp, whose directions describe travel instead.
-    const Vector3 dirs[3] {agiMeshLighterSun, agiMeshLighterFill1, agiMeshLighterFill2};
-    const Vector3 cols[3] {agiMeshLighterSunColor, agiMeshLighterFill1Color, agiMeshLighterFill2Color};
+    Vector3 dirs[3] {agiMeshLighterSun, agiMeshLighterFill1, agiMeshLighterFill2};
+    Vector3 cols[3] {agiMeshLighterSunColor, agiMeshLighterFill1Color, agiMeshLighterFill2Color};
+
+    // Replace the engine's sun with one that actually tracks the time of day and the weather.
+    //
+    // The original moves the sun in ONE axis and only for three of the four presets. fix_sun()
+    // (game.asm ~178055) builds the direction from an elevation and an azimuth held in two globals,
+    // but the azimuth is written once, to zero, and never again - so the sun only ever rises and
+    // sets in a single plane. The elevation comes from a jump table on MMSTATE.TimeOfDay that sets
+    // Morning to 0.70 rad, Noon to 1.396 and Sunset to 2.618, and has no case for Night at all,
+    // which leaves whatever the previous preset wrote still standing. Weather never touches it.
+    //
+    // For a per-pixel path that is the wrong key light in three ways at once: the sun does not move
+    // across the sky, night is lit by a stale daytime sun, and an overcast sky is as hard and as
+    // warm as a clear one. All three are very visible on car paint, which is the one surface in the
+    // game whose whole appearance is a specular response to the key light.
+    //
+    // Pathway B only, deliberately: agiMeshLighterSun is still what the CPU rig and the D3DLIGHT9
+    // fixed-function path read, and rewriting the global would change Pathway A's output, which is
+    // the parity baseline (dx9_rendering_pathways.md §2). -d3d9sun 0 restores the engine's own.
+    if (PARAM_d3d9_sun.get_or(true))
+        agiDX9ComputeSunLight(dirs[0], cols[0]);
 
     f32 light_dirs[12] {};
     f32 light_cols[12] {};
