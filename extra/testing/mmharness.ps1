@@ -258,17 +258,29 @@ function Save-MMShot {
     return $true
 }
 
-# The menus run at 640x480 and gameplay at the chosen resolution, so client width is a far more
-# reliable "are we in yet" signal than a fixed sleep.
+# "Are we in the city yet?"
+#
+# NOT client width. That was the first attempt and it is wrong: gameplay only runs wider than the
+# 640x480 menus if the player's profile asks for a wider resolution, and a profile set to 640x480
+# makes the test unpassable - which looks exactly like the menu navigation failing, and cost a
+# debugging session to work out.
+#
+# The census is the honest signal. It reports world-space triangles submitted per frame, which is
+# zero on every menu and immediately non-zero once a city is drawing.
 function Wait-MMGameplay {
-    param([int]$TimeoutSeconds = 90, [int]$MenuWidth = 640)
+    param([int]$TimeoutSeconds = 90, [string]$LogPath = 'E:\MM1\Open1560.log')
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 
     while ((Get-Date) -lt $deadline) {
         if (-not (Get-MMProcess)) { return $false }
-        $c = Get-MMClientRect
-        if ($c -and $c.Width -gt $MenuWidth) { return $true }
+
+        $last = Get-MMLogLines 'DX9 CENSUS' -LogPath $LogPath -Last 1
+
+        if ($last -and ($last -match 'world=(\d+) tris') -and ([int]$Matches[1] -gt 200)) {
+            return $true
+        }
+
         Start-Sleep -Seconds 2
     }
 

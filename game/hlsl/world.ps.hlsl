@@ -409,69 +409,62 @@ float4 main(VSOut i, float face : VFACE) : COLOR0
     //
     // g_EnvInfo.w is 0 when no probe could be created, in which case the old flat term is kept -
     // worse looking, still correct.
-    if (g_EnvInfo.w > 0.5f)
+    float3 R = reflect(-V, N);
+
+    if (g_ViewCol[0].w > 0.5f)
     {
-        // g_EnvInfo.z is the draw's reflectivity - 1 on a vehicle body, 0 on everything else. A car
-        // is lacquered, so it reflects far more sharply than the roughness its material table gives
-        // it, which is tuned for the body's diffuse response. Pulling the sampled roughness down
-        // rather than overriding it keeps a matte-painted vehicle matte relative to a glossy one.
+        // --- Vehicle bodywork: the game's own authored reflection map, as a clearcoat ------------
         //
-        // This is what agiRQ.SphMap now controls: the engine's own "vehicle reflections" option,
-        // driving a cubemap lookup instead of the CPU sphere-map pass that cannot run on this path.
-        float refl = g_EnvInfo.z;
-
-        float env_rough = roughness * (1.0f - (refl * 0.75f));
-
-        float3 R = reflect(-V, N);
-
-        float3 env = texCUBElod(g_EnvCube, float4(R, env_rough * g_EnvInfo.x)).rgb;
-
-        // On a car body with an authored sphere map, use the game's own reflection art instead of
-        // the synthesised probe. MM1 drew that texture specifically for bodywork, so it carries the
-        // look the vehicles were designed against - the probe is the fallback for everything the
-        // game never authored a reflection for.
+        // Cars take the sphere map ALONE, not blended with the synthesised probe. MM1 drew that
+        // texture specifically for bodywork and it is what the vehicles were designed against; the
+        // probe exists for the surfaces the game never authored a reflection for.
         //
         // The mapping is the one BuildVehicleReflectionVertices() established for the fixed-function
-        // pass, reproduced here per pixel rather than per vertex: take the reflection vector into
-        // view space, then m = 2*sqrt(Rx^2 + Ry^2 + (Rz+1)^2) and read (Rx/m + 0.5, 0.5 - Ry/m).
-        if (g_ViewCol[0].w > 0.5f)
-        {
-            float3 Rv;
-            Rv.x = dot(R, g_ViewCol[0].xyz);
-            Rv.y = dot(R, g_ViewCol[1].xyz);
-            Rv.z = dot(R, g_ViewCol[2].xyz);
+        // pass, reproduced per pixel rather than per vertex: reflection vector into view space, then
+        // m = 2*sqrt(Rx^2 + Ry^2 + (Rz+1)^2) and read (Rx/m + 0.5, 0.5 - Ry/m).
+        float3 Rv;
+        Rv.x = dot(R, g_ViewCol[0].xyz);
+        Rv.y = dot(R, g_ViewCol[1].xyz);
+        Rv.z = dot(R, g_ViewCol[2].xyz);
 
-            float m = 2.0f * sqrt(dot(Rv.xy, Rv.xy) + ((Rv.z + 1.0f) * (Rv.z + 1.0f)));
+        float m = 2.0f * sqrt(dot(Rv.xy, Rv.xy) + ((Rv.z + 1.0f) * (Rv.z + 1.0f)));
 
-            float2 sph = float2(0.5f, 0.5f);
+        float2 sph = (m > 1e-5f) ? float2((Rv.x / m) + 0.5f, 0.5f - (Rv.y / m)) : float2(0.5f, 0.5f);
 
-            if (m > 1e-5f)
-                sph = float2((Rv.x / m) + 0.5f, 0.5f - (Rv.y / m));
-
-            env = tex2D(g_SphereMap, saturate(sph)).rgb;
-        }
-
-        // A clearcoat lobe on top of the body's own response, rather than in place of it - the
-        // paint underneath still reads as its own colour.
-        float strength = g_EnvInfo.y * (1.0f + (refl * 1.5f));
-
-        // Rough, non-reflective surfaces keep the (1 - roughness) damping.
+        // Fresnel-weighted, and this is the important part.
         //
-        // Removing it wholesale when the probe landed was wrong, and the road said so: asphalt is
-        // enormous, flat and viewed almost edge-on across most of the screen, so EnvBRDFApprox's
-        // grazing Fresnel rise sweeps a bright band down the carriageway - visible as a sheen
-        // running along the road in both directions from the camera. A prefiltered probe fixed the
-        // *colour* of that reflection (a rough road now samples dim ground rather than bright sky)
-        // but not its strength at grazing angles, which is what actually produced the artefact.
+        // Applying the reflection at a near-uniform strength across the panel is what made cars look
+        // shrink-wrapped: real lacquer reflects hard at grazing angles and barely at all head-on, so
+        // a flat application reads as a sticker rather than as a surface. Schlick with a dielectric
+        // clearcoat F0 of 0.04 is the physical answer and costs three instructions - the reflection
+        // now gathers at the edges of a panel and along its curvature, which is where the eye
+        // expects it.
         //
-        // Vehicles are exempt because they are the case the damping was hurting: a lacquered car
-        // genuinely is a near-mirror and should keep its full environment response.
-        strength *= lerp(1.0f - roughness, 1.0f, refl);
+        // The previous 2.5x flat multiplier is gone with it. Full strength at grazing is already
+        // correct; d3d9reflect scales the whole thing if a stronger look is wanted.
+        float fresnel = pow(1.0f - NdotV, 5.0f);
+        float coat = 0.04f + (0.96f * fresnel);
 
-        indirect += env * EnvBRDFApprox(f0, env_rough, NdotV) * strength;
+        indirect += tex2D(g_SphereMap, saturate(sph)).rgb * coat * g_EnvInfo.y;
+    }
+    else if (g_EnvInfo.w > 0.5f)
+    {
+        // --- Everything else: the prefiltered probe ----------------------------------------------
+        //
+        // Rough surfaces keep the (1 - roughness) damping. Removing it wholesale when the probe
+        // landed was wrong, and the road said so: asphalt is enormous, flat and viewed almost
+        // edge-on, so EnvBRDFApprox's grazing Fresnel rise swept a bright band down the carriageway.
+        // The probe fixed the COLOUR of that reflection - a rough road now samples dim ground rather
+        // than bright sky - but not its strength at grazing angles, which is what produced the
+        // artefact.
+        float3 env = texCUBElod(g_EnvCube, float4(R, roughness * g_EnvInfo.x)).rgb;
+
+        indirect += env * EnvBRDFApprox(f0, roughness, NdotV) * g_EnvInfo.y * (1.0f - roughness);
     }
     else
     {
+        // No probe could be created: the flat hemisphere term, as before. Worse looking, still
+        // correct.
         indirect += irradiance * EnvBRDFApprox(f0, roughness, NdotV) * (1.0f - roughness);
     }
 
