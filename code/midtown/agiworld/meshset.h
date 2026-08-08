@@ -257,8 +257,11 @@ public:
     ARTS_EXPORT static b32 MirrorMode;
 
     // MESH_CLIP_*
-    // ?codes@agiMeshSet@@2PAEA | agiworld:meshrend
-    ARTS_EXPORT static u8 codes[16384];
+    //
+    // Was ?codes@agiMeshSet@@2PAEA, exported for the assembly. Nothing in game.asm references it
+    // any more - the last caller went when agiMeshModel::ModelDrawLit was reimplemented in C++ -
+    // so it is a plain static now, and tools/asm.py no longer reports it as an unused export.
+    static u8 codes[16384];
 
 protected:
     // ?ClipTri@agiMeshSet@@IAEXHHHH@Z | agiworld:meshrend
@@ -359,7 +362,7 @@ protected:
 
     // protected, not private: agiMeshModel::ModelDrawLit (agiworld/meshmodel.cpp) routes animated
     // pedestrian geometry through the same path. Safe to widen - this is new C++ with no assembly
-    // caller, so unlike an ARTS_IMPORT/EXPORT member its access level is not part of a linked
+    // caller, so unlike an imported or exported member its access level is not part of a linked
     // symbol name.
 protected:
     // Not part of the original engine/binary. Used by Draw()/DrawLit()/DrawLitEnv()/DrawLitSph()

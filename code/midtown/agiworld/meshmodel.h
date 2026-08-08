@@ -55,12 +55,12 @@ public:
     // ?ModelDraw@agiMeshModel@@QAEHIPAVbnAnimation@@H@Z
     ARTS_IMPORT i32 ModelDraw(u32 arg1, bnAnimation* arg2, i32 arg3);
 
-    // ?ModelDrawLit@agiMeshModel@@QAEHP6AXPAEPAI1PAVagiMeshSet@@@ZIPAVagiLitAnimation@@H@Z
-    //
     // Reimplemented in agiworld/meshmodel.cpp to add the world-space path for pedestrians. The
     // signature is spelled with agiMeshLighter rather than the raw function-pointer type it was
     // written as - they are the same type (meshset.h), so the mangled name the assembly calls is
     // unchanged.
+
+    // ?ModelDrawLit@agiMeshModel@@QAEHP6AXPAEPAI1PAVagiMeshSet@@@ZIPAVagiLitAnimation@@H@Z
     ARTS_EXPORT i32 ModelDrawLit(agiMeshLighter arg1, u32 arg2, agiLitAnimation* arg3, i32 arg4);
 
     // ?ModelDrawSkel@agiMeshModel@@QAEHIPAVbnAnimation@@H@Z

@@ -845,9 +845,9 @@ static bool NativePathEnabled(u32 which)
 bool agiNativePathEnabled(u32 which)
 {
     static const u32 mask = []() -> u32 {
-        // std::getenv is deprecated by MSVC and this build is /WX; the alternatives are either
-        // windows.h in agiworld (invasive) or getenv_s (Annex K). Reading one environment variable
-        // once at startup is not the unsafety the deprecation is aimed at, so suppress it locally.
+    // std::getenv is deprecated by MSVC and this build is /WX; the alternatives are either
+    // windows.h in agiworld (invasive) or getenv_s (Annex K). Reading one environment variable
+    // once at startup is not the unsafety the deprecation is aimed at, so suppress it locally.
 #pragma warning(push)
 #pragma warning(disable : 4996)
         const char* value = std::getenv("OPEN1560_NATIVE_MASK");
@@ -990,7 +990,7 @@ static inline bool IsStaticCityLighter(agiMeshLighter lighter)
 
 // agiConeLighter is deliberately NOT in the list above, and is deliberately kept off the hardware
 // path entirely. It is a genuinely different lighting model - selected only by the `-conelighter`
-// debug switch (mmcity/cullcity.cpp, fix_lighting), still closed ARTS_IMPORT, and named for cone
+// debug switch (mmcity/cullcity.cpp, fix_lighting), still closed assembly, and named for cone
 // geometry rather than the sun/fill/fill rig. Mapping it onto SetupD3D9StaticLights()'s three
 // directionals, as this used to, silently substituted a completely different result for whatever it
 // actually computes. There is no evidence for that mapping, so the honest behaviour is to let it
@@ -1128,7 +1128,7 @@ void agiMeshSet::DrawLitSph(agiMeshLighter lighter, agiTexDef* sph_map, u32 flag
     // vehicles or to the vehicle-select showroom camera.
     //
     // The sphere-map specular overlay stays off on the native path: SphereMap() is closed
-    // ARTS_IMPORT code that reads the CPU Geometry() pass's leftover scratch state, which this
+    // assembly that reads the CPU Geometry() pass's leftover scratch state, which this
     // path never populates, and calling it there hard-crashes.
     //
     // What replaces it is the environment probe (agidx9/dx9probe.h). This is the one entry point
@@ -1163,11 +1163,12 @@ void agiMeshSet::DrawLitEnv(agiMeshLighter lighter, agiTexDef* env_map, Matrix34
         // take MultiTexEnvMap() below - a fully CPU-pretransformed path, invisible to RTX Remix as
         // 3D geometry. Prefer the hardware-transform path and drop the env-map reflection overlay,
         // for the same reason the non-multitex branch already does: both EnvMap() and
-        // MultiTexEnvMap() are closed ARTS_IMPORT routines that consume the codes/out/firstFacet
+        // MultiTexEnvMap() are closed assembly routines that consume the codes/out/firstFacet
         // scratch state the CPU Geometry() pass leaves behind, which DrawNativeTransform() never
         // populates. Losing the road's shadow/env sheen is a visual downgrade; feeding those
         // routines stale scratch state crashes ("Bug?").
-        if (Pipe()->SupportsNativeTransform() && Normals && CanNativeLight(lighter) && NativePathEnabled(NATIVE_DRAWLITENV))
+        if (Pipe()->SupportsNativeTransform() && Normals && CanNativeLight(lighter) &&
+            NativePathEnabled(NATIVE_DRAWLITENV))
         {
             // `lighter == nullptr` means "do not light this" - the CPU branches below both funnel
             // that case into DrawLit(), which forwards it to Draw() and so to FirstPass() with no
@@ -1680,8 +1681,7 @@ b32 agiMeshSet::DrawNativeTransform(
     for (u32 a = 0; a < AdjunctCount; ++a)
     {
         verts[a].pos = Vertices[VertexIndices[a]];
-        verts[a].normal =
-            has_normals ? (smooth_normals ? smooth_normals[a] : UnpackNormal[Normals[a]]) : filler_normal;
+        verts[a].normal = has_normals ? (smooth_normals ? smooth_normals[a] : UnpackNormal[Normals[a]]) : filler_normal;
         verts[a].color = src_colors ? src_colors[a] : 0xFFFFFFFF;
         verts[a].tu = TexCoords ? TexCoords[a].x : 0.0f;
         verts[a].tv = TexCoords ? TexCoords[a].y : 0.0f;
@@ -1896,7 +1896,6 @@ i32 agiMeshSet::ShadowGeometry(u32 flags, Vector3* verts, const Vector4& plane, 
 // ?CurrentMeshCard@@3UagiMeshCardInfo@@A
 ARTS_IMPORT extern agiMeshCardInfo CurrentMeshCard;
 
-
 // --- Glow light harvesting (see agiworld/glowlight.h) -----------------------------------------
 
 agiGlowLight agiGlowLights[AGI_MAX_GLOW_LIGHTS] {};
@@ -1915,7 +1914,6 @@ f32 agiLightningFlash = 0.0f;
 // and assigned values to every registered parameter - so it registers too late and silently
 // never receives its value, no matter what the user passes on the command line.
 static mem::cmd_param PARAM_glowdebug {"glowdebug", "Log glow lights as they are harvested"};
-
 
 // Per-kind intensity, because these are not one population.
 //
@@ -1936,7 +1934,8 @@ static mem::cmd_param PARAM_light_head {"lighthead", "Intensity of vehicle headl
 static mem::cmd_param PARAM_light_vehicle {"lightvehicle", "Intensity of vehicle tail/brake/reverse lights"};
 static mem::cmd_param PARAM_light_traffic {"lighttraffic", "Intensity of traffic signals"};
 static mem::cmd_param PARAM_light_lamp {"lightlamp", "Intensity of street lamps and static lights"};
-static mem::cmd_param PARAM_light_generic {"lightgeneric", "Intensity of neutral-white glows that are not street lamps"};
+static mem::cmd_param PARAM_light_generic {
+    "lightgeneric", "Intensity of neutral-white glows that are not street lamps"};
 
 // Relative saturation above which a colour counts as a pure signal hue rather than a warm white.
 //
@@ -1972,7 +1971,8 @@ static mem::cmd_param PARAM_glow_on_head {"glowheadlights", "Headlight cones emi
 static mem::cmd_param PARAM_glow_on_vehicle {"glowvehiclelights", "Vehicle tail and brake lights emit light"};
 static mem::cmd_param PARAM_glow_on_traffic {"glowtrafficlights", "Traffic signals emit light"};
 static mem::cmd_param PARAM_glow_on_lamp {"glowstreetlamps", "Street lamps emit light"};
-static mem::cmd_param PARAM_glow_on_generic {"glowgenericlights", "Neutral white glows (reverse lamps, coronas) emit light"};
+static mem::cmd_param PARAM_glow_on_generic {
+    "glowgenericlights", "Neutral white glows (reverse lamps, coronas) emit light"};
 
 bool agiGlowKindEnabled(agiGlowKind kind)
 {
@@ -2060,7 +2060,8 @@ f32 agiClassifyGlowIntensity(const char* name, const Vector3& color)
     return PARAM_light_generic.get_or(1.0f);
 }
 
-static mem::cmd_param PARAM_glow_reach_scale {"glowreachscale", "Glow flare half-extent to light reach, in world units"};
+static mem::cmd_param PARAM_glow_reach_scale {
+    "glowreachscale", "Glow flare half-extent to light reach, in world units"};
 static mem::cmd_param PARAM_glow_reach_min {"glowreachmin", "Minimum reach of a glow-driven light, in world units"};
 
 f32 agiGlowLightReach(f32 flare_half_extent)
@@ -2068,8 +2069,7 @@ f32 agiGlowLightReach(f32 flare_half_extent)
     return std::max(flare_half_extent * PARAM_glow_reach_scale.get_or(14.0f), PARAM_glow_reach_min.get_or(20.0f));
 }
 
-void agiAddGlowLightRGB(
-    const Vector3& position, const Vector3& tint, f32 radius, agiTexDef* texture, f32 u, f32 v)
+void agiAddGlowLightRGB(const Vector3& position, const Vector3& tint, f32 radius, agiTexDef* texture, f32 u, f32 v)
 {
     if ((tint.x <= 0.0f) && (tint.y <= 0.0f) && (tint.z <= 0.0f))
         return;

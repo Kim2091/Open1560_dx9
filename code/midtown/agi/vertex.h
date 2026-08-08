@@ -64,7 +64,7 @@ check_size(agiVtx, 0x20);
 
 // Untransformed (model-space) vertex. Unlike agiScreenVtx/agiScreenVtx2, this is not part of
 // the agiVtx union: agiVtx's layout must stay bit-for-bit compatible with the original binary
-// for the ARTS_IMPORT thunks that still operate on it, and no such code ever produces or
+// for the imported thunks that still operate on it, and no such code ever produces or
 // consumes agiWorldVtx - it only exists for the additive agiRasterizer::MeshWorld() path used
 // by renderers with native hardware transform/lighting support (see agidx9).
 struct agiWorldVtx

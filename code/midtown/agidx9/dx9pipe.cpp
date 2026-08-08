@@ -190,7 +190,6 @@ void agiDX9Pipeline::EndGfx()
 // agidx9 are always linked together, so a name clash here is not hypothetical).
 static mem::cmd_param PARAM_d3d9_frameclear {"d3d9frameclear"};
 
-
 void agiDX9Pipeline::BeginFrame()
 {
     ARTS_UTIMED(agiBeginFrame);
@@ -519,8 +518,8 @@ Ptr<agiSurfaceDesc> agiDX9Pipeline::CaptureScreen()
 
     IDirect3DSurface9* sysmem = nullptr;
 
-    if (SUCCEEDED(
-            device->CreateOffscreenPlainSurface(desc.Width, desc.Height, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sysmem, nullptr)))
+    if (SUCCEEDED(device->CreateOffscreenPlainSurface(
+            desc.Width, desc.Height, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sysmem, nullptr)))
     {
         if (SUCCEEDED(device->GetRenderTargetData(backbuffer, sysmem)))
         {

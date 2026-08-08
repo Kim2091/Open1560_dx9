@@ -70,7 +70,7 @@ static D3DFORMAT PickFormat(const agiSurfaceDesc& surface, bool alpha, bool& nee
 
     switch (surface.PixelFormat.RBitMask)
     {
-        case 0xF800: return D3DFMT_R5G6B5; // 565
+        case 0xF800: return D3DFMT_R5G6B5;  // 565
         case 0xF00: return D3DFMT_A4R4G4B4; // 4444
 
         case 0xFF: // R in the low byte ("A8B8G8R8"), not a guaranteed D3D9 format - swizzle to A8R8G8B8
@@ -84,8 +84,8 @@ static D3DFORMAT PickFormat(const agiSurfaceDesc& surface, bool alpha, bool& nee
     }
 }
 
-static void CopyPixels(u8* dst, u32 dst_pitch, const u8* src, u32 src_pitch, u32 width, u32 height, u32 pixel_size,
-    bool needs_swizzle)
+static void CopyPixels(
+    u8* dst, u32 dst_pitch, const u8* src, u32 src_pitch, u32 width, u32 height, u32 pixel_size, bool needs_swizzle)
 {
     for (u32 y = 0; y < height; ++y)
     {
@@ -108,7 +108,6 @@ static void CopyPixels(u8* dst, u32 dst_pitch, const u8* src, u32 src_pitch, u32
         }
     }
 }
-
 
 // Builds the glow colour grid described in dx9texdef.h. `surface` is A8R8G8B8 here: this only runs
 // for AlphaGlow textures, which BeginGfx() has already rebuilt into the pipeline's alpha format.
@@ -257,8 +256,8 @@ i32 agiDX9TexDef::BeginGfx()
 
     IDirect3DDevice9* device = Pipe()->Context()->GetDevice();
 
-    HRESULT hr =
-        device->CreateTexture(surface->Width, surface->Height, num_levels, 0, format, D3DPOOL_MANAGED, &texture_, nullptr);
+    HRESULT hr = device->CreateTexture(
+        surface->Width, surface->Height, num_levels, 0, format, D3DPOOL_MANAGED, &texture_, nullptr);
 
     if (FAILED(hr))
         Quitf("IDirect3DDevice9::CreateTexture failed, code %x", static_cast<u32>(hr));

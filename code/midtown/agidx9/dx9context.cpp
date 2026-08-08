@@ -254,7 +254,8 @@ static D3DFORMAT PickDepthFormat(IDirect3D9* d3d, D3DFORMAT adapter_format)
     {
         if (SUCCEEDED(d3d->CheckDeviceFormat(
                 D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, adapter_format, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_SURFACE, format)) &&
-            SUCCEEDED(d3d->CheckDepthStencilMatch(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, adapter_format, adapter_format, format)))
+            SUCCEEDED(d3d->CheckDepthStencilMatch(
+                D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, adapter_format, adapter_format, format)))
         {
             return format;
         }
@@ -342,7 +343,8 @@ bool agiDX9Context::ResetDevice()
         {
             Errorf("D3D9: Reset returned D3DERR_INVALIDCALL - a D3DPOOL_DEFAULT resource outlived "
                    "agiDX9ReleaseDefaultPoolResources() (%s)",
-                agiDX9HasDefaultPoolResources() ? "registered resources remain" : "no registered resources - unowned allocation");
+                agiDX9HasDefaultPoolResources() ? "registered resources remain"
+                                                : "no registered resources - unowned allocation");
         }
         else
         {

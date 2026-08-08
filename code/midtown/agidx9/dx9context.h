@@ -29,8 +29,8 @@ class agiDX9Context
 public:
     // `adopt`, when non-null, is an existing device this context takes ownership of and resets to
     // the requested size instead of creating a new one. See the parked-device note in dx9pipe.cpp.
-    agiDX9Context(SDL_Window* window, u32 width, u32 height, bool windowed, bool vsync,
-        IDirect3DDevice9* adopt = nullptr);
+    agiDX9Context(
+        SDL_Window* window, u32 width, u32 height, bool windowed, bool vsync, IDirect3DDevice9* adopt = nullptr);
     ~agiDX9Context();
 
     // Hands the device back without releasing it, leaving this context empty. The caller becomes

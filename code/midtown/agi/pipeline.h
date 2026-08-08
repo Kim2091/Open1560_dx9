@@ -125,7 +125,7 @@ public:
     virtual void DumpStatus(agiMemStatus& arg1);
 
     // Not part of the original engine/binary - appended after every original virtual so the
-    // vtable slots ARTS_IMPORT code relies on (by original offset) are left undisturbed.
+    // vtable slots the assembly relies on (by original offset) are left undisturbed.
     // True for renderers that implement agiRasterizer::MeshWorld() with a real hardware
     // transform/lighting pipeline (currently only agidx9).
     virtual bool SupportsNativeTransform() const

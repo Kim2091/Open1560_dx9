@@ -76,7 +76,7 @@ public:
     ARTS_EXPORT virtual void LineList(agiVtxType type, agiVtx* vertices, i32 vertex_count);
 
     // Not part of the original engine/binary - appended after every original virtual so the
-    // vtable slots ARTS_IMPORT code relies on (by original offset) are left undisturbed.
+    // vtable slots the assembly relies on (by original offset) are left undisturbed.
     // Lets a renderer with native hardware transform/lighting (agidx9) draw a facet directly
     // from untransformed model-space data, bypassing agiScreenVtx/RAST->Mesh entirely. Default
     // implementation reports "unsupported" so every other renderer is unaffected.

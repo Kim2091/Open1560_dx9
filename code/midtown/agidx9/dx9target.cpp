@@ -107,8 +107,8 @@ static D3DFORMAT PickTargetFormat(IDirect3D9* d3d, D3DFORMAT adapter_format, D3D
 
     for (u32 i = 0; i < count; ++i)
     {
-        if (SUCCEEDED(d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, adapter_format,
-                D3DUSAGE_RENDERTARGET, D3DRTYPE_TEXTURE, candidates[i])))
+        if (SUCCEEDED(d3d->CheckDeviceFormat(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, adapter_format, D3DUSAGE_RENDERTARGET,
+                D3DRTYPE_TEXTURE, candidates[i])))
         {
             return candidates[i];
         }

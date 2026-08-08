@@ -118,8 +118,9 @@ static void BuildVehicleReflectionVertices(DX9ReflectVtx* output, agiWorldVtx* i
         Vector3 reflect_dir = (normal_view * (2.0f * ndotv)) - view_dir;
         reflect_dir = NormalizeSafe(reflect_dir, {0.0f, 0.0f, 1.0f});
 
-        f32 m = 2.0f * std::sqrt(
-            (reflect_dir.x * reflect_dir.x) + (reflect_dir.y * reflect_dir.y) + ((reflect_dir.z + 1.0f) * (reflect_dir.z + 1.0f)));
+        f32 m = 2.0f *
+            std::sqrt((reflect_dir.x * reflect_dir.x) + (reflect_dir.y * reflect_dir.y) +
+                ((reflect_dir.z + 1.0f) * (reflect_dir.z + 1.0f)));
 
         if (m > 1.0e-5f)
         {
@@ -143,8 +144,8 @@ static void BuildVehicleReflectionVertices(DX9ReflectVtx* output, agiWorldVtx* i
     }
 }
 
-static void DrawVehicleReflectionPass(IDirect3DDevice9* device, agiWorldVtx* vertices,
-    i32 vertex_count, u16* indices, i32 index_count, const Matrix34& world, const Matrix34& view, const agiNativeMaterialFx& fx)
+static void DrawVehicleReflectionPass(IDirect3DDevice9* device, agiWorldVtx* vertices, i32 vertex_count, u16* indices,
+    i32 index_count, const Matrix34& world, const Matrix34& view, const agiNativeMaterialFx& fx)
 {
     if (!fx.ReflectionTexture)
         return;
@@ -176,8 +177,8 @@ static void DrawVehicleReflectionPass(IDirect3DDevice9* device, agiWorldVtx* ver
     device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
     device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
-    device->DrawIndexedPrimitiveUP(
-        D3DPT_TRIANGLELIST, 0, vertex_count, index_count / 3, indices, D3DFMT_INDEX16, reflect_verts, sizeof(DX9ReflectVtx));
+    device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vertex_count, index_count / 3, indices, D3DFMT_INDEX16,
+        reflect_verts, sizeof(DX9ReflectVtx));
 
     device->SetTexture(0, nullptr);
     device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
@@ -417,7 +418,7 @@ static void ApplyTexEnv(IDirect3DDevice9* device, agiTexEnv tex_env)
 }
 
 // Shared by FlushState() and MeshWorld(), for the same reason ApplyTexEnv() is: the native
-// transform path bypasses agiTexSorter::DoTexture() (still closed ARTS_IMPORT, game.asm), which is
+// transform path bypasses agiTexSorter::DoTexture() (still closed assembly, game.asm), which is
 // what binds per-texture material state on the CPU path, so MeshWorld() has to program the blend
 // mode itself rather than inherit whatever the last CPU-path draw happened to leave behind.
 static void ApplyBlendSet(IDirect3DDevice9* device, agiBlendSet blend_set)
@@ -701,11 +702,10 @@ void agiDX9Rasterizer::FlushState()
 
 // Per-frame census of how geometry actually reaches the device, so "is anything still submitted
 // pretransformed?" is answered by counting rather than by reading call sites - most of the engine
-// that draws is still closed ARTS_IMPORT code, so a source audit alone cannot answer it.
+// that draws is still closed assembly, so a source audit alone cannot answer it.
 // Pretransformed (XYZRHW) draws carry no world-space information and are invisible to RTX Remix
 // as 3D geometry, no matter how they look on screen. Dumped by agiDX9Pipeline::EndFrame().
 agiDX9SubmitCensus agiDX9Census {};
-
 
 // Fog must be OFF for additively-composited AlphaGlow content, and the engine says so itself.
 //
@@ -778,8 +778,7 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
     // every following draw that happened not to change fog state.
     if (glow)
     {
-        device->SetRenderState(
-            D3DRS_FOGENABLE, (agiLastState.FogMode != agiFogMode::None) ? TRUE : FALSE);
+        device->SetRenderState(D3DRS_FOGENABLE, (agiLastState.FogMode != agiFogMode::None) ? TRUE : FALSE);
     }
 }
 
@@ -813,7 +812,7 @@ static D3DMATRIX ToD3DMatrix(const Matrix34& m)
 }
 
 // Built directly from agiViewParameters' already-computed projection coefficients (no need to
-// touch the still-ARTS_IMPORT agiViewParameters::Perspective() that derives them). Mathematically
+// touch the still-imported agiViewParameters::Perspective() that derives them). Mathematically
 // equivalent to the CPU M-multiply + ToScreen() every other renderer relies on: with row-vectors
 // v' = v * World * View * Projection, the third row/fourth column here reproduce
 // `z_clip = view_z * ProjZZ + ProjZW` and `w_clip = view_z` exactly as agiMeshSet::Transform() does.
@@ -884,7 +883,7 @@ static void SetupD3D9Lights(IDirect3DDevice9* device)
     i32 enabled = 0;
 
     // agiLighter::ACTIVELIGHTS is a per-object scratch cache written only by the still-closed
-    // ARTS_IMPORT CPU-lighting machinery (agiLighter::LightVertex and friends) - since this
+    // assembly CPU-lighting machinery (agiLighter::LightVertex and friends) - since this
     // world-space path bypasses CPU lighting entirely, that cache is never refreshed for us and
     // can hold dangling pointers left over from lights destroyed since the last CPU-lit draw
     // (this crashed with an access violation here after a race reset tore down its lights).
@@ -984,8 +983,7 @@ bool agiDX9WantsStaticSpecular()
 // directions/colors/ambient below are set to match.
 static void SetupD3D9StaticLights(IDirect3DDevice9* device)
 {
-    auto set_directional = [device](DWORD index, const Vector3& direction_to_light, const Vector3& color)
-    {
+    auto set_directional = [device](DWORD index, const Vector3& direction_to_light, const Vector3& color) {
         D3DLIGHT9 light {};
         light.Type = D3DLIGHT_DIRECTIONAL;
         light.Diffuse = {color.x, color.y, color.z, 1.0f};
@@ -1181,7 +1179,6 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
         device->SetTransform(D3DTS_PROJECTION, &identity);
 }
 
-
 // Harvests a world-space glow mesh as a light source. See agiworld/glowlight.h.
 //
 // The billboard path (agiMeshSet::DrawCard) misses everything vehicle-related: mmCarModel::DrawGlow
@@ -1191,8 +1188,8 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
 // Position and extent come from the submitted geometry rather than from the instance origin,
 // because a tail light sits well off a car's centre and the whole point is that the light lands
 // where the lamp is.
-static void HarvestWorldGlow(agiDX9TexDef* texture, agiWorldVtx* vertices, u16* indices, i32 index_count,
-    const Matrix34& world)
+static void HarvestWorldGlow(
+    agiDX9TexDef* texture, agiWorldVtx* vertices, u16* indices, i32 index_count, const Matrix34& world)
 {
     if (!texture || (index_count <= 0))
         return;
@@ -1243,8 +1240,8 @@ static void HarvestWorldGlow(agiDX9TexDef* texture, agiWorldVtx* vertices, u16* 
 
     for (i32 tri = 0; (tri + 2) < index_count; tri += 3)
     {
-        Vector3 centre = (vertices[indices[tri]].pos + vertices[indices[tri + 1]].pos + vertices[indices[tri + 2]].pos) /
-            3.0f;
+        Vector3 centre =
+            (vertices[indices[tri]].pos + vertices[indices[tri + 1]].pos + vertices[indices[tri + 2]].pos) / 3.0f;
 
         i32 slot = -1;
 
@@ -1322,8 +1319,8 @@ static void HarvestWorldGlow(agiDX9TexDef* texture, agiWorldVtx* vertices, u16* 
         // floor the reach differently - 14 here against 24 there - and since emitted intensity goes
         // with the square of reach, that alone made the same fixture ~3x brighter as a card than as
         // a mesh.
-        agiAddGlowLightRGB(world_centre, tint, agiGlowLightReach(flare_size), texture,
-            cluster.AccumU * inv_verts, cluster.AccumV * inv_verts);
+        agiAddGlowLightRGB(world_centre, tint, agiGlowLightReach(flare_size), texture, cluster.AccumU * inv_verts,
+            cluster.AccumV * inv_verts);
     }
 }
 
@@ -1436,7 +1433,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // background rasterises opaque - a solid black box with the glow inside it.
     //
     // On the CPU path this never arises, because the draw is issued by agiTexSorter::DoTexture()
-    // (closed ARTS_IMPORT, game.asm), which binds blend state per texture from these same flags.
+    // (closed assembly, game.asm), which binds blend state per texture from these same flags.
     // This path bypasses the sorter entirely, so it has to do that binding itself - the same class
     // of omission already fixed above for the texture bind and below for the blend mode.
     bool additive_glow = native_tex && (native_tex->Tex.Props & agiTexProp::AlphaGlow);
@@ -1662,8 +1659,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         // colour and power from the engine's own agiMtlDef (agiCurState.GetMtl()), i.e. real
         // authored material data for cars and movers. The static city rig has no specular concept
         // at all, so it only gets one when explicitly asked for. See SetupD3D9StaticMaterial().
-        device->SetRenderState(
-            D3DRS_SPECULARENABLE, (!static_lighting || agiDX9WantsStaticSpecular()) ? TRUE : FALSE);
+        device->SetRenderState(D3DRS_SPECULARENABLE, (!static_lighting || agiDX9WantsStaticSpecular()) ? TRUE : FALSE);
 
         device->SetRenderState(D3DRS_COLORVERTEX, TRUE);
         device->SetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, D3DMCS_COLOR1);

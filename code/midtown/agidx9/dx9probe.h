@@ -55,7 +55,8 @@ public:
     // Rebuilds the faces, but only when one of the inputs has actually moved - so this is free on
     // the overwhelming majority of frames. Time of day and weather change a handful of times a
     // session; the sun does not move within a preset.
-    void Update(const Vector3& sun_dir, const Vector3& sun_color, const Vector3& sky_color, const Vector3& ground_color);
+    void Update(
+        const Vector3& sun_dir, const Vector3& sun_color, const Vector3& sky_color, const Vector3& ground_color);
 
     IDirect3DCubeTexture9* GetTexture() const
     {

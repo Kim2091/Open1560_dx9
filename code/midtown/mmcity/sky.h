@@ -45,16 +45,16 @@ public:
     //
     // An accessor rather than making DoFlash itself public: MSVC encodes access level into the
     // mangled name (?DoFlash@mmSky@@0HA private vs @2HA public), so widening the access of an
-    // ARTS_IMPORT static changes the symbol being linked against and breaks the import. A member
+    // imported static changes the symbol being linked against and breaks the import. A member
     // function can read it while leaving the mangling alone.
     static i32 IsFlashing();
 
 private:
-    // ?DoFlash@mmSky@@0HA
-    //
     // Set by mmRainAudio::Update when thunder plays, and consumed by mmSky::Draw, which swaps the
     // sky mesh's texture for FlashTex for a single frame and then clears the flag. That makes the
     // lightning a SKY-ONLY effect in the original - the city itself is never lit by it.
+
+    // ?DoFlash@mmSky@@0HA
     ARTS_IMPORT static i32 DoFlash;
 
     // ?Instance@mmSky@@0PAV1@A

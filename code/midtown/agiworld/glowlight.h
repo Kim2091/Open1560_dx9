@@ -211,8 +211,7 @@ void agiAddGlowLight(const Vector3& position, u32 color, f32 scale, agiTexDef* t
 // in the sheet data). That is the engine's own answer to "what colour is this light", which is why
 // a red tail light, an amber indicator and a green traffic light come out right without anything
 // being hard-coded here.
-void agiAddGlowLightRGB(
-    const Vector3& position, const Vector3& tint, f32 radius, agiTexDef* texture, f32 u, f32 v);
+void agiAddGlowLightRGB(const Vector3& position, const Vector3& tint, f32 radius, agiTexDef* texture, f32 u, f32 v);
 
 // Ages the live set and retires lights whose sprite has not been seen for a while.
 // Called once per frame by the pipeline (agidx9/dx9pipe.cpp, BeginFrame).
