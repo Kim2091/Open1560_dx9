@@ -33,6 +33,7 @@ define_dummy_symbol(pcwindis_dxsetup);
 
 static mem::cmd_param PARAM_config {"config"};
 static mem::cmd_param PARAM_sw {"sw"};
+static mem::cmd_param PARAM_d3d9 {"d3d9"};
 
 i32 dxiCpuSpeed = 0;
 
@@ -87,6 +88,18 @@ void dxiConfig([[maybe_unused]] i32 argc, [[maybe_unused]] char** argv)
         for (i32 i = 0; i < dxiRendererCount; ++i)
         {
             if (IsSoftwareRenderer(dxiInfo[i].Type))
+            {
+                dxiRendererChoice = i;
+                break;
+            }
+        }
+    }
+
+    if (PARAM_d3d9)
+    {
+        for (i32 i = 0; i < dxiRendererCount; ++i)
+        {
+            if (dxiInfo[i].Type == dxiRendererType::D3D9)
             {
                 dxiRendererChoice = i;
                 break;

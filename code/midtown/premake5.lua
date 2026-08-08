@@ -5,6 +5,7 @@ include "core"
 
 include "agi"
 
+include "agidx9"
 include "agigl"
 include "agisdl"
 include "agisw"
@@ -75,6 +76,7 @@ project "Open1560"
         "arts_core",
 
         "arts_agi",
+        "arts_agidx9",
         "arts_agigl",
         "arts_agisdl",
         "arts_agisw",

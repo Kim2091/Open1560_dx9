@@ -30,6 +30,9 @@ define_dummy_symbol(mmcity_cullcity);
 #include "agiworld/meshlight.h"
 #include "agiworld/meshset.h"
 #include "agiworld/quality.h"
+#include "sky.h"
+
+#include "agiworld/glowlight.h"
 #include "agiworld/texsheet.h"
 #include "arts7/cullmgr.h"
 #include "arts7/sim.h"
@@ -108,8 +111,30 @@ ARTS_IMPORT /*static*/ void parseVector3(Vector3& arg1);
 // ?ShowRenderStats@@YAXXZ
 ARTS_IMPORT /*static*/ void ShowRenderStats();
 
+i32 mmSky::IsFlashing()
+{
+    return DoFlash;
+}
+
 void mmCullCity::Cull()
 {
+    // Latch the lightning strike so it can light the world, not just the sky.
+    //
+    // mmSky::DoFlash is a single-frame flag raised by mmRainAudio::Update when thunder plays, and
+    // mmSky::Draw clears it as it swaps in FlashTex. Sampling it here - during the cull pass, ahead
+    // of any drawing - is what makes it observable at all; reading it later would always see zero.
+    //
+    // Decayed rather than held for one frame because a strike is not instantaneous: the falloff is
+    // what reads as a flash rather than a dropped frame. Roughly 0.8 per frame gives a visible
+    // flicker of a few frames at any sane frame rate.
+    if (mmSky::IsFlashing())
+        agiLightningFlash = 1.0f;
+    else
+        agiLightningFlash *= 0.80f;
+
+    if (agiLightningFlash < 0.01f)
+        agiLightningFlash = 0.0f;
+
     if (FogEnd == 0.0f || agiCurState.GetDrawMode() == agiDrawDepth)
     {
         agiCurState.SetFogMode(agiFogMode::None);

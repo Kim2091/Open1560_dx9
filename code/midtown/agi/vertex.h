@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include "vector7/vector3.h"
+
 enum class agiVtxType : i32
 {
     VtxType0,
@@ -59,3 +61,18 @@ union agiVtx
 };
 
 check_size(agiVtx, 0x20);
+
+// Untransformed (model-space) vertex. Unlike agiScreenVtx/agiScreenVtx2, this is not part of
+// the agiVtx union: agiVtx's layout must stay bit-for-bit compatible with the original binary
+// for the ARTS_IMPORT thunks that still operate on it, and no such code ever produces or
+// consumes agiWorldVtx - it only exists for the additive agiRasterizer::MeshWorld() path used
+// by renderers with native hardware transform/lighting support (see agidx9).
+struct agiWorldVtx
+{
+    Vector3 pos;
+    Vector3 normal;
+    u32 color;
+    f32 tu, tv;
+};
+
+check_size(agiWorldVtx, 0x24);

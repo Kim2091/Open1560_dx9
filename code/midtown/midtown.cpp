@@ -24,8 +24,11 @@ define_dummy_symbol(midtown);
 #include "agi/physlib.h"
 #include "agi/pipeline.h"
 #include "agi/texdef.h"
+#include "agidx9/dx9config.h"
+#include "agidx9/dx9pipe.h"
 #include "agigl/glpipe.h"
 #include "agisdl/sdlswpipe.h"
+#include "agiworld/quality.h"
 #include "arts7/sim.h"
 #include "data7/args.h"
 #include "data7/cache.h"
@@ -398,6 +401,10 @@ static void GameLoop([[maybe_unused]] mmInterface* mm_interface, [[maybe_unused]
                     CACHE.Age();
                     TEXCACHE.Age();
                 }
+
+                // DX9 no longer calls the original imported SphereMap() routine here. Vehicle
+                // chrome/reflection now routes through agiMeshSet::DrawLitSph()'s DX9-native
+                // replacement path instead, so keep agiRQ.SphMap live for this renderer.
 
                 Sim()->Simulate();
             }
@@ -826,7 +833,14 @@ static void ApplicationHelper(i32 argc, char** argv)
             break;
 
         case 1: // Only allow access to save data (default)
-            HierAllowPath = "players\0"_xconst;
+            // `hlsl` is here so the Pathway B world shaders (agidx9/dx9shader.cpp, game/hlsl) can be
+            // loaded as loose files. They are read-only program assets, the same class of thing as
+            // the `race`/`tune` data allowed by filter 2 - not a widening of what the game can
+            // write. Loose rather than packed into 1560.ar on purpose: a full rebuild of this
+            // project is about seven minutes, and shader iteration that needs no rebuild at all is
+            // the difference between tuning the lighting in an afternoon and in a week. It also
+            // makes the shaders moddable, which packing them would not.
+            HierAllowPath = "players\0hlsl\0"_xconst;
             break;
 
         case 2: // Allow access to tuning data (fasttune)
@@ -891,6 +905,7 @@ Ptr<agiPipeline> CreatePipeline(i32 argc, char** argv)
         switch (info.Type)
         {
             case dxiRendererType::OpenGL: pipe = as_ptr glCreatePipeline(argc, argv); break;
+            case dxiRendererType::D3D9: pipe = as_ptr dx9CreatePipeline(argc, argv); break;
             case dxiRendererType::SDL2: pipe = as_ptr sdlCreatePipeline(argc, argv); break;
             default: Quitf("Unknown renderer type %i", static_cast<int>(info.Type));
         }
@@ -923,6 +938,7 @@ Ptr<agiPipeline> CreatePipeline(i32 argc, char** argv)
         switch (info.Type)
         {
             case dxiRendererType::OpenGL: pipe = as_ptr glCreatePipeline(argc, argv); break;
+            case dxiRendererType::D3D9: pipe = as_ptr dx9CreatePipeline(argc, argv); break;
             case dxiRendererType::SDL2: pipe = as_ptr sdlCreatePipeline(argc, argv); break;
             default: Quitf("Unknown renderer type %i", static_cast<int>(info.Type));
         }
@@ -1175,6 +1191,10 @@ int main(int argc, char** argv)
             argv = new_argv;
         }
     }
+
+    // Before init(argc, argv), deliberately: assignments overwrite, so loading the file first is
+    // what lets a command-line switch override it. See agidx9/dx9config.h.
+    agiDX9LoadShaderConfig();
 
     mem::cmd_param::init(argc, argv);
 

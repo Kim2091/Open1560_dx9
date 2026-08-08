@@ -22,10 +22,14 @@ define_dummy_symbol(agiworld_meshrend);
 
 #include "agi/pipeline.h"
 #include "agi/rsys.h"
+#include "agi/texdef.h"
 #include "agi/viewport.h"
 #include "agisw/swrend.h"
+#include "agiworld/glowlight.h"
+#include "agiworld/meshlight.h"
 #include "agiworld/packnorm.h"
 #include "agiworld/quality.h"
+#include "agiworld/texsheet.h"
 #include "agiworld/texsort.h"
 #include "core/podarray.h"
 #include "data7/b2f.h"
@@ -35,6 +39,8 @@ define_dummy_symbol(agiworld_meshrend);
 #include "pcwindis/setupdata.h"
 #include "vector7/matrix34.h"
 #include "vector7/matrix44.h"
+
+#include <cstdlib>
 
 // #ifdef ARTS_ENABLE_KNI
 // #    define CLIP_ALL_TO_SCREEN
@@ -819,6 +825,34 @@ void agiMeshSet::InitViewport(agiViewParameters& params)
         HalfWidth = -HalfWidth;
 }
 
+// Which draw entry points are allowed to take the hardware-transform path, as a bitmask from the
+// OPEN1560_NATIVE_MASK environment variable (default: all). Exists so a rendering regression can be
+// bisected against a running game in seconds instead of one seven-minute rebuild per hypothesis -
+// set it to 0 to get the original CPU-pretransform behavior back without rebuilding at all.
+#define NATIVE_DRAW 0x1u
+#define NATIVE_DRAWLIT 0x2u
+#define NATIVE_DRAWLITENV 0x4u
+#define NATIVE_DRAWCOLOR 0x8u
+
+static bool NativePathEnabled(u32 which)
+{
+    static const u32 mask = []() -> u32 {
+        // std::getenv is deprecated by MSVC and this build is /WX; the alternatives are either
+        // windows.h in agiworld (invasive) or getenv_s (Annex K). Reading one environment variable
+        // once at startup is not the unsafety the deprecation is aimed at, so suppress it locally.
+#pragma warning(push)
+#pragma warning(disable : 4996)
+        const char* value = std::getenv("OPEN1560_NATIVE_MASK");
+#pragma warning(pop)
+
+        u32 parsed = value ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0xFu;
+        Displayf("DX9 NATIVE_MASK = 0x%X (%s)", parsed, value ? "from environment" : "default");
+        return parsed;
+    }();
+
+    return (mask & which) != 0;
+}
+
 b32 agiMeshSet::Draw(u32 flags)
 {
     // FIXME: Avoid this check
@@ -830,7 +864,27 @@ b32 agiMeshSet::Draw(u32 flags)
 
     if (LockIfResident())
     {
-        if (Geometry(flags, Vertices, Planes) <= 0xFF)
+        // Deliberately not gated on Normals: DrawNativeTransform() submits normal-less meshes
+        // unlit, exactly as FirstPass() would have. Requiring normals here was what kept most
+        // static city scenery and every low-detail LOD on the CPU pretransform path - measured at
+        // ~30% of scene triangles, and growing with scene density.
+        if (Pipe()->SupportsNativeTransform() && NativePathEnabled(NATIVE_DRAW))
+        {
+            // Unlit, unconditionally. Draw() is the *unlit* entry point: its CPU branch below is
+            // FirstPass(Colors, TexCoords, 0xFFFFFFFF), which runs no lighter at all and hands the
+            // mesh's baked per-adjunct colours straight to the rasterizer. Leaving `unlit` at its
+            // default let every mesh that merely *has* normals get hardware-lit here instead, by
+            // whichever rig static_lighting selected - and with static_lighting false that is the
+            // real-time dynamic list (agiLighter::LIGHTS, headlights and coronas), which carries
+            // essentially nothing for static scenery. This is the path DrawLit() falls back to when
+            // the lighter is null, i.e. all of AGI_QUALITY_LOW (mmcity/cullcity.cpp, fix_lighting
+            // sets both StaticLighter and DynamicLighter to nullptr there), and it is also where
+            // software-rendering-disabled StaticLighter content lands. The result was city geometry
+            // rendered near-black at low light quality while the same content on the CPU path was
+            // correctly bright.
+            drawn = DrawNativeTransform(flags, false, nullptr, nullptr, /*unlit=*/true);
+        }
+        else if (Geometry(flags, Vertices, Planes) <= 0xFF)
         {
             FirstPass(Colors, TexCoords, 0xFFFFFFFF);
             drawn = true;
@@ -852,7 +906,36 @@ b32 agiMeshSet::DrawColor(u32 color, u32 flags)
 
     if (LockIfResident())
     {
-        if (Geometry(flags, Vertices, Planes) <= 0xFF)
+        if (Pipe()->SupportsNativeTransform() && NativePathEnabled(NATIVE_DRAWCOLOR))
+        {
+            // Same colour resolution FirstPass() performs, done up front so the result can be
+            // handed to the hardware path as final per-vertex colours: modulate the mesh's own
+            // colours by `color`, or - when the mesh has none - use `color` for every vertex.
+            // These draws are unlit by definition (the caller is dictating the colour), so
+            // hardware lighting is forced off even for meshes that do carry normals.
+            const u32* final_colors = Colors;
+
+            if (color != 0xFFFFFFFF)
+            {
+                u32* shaded = ARTS_ALLOCA(u32, AdjunctCount);
+
+                if (Colors)
+                {
+                    ARTS_UTIMED(agiLightTimer);
+                    agiBlendColors(shaded, Colors, AdjunctCount, color);
+                }
+                else
+                {
+                    for (u32 i = 0; i < AdjunctCount; ++i)
+                        shaded[i] = color;
+                }
+
+                final_colors = shaded;
+            }
+
+            drawn = DrawNativeTransform(flags, false, nullptr, final_colors, /*unlit=*/true);
+        }
+        else if (Geometry(flags, Vertices, Planes) <= 0xFF)
         {
             u32* colors = Colors;
 
@@ -884,10 +967,105 @@ b32 agiMeshSet::DrawColor(u32 color, u32 flags)
     return drawn;
 }
 
+// True for the fixed sun/fill1/fill2 + ambient rig the city's static geometry is lit with, as
+// opposed to the real-time dynamic light list used for cars and other movers. These are the only
+// three lighters mmInstance::StaticLighter/DynamicLighter are ever set to (mmcity/cullcity.cpp),
+// but comparing against the agiworld-level functions themselves keeps this layer independent of
+// mmcity. Selects agiRasterizer::MeshWorld()'s static_lighting argument - see agi/rsys.h.
+static inline bool IsStaticCityLighter(agiMeshLighter lighter)
+{
+    return (lighter == agiMeshLighterTriple) || (lighter == agiMeshLighterQuarter);
+}
+
+// agiConeLighter is deliberately NOT in the list above, and is deliberately kept off the hardware
+// path entirely. It is a genuinely different lighting model - selected only by the `-conelighter`
+// debug switch (mmcity/cullcity.cpp, fix_lighting), still closed ARTS_IMPORT, and named for cone
+// geometry rather than the sun/fill/fill rig. Mapping it onto SetupD3D9StaticLights()'s three
+// directionals, as this used to, silently substituted a completely different result for whatever it
+// actually computes. There is no evidence for that mapping, so the honest behaviour is to let it
+// keep running on the CPU where it is correct.
+static inline bool CanNativeLight(agiMeshLighter lighter)
+{
+    return lighter != agiConeLighter;
+}
+
 b32 agiMeshSet::DrawLit(agiMeshLighter lighter, u32 flags, u32* colors)
 {
     if (!lighter)
         return Draw(flags);
+
+    // City geometry (building facades, ground/road, animated set pieces) reaches the renderer
+    // through here, and it is the bulk of the scene - so this is the branch that decides whether
+    // RTX Remix sees a real 3D world or a stream of screen-space triangles. Route it through the
+    // hardware-transform path, which submits model-space vertices plus a real SetTransform(WORLD),
+    // and let the GPU do the lighting the `lighter` callback would otherwise have baked into
+    // per-vertex colors on the CPU.
+    //
+    // Three previous attempts at this were reverted, all reporting city geometry that vanished or
+    // rendered "detached/floating". That is now explained: BuildProjectionMatrix() had an inverted
+    // sign on the projection's Z row (see dx9rsys.cpp), which drove clip-space Z negative for every
+    // vertex, so *all* native-transform geometry failed D3D9's near-plane test and was discarded
+    // while the draw still reported success. Those reverts were diagnosing the projection bug, not
+    // a World-matrix bug: the "World is (0,0,0)" observation behind the last one only ever printed
+    // World.m3, and a zero translation is simply an identity world transform - correct, and
+    // rendered correctly here, for cell geometry whose vertices are already world-space.
+    //
+    // `colors` overrides the mesh's own per-adjunct base colours; it is forwarded as the hardware
+    // path's base colours, which is the same role it plays on the CPU path (there it is handed to
+    // the lighter as the base to shade). Requires normals - this branch asks the GPU to light, and
+    // agiMeshLighter* would equally fault on mesh->Normals[i] without them, so a normal-less mesh
+    // never legitimately reaches DrawLit() with a lighter in the first place.
+    if (Pipe()->SupportsNativeTransform() && Normals && CanNativeLight(lighter) && NativePathEnabled(NATIVE_DRAWLIT))
+    {
+        // Same residency handling Draw() wraps around DrawNativeTransform(): it reads
+        // Vertices/Normals/Colors/TexCoords directly, so the mesh has to be locked in memory for
+        // the duration, and a non-resident mesh needs a PageIn() request rather than a silent
+        // no-op that never asks for the data and so never becomes drawable.
+        bool native_drawn = false;
+
+        if (LockIfResident())
+        {
+            native_drawn = DrawNativeTransform(flags, IsStaticCityLighter(lighter), nullptr, colors);
+
+            Unlock();
+        }
+        else
+        {
+            PageIn();
+        }
+
+        // DrawLit() carries an implicit contract with closed ARTS_IMPORT callers that run a second
+        // pass over the same mesh afterwards: it leaves the CPU Geometry() scratch state
+        // (codes/out/firstFacet/nextFacet/vertCounts/indexCounts) describing what was just drawn,
+        // and they read it instead of recomputing. aiVehicleInstance::Draw (game.asm:98859) is the
+        // one such caller left - it calls DrawLit() and then, for the highest LOD, SphereMap() for
+        // the vehicle reflection overlay. DrawNativeTransform() never writes that scratch state, so
+        // on the hardware path SphereMap() reads whatever an earlier mesh left behind and aborts
+        // with "FATAL ERROR: Bug?".
+        //
+        // Re-running Geometry() here to repopulate it was tried, and does not work. Geometry()
+        // returns a clip code and may legitimately reject the mesh outright - > 0xFF, the very
+        // condition the CPU branch below gates FirstPass() on - which leaves the facet chain empty.
+        // SphereMap() does not check: it walks firstFacet/nextFacet accumulating a count and
+        // asserts when that count is zero (game.asm:334168, the third 'Bug?' site). So the assert
+        // still fired, and every vehicle paid for a full CPU transform per frame to achieve it.
+        //
+        // Report "not drawn" instead, which makes the `test eax,eax / jz` at game.asm:98860 skip
+        // the overlay. That is safe because this is the *only* one of DrawLit()'s call sites that
+        // reads the return value at all - the other seventeen discard eax immediately - so nothing
+        // else changes behaviour. The body itself was already submitted by DrawNativeTransform()
+        // above; only the chrome overlay is dropped, which is exactly the policy DrawLitSph() below
+        // already applies deliberately for the same reason.
+        //
+        // The overlay is a CPU-pretransformed pass and so invisible to RTX Remix anyway, while the
+        // vehicle body underneath now goes out in world space, which is what Remix needs. Giving it
+        // back means a native replacement - the agiNativeMaterialFx hook in MeshWorld() exists for
+        // it - not resurrecting the CPU pass.
+        if (native_drawn && agiRQ.SphMap)
+            return false;
+
+        return native_drawn;
+    }
 
     bool drawn = false;
 
@@ -916,11 +1094,43 @@ b32 agiMeshSet::DrawLit(agiMeshLighter lighter, u32 flags, u32* colors)
     return drawn;
 }
 
+void agiMeshSet::DrawLitSph(agiMeshLighter lighter, agiTexDef* sph_map, u32 flags)
+{
+    // Vehicle bodies. DrawLit() now takes the hardware-transform path here too, which is what puts
+    // cars into the world-space stream RTX Remix can reconstruct. An earlier attempt at this
+    // reported bodies rendering completely invisible (only headlight/taillight sprites left) and
+    // was reverted; that was the inverted projection Z sign described in DrawLit() above, which
+    // clipped every native-transform draw regardless of subject, not something specific to
+    // vehicles or to the vehicle-select showroom camera.
+    //
+    // The sphere-map specular overlay stays off on the native path: SphereMap() is closed
+    // ARTS_IMPORT code that reads the CPU Geometry() pass's leftover scratch state, which this
+    // path never populates, and calling it there hard-crashes.
+    if (DrawLit(lighter, flags, nullptr) && sph_map && !Pipe()->SupportsNativeTransform())
+        SphereMap(sph_map, 0xFFFFFFFF);
+}
+
 void agiMeshSet::DrawLitEnv(agiMeshLighter lighter, agiTexDef* env_map, Matrix34& transform, u32 flags)
 {
     if (LockIfResident())
     {
-        if (agiCurState.GetMaxTextures() > 1 && agiRQ.EnvMap)
+        // Ground/road geometry arrives here, and on a multitexturing device it would otherwise
+        // take MultiTexEnvMap() below - a fully CPU-pretransformed path, invisible to RTX Remix as
+        // 3D geometry. Prefer the hardware-transform path and drop the env-map reflection overlay,
+        // for the same reason the non-multitex branch already does: both EnvMap() and
+        // MultiTexEnvMap() are closed ARTS_IMPORT routines that consume the codes/out/firstFacet
+        // scratch state the CPU Geometry() pass leaves behind, which DrawNativeTransform() never
+        // populates. Losing the road's shadow/env sheen is a visual downgrade; feeding those
+        // routines stale scratch state crashes ("Bug?").
+        if (Pipe()->SupportsNativeTransform() && Normals && CanNativeLight(lighter) && NativePathEnabled(NATIVE_DRAWLITENV))
+        {
+            // `lighter == nullptr` means "do not light this" - the CPU branches below both funnel
+            // that case into DrawLit(), which forwards it to Draw() and so to FirstPass() with no
+            // lighter. Ask for the same here rather than letting the GPU light road and terrain
+            // geometry off the dynamic light list. See the matching note in Draw().
+            DrawNativeTransform(flags, IsStaticCityLighter(lighter), nullptr, nullptr, /*unlit=*/lighter == nullptr);
+        }
+        else if (agiCurState.GetMaxTextures() > 1 && agiRQ.EnvMap)
         {
             if (Geometry(flags, Vertices, Planes) <= 0xFF)
             {
@@ -943,6 +1153,9 @@ void agiMeshSet::DrawLitEnv(agiMeshLighter lighter, agiTexDef* env_map, Matrix34
         }
         else if (DrawLit(lighter, flags, nullptr) && env_map)
         {
+            // Only reachable on the CPU path now (the native-transform branch above returns
+            // first), so EnvMap() is guaranteed the codes/out/firstFacet scratch state the
+            // Geometry() pass inside DrawLit() just populated - which is exactly what it reads.
             EnvMap(transform, env_map, 0xFFFFFFFF);
         }
 
@@ -1084,7 +1297,33 @@ i32 agiMeshSet::Geometry(u32 flags, Vector3* verts, Vector4* planes)
             clip_mask = TransformOutcode(codes, out, BoundingBox, 8);
 
             if (clip_mask > 0xFF) // All verts are clipped (not visible)
-                return clip_mask;
+            {
+                // TransformOutcode's per-axis test is |coord| <= |w|, which doesn't check w's
+                // sign. A corner behind the camera (w<=0) can still numerically satisfy that test
+                // and land on whichever side the sign coincidence favors, so when the camera is
+                // close enough to be inside (or straddling) this bounding box - some corners
+                // ahead (w>0), some behind (w<=0) - the "all 8 corners agree on an out-of-bounds
+                // bit" AND-reduction this early-reject relies on can trigger on a coincidental
+                // match between meaningless behind-camera outcodes and genuine in-front ones,
+                // wrongly discarding an object that's actually still partially visible (confirmed
+                // via diagnostic: large city instance-chain bounding boxes - e.g. a batch of
+                // roadside trees - show exactly this mixed-sign pattern at the point this
+                // early-reject fires). Only trust the quick reject when every corner agrees on
+                // being in front of the camera; otherwise fall through to the slower per-vertex
+                // path below, which re-derives clip_mask from the mesh's real geometry instead of
+                // its bounding box.
+                bool all_in_front = true;
+
+                for (i32 i = 0; i < 8 && all_in_front; ++i)
+                {
+                    all_in_front = out[i].w > 0.0f;
+                }
+
+                if (all_in_front)
+                    return clip_mask;
+
+                clip_mask = MESH_CLIP_ANY;
+            }
         }
 
         if (clip_mask)
@@ -1224,6 +1463,235 @@ i32 agiMeshSet::Geometry(u32 flags, Vector3* verts, Vector4* planes)
     ToScreen(codes, out, VertexCount);
 
     return clip_mask;
+}
+
+// See meshset.h - additive path used only by renderers with native transform/lighting support
+// (agiPipeline::SupportsNativeTransform). Mirrors the facet traversal in Geometry() above, but
+// skips Transform/TransformOutcode/ToScreen entirely: individual triangles are clipped by the
+// GPU, so there's no need for the CPU-side clip machinery (ClipTri/FullClip/ClippedVerts) either.
+
+// Reconstructs smooth per-vertex normals for the native path.
+//
+// agiMeshSet stores normals as a u8 index into UnpackNormal[198] - 198 directions over the whole
+// sphere, roughly 26 degrees apart. That quantisation is coarse enough to collapse the normals of
+// neighbouring vertices onto the *same* table entry, so all three corners of a facet routinely end
+// up identical. Interpolating a constant gives a constant, which means the pixel shader is handed a
+// flat normal per facet and its output is indistinguishable from flat shading no matter how
+// per-pixel the lighting maths is. On low-poly bodywork - which is all of MM1's vehicles - that
+// reads exactly like vertex shading, because geometrically it is.
+//
+// Re-averaging in float across adjuncts that share a vertex recovers the gradient the quantiser
+// destroyed. Adjuncts are per-facet-corner, so several of them reference one spatial vertex via
+// VertexIndices; summing their normals there and renormalising is the standard smoothing pass.
+//
+// The angle threshold preserves genuine hard edges. Without it a box would be smoothed into a
+// blob: at a cube corner the average points along the diagonal, which is 54.7 degrees off each face
+// normal, so a cos threshold of 0.7 (about 45 degrees) keeps the faces flat while still smoothing
+// the shallow angles that make up a curved panel.
+static mem::cmd_param PARAM_smooth_normals {"smoothnormals", "Rebuild smooth vertex normals for the hardware path"};
+
+static void SmoothAdjunctNormals(Vector3* ARTS_RESTRICT out_normals, const u16* ARTS_RESTRICT vertex_indices,
+    const u8* ARTS_RESTRICT normals, u32 adjunct_count, Vector3* ARTS_RESTRICT accum, u32 vertex_count)
+{
+    for (u32 v = 0; v < vertex_count; ++v)
+        accum[v] = {0.0f, 0.0f, 0.0f};
+
+    for (u32 a = 0; a < adjunct_count; ++a)
+        accum[vertex_indices[a]] += UnpackNormal[normals[a]];
+
+    constexpr f32 kHardEdgeCos = 0.7f;
+
+    for (u32 a = 0; a < adjunct_count; ++a)
+    {
+        const Vector3& own = UnpackNormal[normals[a]];
+        const Vector3& sum = accum[vertex_indices[a]];
+
+        f32 mag2 = sum.Mag2();
+
+        if (mag2 <= 1.0e-8f)
+        {
+            out_normals[a] = own;
+            continue;
+        }
+
+        Vector3 averaged = sum / std::sqrt(mag2);
+
+        // Keep the facet's own normal wherever smoothing would round off a real edge.
+        out_normals[a] = ((averaged ^ own) >= kHardEdgeCos) ? averaged : own;
+    }
+}
+
+b32 agiMeshSet::DrawNativeTransform(
+    u32 flags, bool static_lighting, const agiNativeMaterialFx* fx, const u32* base_colors, bool unlit)
+{
+    Init((Planes != nullptr) && (SurfaceCount > 1));
+
+    // NOTE: deliberately NOT doing a CPU-side bounding-box pre-cull here (the old path uses
+    // TransformOutcode(), which transforms via the shared static agiMeshSet::M - refreshed by
+    // the still-closed Init() above from *some* snapshot of the current transform). That's fine
+    // for the old path, which uses the exact same M for its actual per-vertex transform right
+    // afterward, so any staleness is self-consistent. This path instead transforms via the
+    // hardware pipeline using ViewParams().World/View directly (set moments ago by this
+    // object's own SetWorld() call, e.g. once per wheel for a car's four wheels drawn back to
+    // back) - mixing that with an M-based pre-cull risks M lagging behind by one SetWorld() call
+    // (e.g. still reflecting the previous wheel's transform), which would wrongly test a small,
+    // corner-offset object's bounding box against the wrong frustum position and silently drop
+    // it before ever reaching MeshWorld() - a clean, total disappearance rather than a visible
+    // glitch. The GPU clips real off-screen geometry correctly regardless, so skipping this
+    // optimization only costs a bit of CPU work building vertex/index data for meshes that
+    // might be off-screen - never a correctness problem.
+
+    DynTexFlag = flags & MESH_DRAW_DYNTEX;
+    CurrentMeshSetVariant = std::min<i32>(MESH_DRAW_GET_VARIANT(flags), VariationCount - 1);
+
+    // So the renderer can tell which glow lights can reach this mesh - see agiworld/glowlight.h.
+    agiNativeDrawRadius = Radius;
+
+    fill_bytes(firstFacet, TextureCount + 1, 0xFF);
+
+    // Backface culling uses the shared IsBackfacing()/agiMeshSet::EyePos, exactly like the CPU
+    // Geometry() path above, so both paths make identical per-facet decisions.
+    //
+    // Earlier revisions here distrusted EyePos and substituted hand-rolled eye positions (first
+    // the raw world-space ViewParams().Camera.m3 - a genuine coordinate-space mismatch, since
+    // Planes[] are local/object-space plane equations - then Camera.m3 transformed by
+    // World.FastInverse()). Neither was necessary: disassembling the closed producer
+    // (agiMeshSet::InitMtx, game.asm) shows EyePos is computed from agiViewParameters::ModelView
+    // (= View * World) as the camera's position expressed in *model* space - precisely the
+    // local-space eye this test wants - and Init() above re-runs InitMtx() whenever
+    // agiViewParameters::MtxSerial has moved, which SetWorld() bumps on every call. So EyePos is
+    // both correct and already fresh for this draw. Verified against logged runtime values: for an
+    // instance at world (-185.3, 5.0, 854.0) with the camera at (-234.7, 4.2, 981.9), EyePos came
+    // out as (120.6, -0.8, -65.3), whose magnitude matches the true camera-to-object distance.
+    for (u32 i = 0; i < SurfaceCount; ++i)
+    {
+        if (!Planes || !IsBackfacing(Planes[i]))
+        {
+            u8 texture = TextureIndices[i];
+            nextFacet[i] = firstFacet[texture];
+            firstFacet[texture] = static_cast<i16>(i);
+        }
+    }
+
+    // Index buffer size is NOT IndicesCount. That is the length of the *source* SurfaceIndices
+    // array - 4 entries per facet (agiworld/meshload.cpp reads SurfaceIndices as IndicesCount
+    // u16s) - whereas the loop below emits triangles: 3 indices for a triangle facet but 6 for a
+    // quad. A quad-heavy mesh therefore needs 1.5x what IndicesCount describes, so sizing by it
+    // overran the buffer and corrupted whatever followed. SurfaceCount * 6 is the true worst case.
+    const u32 max_indices = SurfaceCount * 6;
+
+    // ARTS_ALLOCA, deliberately - do NOT move these buffers onto the heap. Three revisions have now
+    // tried it and all three failed:
+    //
+    // - `static std::vector` raced. This function is reached on more than one thread (the device is
+    //   created D3DCREATE_MULTITHREADED), so one thread's resize() reallocated the storage out from
+    //   under another thread's already-taken pointer.
+    // - `static thread_local std::vector` removed the race and still failed, which rules the race
+    //   out as the whole story. It crashed on entering gameplay, inside the *simulation* loop, with
+    //   AI vehicle fields reading 0x55555555 - asMemoryAllocator::Node::LOWER_FILL, the custom
+    //   allocator's guard byte (memory/allocator.cpp). Bisected with OPEN1560_NATIVE_MASK: mask 0
+    //   ran clean, mask 0x1 (this path via Draw()) reproduced it every time, and reverting to
+    //   ARTS_ALLOCA with nothing else changed fixed it. Whatever the precise mechanism, calling the
+    //   game's own allocator from this point in the draw is not safe.
+    //
+    // The cost of staying on the stack is a real but currently theoretical overflow risk: meshes
+    // may reach BigVtxSize (16384) adjuncts, and at sizeof(agiWorldVtx) == 0x24 that is ~590 KB of
+    // vertices plus up to ~192 KB of indices, per call, in an already-deep draw chain against a
+    // 1 MB stack. Real meshes are far smaller and this has not been observed to fire. If it ever
+    // needs fixing, the fix is a buffer that is neither the game heap nor the stack - a
+    // module-level array sized once for the worst case, or the dynamic D3D9 vertex/index buffers
+    // proposed in docs/dx9_rendering_pathways.md - not std::vector.
+    //
+    // One vertex per adjunct (SurfaceIndices entries are adjunct indices, so they index this
+    // array directly - no remapping needed).
+    agiWorldVtx* verts = ARTS_ALLOCA(agiWorldVtx, AdjunctCount);
+
+    const agiViewParameters& view_params = ViewParams();
+
+    // Meshes loaded without MESH_SET_NORMAL have no normals at all (mmInstance::InitMeshes only
+    // requests them for COLLIDER/MOVER instances, so most static scenery and the low-detail LODs
+    // go without). Those draw unlit from their baked Colors on the CPU path, and do the same here -
+    // the normal field is filler and MeshWorld() is told to disable hardware lighting, so nothing
+    // reads it. Without this they would fall back to CPU pretransform and stay invisible to Remix.
+    const bool has_normals = (Normals != nullptr);
+    const bool hardware_lighting = has_normals && !unlit;
+    const Vector3 filler_normal {0.0f, 1.0f, 0.0f};
+
+    const u32* src_colors = base_colors ? base_colors : Colors;
+
+    // Smoothed normals, when the mesh has any and is small enough to do it on the stack. See
+    // SmoothAdjunctNormals - this is what stops low-poly bodywork looking flat-shaded regardless of
+    // how the lighting is evaluated.
+    Vector3* smooth_normals = nullptr;
+
+    if (has_normals && PARAM_smooth_normals.get_or(true) && (VertexCount <= 4096) && (AdjunctCount <= 4096))
+    {
+        smooth_normals = ARTS_ALLOCA(Vector3, AdjunctCount);
+        Vector3* accum = ARTS_ALLOCA(Vector3, VertexCount);
+
+        SmoothAdjunctNormals(smooth_normals, VertexIndices, Normals, AdjunctCount, accum, VertexCount);
+    }
+
+    for (u32 a = 0; a < AdjunctCount; ++a)
+    {
+        verts[a].pos = Vertices[VertexIndices[a]];
+        verts[a].normal =
+            has_normals ? (smooth_normals ? smooth_normals[a] : UnpackNormal[Normals[a]]) : filler_normal;
+        verts[a].color = src_colors ? src_colors[a] : 0xFFFFFFFF;
+        verts[a].tu = TexCoords ? TexCoords[a].x : 0.0f;
+        verts[a].tv = TexCoords ? TexCoords[a].y : 0.0f;
+    }
+
+    u16* indices = ARTS_ALLOCA(u16, max_indices);
+
+    bool drawn = false;
+
+    for (u32 texture = 0; texture <= TextureCount; ++texture)
+    {
+        if (firstFacet[texture] == -1)
+            continue;
+
+        u32 index_count = 0;
+
+        for (i16 facet = firstFacet[texture]; facet != -1; facet = nextFacet[facet])
+        {
+            const u16* ARTS_RESTRICT surface = &SurfaceIndices[facet * 4];
+
+            if (surface[3])
+            {
+                // Matches the diagonal split ClipTri uses for quads elsewhere in this file.
+                indices[index_count++] = surface[1];
+                indices[index_count++] = surface[2];
+                indices[index_count++] = surface[3];
+                indices[index_count++] = surface[1];
+                indices[index_count++] = surface[3];
+                indices[index_count++] = surface[0];
+            }
+            else
+            {
+                indices[index_count++] = surface[0];
+                indices[index_count++] = surface[1];
+                indices[index_count++] = surface[2];
+            }
+        }
+
+        if (index_count == 0)
+            continue;
+
+        agiTexDef* tex_def = TexCoords ? Textures[CurrentMeshSetVariant][texture] : nullptr;
+
+        auto old_texture = agiCurState.SetTexture(tex_def);
+
+        if (RAST->MeshWorld(verts, static_cast<i32>(AdjunctCount), indices, static_cast<i32>(index_count),
+                view_params.World, view_params.View, view_params, static_lighting, fx, hardware_lighting))
+        {
+            drawn = true;
+        }
+
+        agiCurState.SetTexture(old_texture);
+    }
+
+    return drawn;
 }
 
 i32 agiMeshSet::ShadowGeometry(u32 flags, Vector3* verts, const Vector4& plane, const Vector3& light_dir)
@@ -1383,6 +1851,303 @@ i32 agiMeshSet::ShadowGeometry(u32 flags, Vector3* verts, const Vector4& plane, 
 // ?CurrentMeshCard@@3UagiMeshCardInfo@@A
 ARTS_IMPORT extern agiMeshCardInfo CurrentMeshCard;
 
+
+// --- Glow light harvesting (see agiworld/glowlight.h) -----------------------------------------
+
+agiGlowLight agiGlowLights[AGI_MAX_GLOW_LIGHTS] {};
+u32 agiGlowLightCount = 0;
+
+u32 agiGlowCardsSeen = 0;
+u32 agiGlowCardsNoTexture = 0;
+u32 agiGlowCardsNotGlow = 0;
+u32 agiGlowCardsHarvested = 0;
+
+f32 agiNativeDrawRadius = 0.0f;
+f32 agiLightningFlash = 0.0f;
+
+// NOTE: at namespace scope deliberately. A function-local `static mem::cmd_param` is constructed
+// lazily on first call, which happens long after mem::cmd_param::init() has already walked argv
+// and assigned values to every registered parameter - so it registers too late and silently
+// never receives its value, no matter what the user passes on the command line.
+static mem::cmd_param PARAM_glowdebug {"glowdebug", "Log glow lights as they are harvested"};
+
+
+// Per-kind intensity, because these are not one population.
+//
+// The engine gives no explicit "what sort of light is this" field, but the glow textures are named
+// descriptively and their vertex tints are very distinct, which between them identify every case
+// seen in the draw stream:
+//
+//   FXLTCONE      - the headlight cone mesh. Huge (radius ~39) and centred well ahead of the car.
+//   FXLTGLOWRED   - vehicle tail/brake, tinted dark red and sitting near ground level.
+//   FXLTGLOW      - shared between traffic signals and street lamps. They are trivially separable
+//                   by saturation: a signal is a pure hue (green measured as 0.00/1.00/0.44), a
+//                   lamp is warm near-white (1.00/0.98/0.47). Nothing else in the stream sits
+//                   between those.
+//
+// Every multiplier is a cmd_param so this can be tuned without a rebuild, and so the classification
+// being heuristic does not lock anyone into my guesses.
+static mem::cmd_param PARAM_light_head {"lighthead", "Intensity of vehicle headlight cones"};
+static mem::cmd_param PARAM_light_vehicle {"lightvehicle", "Intensity of vehicle tail/brake/reverse lights"};
+static mem::cmd_param PARAM_light_traffic {"lighttraffic", "Intensity of traffic signals"};
+static mem::cmd_param PARAM_light_lamp {"lightlamp", "Intensity of street lamps and static lights"};
+static mem::cmd_param PARAM_light_generic {"lightgeneric", "Intensity of neutral-white glows that are not street lamps"};
+
+// Relative saturation above which a colour counts as a pure signal hue rather than a warm white.
+//
+// This test used to be an ABSOLUTE channel spread, `(peak - floor) > 0.40`, and it misclassified the
+// exact case documented above it. A street lamp measures 1.00/0.98/0.47, whose absolute spread is
+// 0.53 - so every street lamp in the city tested as "saturated", fell through to the traffic-signal
+// branch, and ran at `lighttraffic` (2.0) instead of `lightlamp` (10.0). Warm white is by definition
+// a wide absolute spread, so an absolute threshold can never separate it from a hue.
+//
+// It failed the other way too, because the tint handed in has already been multiplied by the flare's
+// brightness (agiAddGlowLight folds in the card's alpha). A genuinely red tail light at alpha 0.3
+// arrives as 0.30/0.00/0.00, an absolute spread of 0.30 - "unsaturated" - and was classified as a
+// street lamp at 10.0. The two populations were being swapped in both directions, and which way a
+// given flare went depended on how bright it happened to be drawn that frame.
+//
+// Relative saturation (peak - floor)/peak is scale-invariant, which removes the brightness
+// dependence outright, and 0.65 separates the observed populations with room to spare:
+//   street lamp   1.00/0.98/0.47 -> 0.53   warm white
+//   green signal  0.00/1.00/0.44 -> 1.00   hue
+//   red tail      1.00/0.10/0.10 -> 0.90   hue
+//   amber signal  1.00/0.60/0.10 -> 0.90   hue
+static constexpr f32 kGlowHueSaturation = 0.65f;
+
+f32 agiClassifyGlowIntensity(const char* name, const Vector3& color)
+{
+    if (!name)
+        return 1.0f;
+
+    // Headlight cones. Drastically reduced: the cone is a big mesh whose centroid sits metres ahead
+    // of the bonnet, so as a point light it washes the road from the wrong place and pops with the
+    // LOD that draws it. The sprite still renders - only its contribution as a light is pulled back.
+    if (std::strstr(name, "CONE"))
+        return PARAM_light_head.get_or(0.05f);
+
+    // Name first where the name is decisive. FXLTGLOWRED/AMBER are vehicle lamp sheets whatever
+    // colour the instance tints them, so they never need the saturation test at all.
+    if (std::strstr(name, "FXLTGLOWRED") || std::strstr(name, "FXLTGLOWAMBER"))
+        return PARAM_light_vehicle.get_or(1.25f);
+
+    const f32 peak = std::max({color.x, color.y, color.z});
+
+    // A black flare has no hue to classify. It also emits nothing, so the value is academic.
+    if (peak <= 1e-4f)
+        return PARAM_light_lamp.get_or(10.0f);
+
+    const f32 floor_ = std::min({color.x, color.y, color.z});
+    const f32 saturation = (peak - floor_) / peak;
+
+    // A pure hue is a signal: a traffic light, or a lamp whose whole job is to be looked at.
+    if (saturation > kGlowHueSaturation)
+        return PARAM_light_traffic.get_or(2.0f);
+
+    // Unsaturated splits again, on WARMTH.
+    //
+    // "Not a pure hue" is not sufficient to be a street lamp, and treating it as such handed the
+    // full lamp multiplier to things that are not lamps - measured in the log as a pure white
+    // (1.00 1.00 1.00) glow sitting at y=0.3, i.e. on a vehicle, being given intensity 25. Anything
+    // that big at ground level washes out the road around a car.
+    //
+    // Every street lamp in this game is warm - incandescent or sodium - so its blue channel sits
+    // well under its red. A neutral white glow is something else (a reverse lamp, a generic corona)
+    // and gets a modest default rather than a street lamp's budget.
+    if ((color.z / peak) < 0.85f)
+        return PARAM_light_lamp.get_or(10.0f);
+
+    return PARAM_light_generic.get_or(1.0f);
+}
+
+static mem::cmd_param PARAM_glow_reach_scale {"glowreachscale", "Glow flare half-extent to light reach, in world units"};
+static mem::cmd_param PARAM_glow_reach_min {"glowreachmin", "Minimum reach of a glow-driven light, in world units"};
+
+f32 agiGlowLightReach(f32 flare_half_extent)
+{
+    return std::max(flare_half_extent * PARAM_glow_reach_scale.get_or(14.0f), PARAM_glow_reach_min.get_or(20.0f));
+}
+
+void agiAddGlowLightRGB(
+    const Vector3& position, const Vector3& tint, f32 radius, agiTexDef* texture, f32 u, f32 v)
+{
+    if ((tint.x <= 0.0f) && (tint.y <= 0.0f) && (tint.z <= 0.0f))
+        return;
+
+    // Find the slot this sprite already owns, so it is refreshed in place rather than duplicated.
+    //
+    // Matching is against the slot's PREDICTED position - where last frame's velocity says it should
+    // be now - not against where it was. A plain distance match fails exactly when it matters most:
+    // a car at 200 km/h covers about a metre per frame, so a one-metre threshold stopped recognising
+    // its own headlights, allocated a fresh slot every frame, and the orphans then survived their
+    // full TTL. That is a trail of lights strung out behind the car, which is what was reported.
+    // Predicting first makes the residual near zero at constant speed, so the threshold only has to
+    // absorb acceleration rather than the whole of the motion.
+    //
+    // Slots already refreshed this frame (Age == 0) are skipped. Without that guard the threshold -
+    // which now has to be generous - would let a car's second headlight claim the slot its first one
+    // just took, collapsing a pair of lights into one.
+    // 0.9 m. Prediction absorbs the motion, so this only has to cover acceleration - and keeping it
+    // well under the ~1.5 m spacing between a car's two tail lights stops them trading slots frame
+    // to frame, which is what made them flicker at speed.
+    constexpr f32 kMatchDistSq = 0.81f;
+
+    f32 best_dist_sq = kMatchDistSq;
+    agiGlowLight* slot = nullptr;
+
+    for (u32 i = 0; i < agiGlowLightCount; ++i)
+    {
+        agiGlowLight& candidate = agiGlowLights[i];
+
+        if ((candidate.Texture != texture) || (candidate.Age == 0))
+            continue;
+
+        const Vector3 predicted = candidate.Position + candidate.Velocity;
+        const f32 dist_sq = (predicted - position).Mag2();
+
+        if (dist_sq < best_dist_sq)
+        {
+            best_dist_sq = dist_sq;
+            slot = &candidate;
+        }
+    }
+
+    if (!slot)
+    {
+        if (agiGlowLightCount < AGI_MAX_GLOW_LIGHTS)
+        {
+            slot = &agiGlowLights[agiGlowLightCount++];
+        }
+        else
+        {
+            // Full: evict the stalest entry rather than dropping this one. A slot that has not been
+            // seen for longest is the one least likely to still matter.
+            u32 oldest = 0;
+
+            for (u32 i = 1; i < agiGlowLightCount; ++i)
+            {
+                if (agiGlowLights[i].Age > agiGlowLights[oldest].Age)
+                    oldest = i;
+            }
+
+            slot = &agiGlowLights[oldest];
+        }
+    }
+
+    // Track velocity from the actual step taken, so the next frame's prediction stays accurate.
+    // A newly allocated slot has no history and starts at rest; it gets a real velocity from its
+    // second frame onwards, which is soon enough - one frame of lag on a light's first appearance
+    // is not observable.
+    slot->Velocity = (slot->Texture == texture) ? (position - slot->Position) : Vector3 {0.0f, 0.0f, 0.0f};
+
+    slot->Position = position;
+    slot->Tint = tint;
+    // Provisional classification, from the tint alone. The renderer refines it once it has resolved
+    // the flare's actual hue out of the glow texture - see agiClassifyGlowIntensity.
+    slot->Intensity = agiClassifyGlowIntensity(texture ? texture->Tex.Name : nullptr, tint);
+    slot->Radius = std::max(radius, 1.0f);
+    slot->Texture = texture;
+    slot->U = u;
+    slot->V = v;
+    slot->Age = 0;
+
+    if (PARAM_glowdebug.get_or(false) && texture)
+    {
+        // Deduplicate on texture AND coarse hue, not on the texture alone.
+        //
+        // Keying on the agiTexDef pointer hid the single most important case. One FXLTGLOW sheet
+        // carries both the traffic signals and the street lamps; whichever was drawn first claimed
+        // the slot, so if a green signal came up before any lamp - which it does - no street lamp
+        // ever printed a line, and the log looked exactly as it would if lamps were never harvested
+        // at all. That is not a small logging nicety: it is the difference between "lamps are not in
+        // the draw stream" and "lamps are in the draw stream and something later drops them", which
+        // are opposite bugs with opposite fixes.
+        struct SeenGlow
+        {
+            const agiTexDef* Texture;
+            u8 R, G, B;
+        };
+
+        static SeenGlow seen[128] {};
+        static u32 seen_count = 0;
+
+        // Quantise the hue to eighths, so the same lamp at different brightnesses collapses to one
+        // entry while genuinely different colours on one sheet stay apart.
+        const f32 peak = std::max({tint.x, tint.y, tint.z, 1e-4f});
+
+        const SeenGlow key {texture, static_cast<u8>(tint.x / peak * 8.0f), static_cast<u8>(tint.y / peak * 8.0f),
+            static_cast<u8>(tint.z / peak * 8.0f)};
+
+        bool known = false;
+
+        for (u32 i = 0; i < seen_count; ++i)
+        {
+            known |= (seen[i].Texture == key.Texture) && (seen[i].R == key.R) && (seen[i].G == key.G) &&
+                (seen[i].B == key.B);
+        }
+
+        if (!known && (seen_count < 128))
+        {
+            seen[seen_count++] = key;
+
+            const f32 saturation = (peak - std::min({tint.x, tint.y, tint.z})) / peak;
+
+            Displayf("GLOW: tex='%s' props=0x%X radius=%.1f tint=(%.2f %.2f %.2f) sat=%.2f intensity=%.2f "
+                     "uv=(%.2f %.2f) pos=(%.1f %.1f %.1f)",
+                texture->Tex.Name, texture->Tex.Props, slot->Radius, tint.x, tint.y, tint.z, saturation,
+                slot->Intensity, u, v, position.x, position.y, position.z);
+        }
+    }
+}
+
+void agiUpdateGlowLights()
+{
+    // Age every slot, then compact out the expired ones. Slots that were refreshed this frame go
+    // back to age 0 in agiAddGlowLightRGB; everything else drifts towards expiry and fades on the
+    // way, so a light that genuinely goes away leaves smoothly instead of popping.
+    u32 live = 0;
+
+    for (u32 i = 0; i < agiGlowLightCount; ++i)
+    {
+        agiGlowLight& light = agiGlowLights[i];
+
+        if (++light.Age >= AGI_GLOW_LIGHT_TTL)
+            continue;
+
+        agiGlowLights[live++] = light;
+    }
+
+    agiGlowLightCount = live;
+
+    agiGlowCardsSeen = 0;
+    agiGlowCardsNoTexture = 0;
+    agiGlowCardsNotGlow = 0;
+    agiGlowCardsHarvested = 0;
+}
+
+void agiAddGlowLight(const Vector3& position, u32 color, f32 scale, agiTexDef* texture, f32 u, f32 v)
+{
+    // The billboard's own alpha is its current brightness - glows fade with distance and with
+    // whatever the caller is animating (traffic lights cycling, headlight glow with the beam).
+    // Folding it in here means the emitted light fades with the sprite instead of popping.
+    f32 intensity = static_cast<f32>((color >> 24) & 0xFF) / 255.0f;
+
+    if (intensity <= 0.0f)
+        return;
+
+    Vector3 rgb {
+        (static_cast<f32>((color >> 16) & 0xFF) / 255.0f) * intensity,
+        (static_cast<f32>((color >> 8) & 0xFF) / 255.0f) * intensity,
+        (static_cast<f32>(color & 0xFF) / 255.0f) * intensity,
+    };
+
+    // The billboard's radius is the size of the *visible flare*, not the reach of the light it
+    // stands for - a street lamp's corona is a metre or so across while it lights several metres of
+    // pavement. agiGlowLightReach() makes that conversion, and is shared with the glow-mesh route so
+    // the same fixture gets the same reach whichever way the engine happens to draw it.
+    agiAddGlowLightRGB(position, rgb, agiGlowLightReach(scale), texture, u, v);
+}
+
 void agiMeshSet::DrawCard(Vector3& position, f32 scale, u32 rotation, u32 color, u32 frame)
 {
     const agiViewParameters& view_params = ViewParams();
@@ -1393,6 +2158,106 @@ void agiMeshSet::DrawCard(Vector3& position, f32 scale, u32 rotation, u32 color,
 
     if (-w > z || z > w)
         return;
+
+    // Harvest this billboard as a light source if it is an AlphaGlow - see agiworld/glowlight.h.
+    // Placed after the depth reject above so off-screen-in-depth glows are not recorded, but before
+    // the screen-space clipping below, which would otherwise drop lights whose flare is just off
+    // the edge of the view while their illumination still falls on visible geometry.
+    ++agiGlowCardsSeen;
+
+    agiTexDef* card_texture = agiCurState.GetTexture();
+
+    if (!card_texture)
+    {
+        ++agiGlowCardsNoTexture;
+
+        // Where are the untextured cards, in world space?
+        //
+        // This is the one measurement that separates two opposite conclusions. A card with no
+        // agiCurState texture is dropped by the harvest below, and there are 40-odd of them per
+        // frame in a dense night scene. If they sit at lamp-head height they ARE the street lamps
+        // and the harvest point is wrong; if they sit on the ground they are blob shadows, which
+        // are legitimately untextured and mean the lamps are failing somewhere else entirely.
+        // Guessing between those has already cost one wrong diagnosis.
+        if (PARAM_glowdebug.get_or(false))
+        {
+            static u32 logged = 0;
+
+            if (logged < 24)
+            {
+                ++logged;
+                Displayf("CARD-NOTEX: pos=(%.1f %.1f %.1f) scale=%.3f color=%08X frame=%u", position.x, position.y,
+                    position.z, scale, color, frame);
+            }
+        }
+    }
+    else if (!(card_texture->Tex.Props & agiTexProp::AlphaGlow))
+    {
+        ++agiGlowCardsNotGlow;
+
+        // Same question for the textured-but-not-AlphaGlow population: a street lamp whose flare
+        // sheet simply is not flagged AlphaGlow would land here and be just as invisible.
+        if (PARAM_glowdebug.get_or(false))
+        {
+            static const agiTexDef* seen[32] {};
+            static u32 seen_count = 0;
+
+            bool known = false;
+
+            for (u32 i = 0; i < seen_count; ++i)
+                known |= (seen[i] == card_texture);
+
+            if (!known && (seen_count < 32))
+            {
+                seen[seen_count++] = card_texture;
+                Displayf("CARD-NOTGLOW: tex='%s' props=0x%X pos=(%.1f %.1f %.1f) scale=%.3f", card_texture->Tex.Name,
+                    card_texture->Tex.Props, position.x, position.y, position.z, scale);
+            }
+        }
+    }
+
+    if (card_texture && (card_texture->Tex.Props & agiTexProp::AlphaGlow))
+    {
+        ++agiGlowCardsHarvested;
+
+        // Sample where this frame actually reads. A traffic light is one texture holding red, amber
+        // and green, selected by `frame` - see the note in agiworld/glowlight.h.
+        const Vector2* frame_uvs = &CurrentMeshCard.Frames[4 * frame];
+
+        f32 u = 0.0f;
+        f32 v = 0.0f;
+
+        for (i32 k = 0; k < 4; ++k)
+        {
+            u += frame_uvs[k].x;
+            v += frame_uvs[k].y;
+        }
+
+        // `position` is in MODEL space, not world space.
+        //
+        // This is the bug that kept street lamps from lighting anything, and it hid well because it
+        // is invisible for half the callers. DrawCard projects through view_params.ModelView, which
+        // is View * World - so whatever world matrix is current when it is called applies to this
+        // position. asParticles::Cull() calls Viewport()->SetWorld(IDENTITY) before its cards, so for
+        // particles, smoke and vehicle glows model space *is* world space and harvesting `position`
+        // raw was accidentally correct. mmBangerInstance::DrawGlow() does not: it sets the banger's
+        // own transform, so the position it passes is the banger-local glow offset.
+        //
+        // The result was that every street lamp in the city registered a light at its raw
+        // mmBangerData::GlowOffset - measured in the log as (0.0, 1.8, 0.0) for `opstlite` and
+        // (-2.3, 6.3, 0.0) for `opstlite_blue`, which are the GlowOffset values themselves, not
+        // positions in Chicago. All of them piled up within a couple of metres of the world origin,
+        // lighting one arbitrary spot on the map and leaving every actual lamp dark while its flare
+        // still drew correctly on screen. The flare looked right because rendering uses ModelView;
+        // only the harvest took the number at face value.
+        //
+        // Transforming by ViewParams().World is correct for both populations: it is the matrix
+        // DrawCard is already implicitly using, and it collapses to a no-op for the identity case.
+        Vector3 world_position;
+        world_position.Dot(position, view_params.World);
+
+        agiAddGlowLight(world_position, color, scale, card_texture, u * 0.25f, v * 0.25f);
+    }
 
     f32 x = matrix.m0.x * position.x + matrix.m1.x * position.y + matrix.m2.x * position.z + matrix.m3.x;
     f32 y = matrix.m0.y * position.x + matrix.m1.y * position.y + matrix.m2.y * position.z + matrix.m3.y;

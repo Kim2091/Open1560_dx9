@@ -1,0 +1,491 @@
+/*
+    Open1560 - An Open Source Re-Implementation of Midtown Madness 1 Beta
+    Copyright (C) 2020 Brick
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program. If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#include "dx9pipe.h"
+
+#include "agi/cmodel.h"
+#include "agi/error.h"
+#include "agi/rsys.h"
+#include "agirend/bilight.h"
+#include "agirend/bilmodel.h"
+#include "agirend/lighter.h"
+#include "agirend/rdlp.h"
+#include "agirend/zbrender.h"
+#include "agiworld/glowlight.h"
+#include "data7/utimer.h"
+#include "eventq7/active.h"
+#include "pcwindis/dxinit.h"
+#include "pcwindis/setupdata.h"
+
+#include "dx9bitmap.h"
+#include "dx9context.h"
+#include "dx9rsys.h"
+#include "dx9texdef.h"
+#include "dx9view.h"
+
+#include "dx9_windows.h"
+
+#include <SDL3/SDL_video.h>
+
+define_dummy_symbol(agidx9_dx9pipe);
+
+agiDX9Pipeline::agiDX9Pipeline() = default;
+agiDX9Pipeline::~agiDX9Pipeline() = default;
+
+// Selects Pathway B (programmable vs_3_0/ps_3_0 world shading) over Pathway A (fixed function).
+static mem::cmd_param PARAM_d3d9_shaders {"d3d9shaders", "Use the programmable PBR world path"};
+
+// The live D3D9 device between EndGfx() and the BeginGfx() that follows it, holding it alive across
+// a pipeline restart. See EndGfx() for why the device must not simply be destroyed.
+//
+// Note this parks the *device*, not the agiDX9Context wrapping it, and that distinction is load
+// bearing. A pipeline restart re-enters MainPhase and resets the engine's memory arena - the second
+// init reports "MemStat: 'ARTS Early Init' 0K before" - so every arnew allocation, an agiDX9Context
+// among them, is freed wholesale at that point. Parking the wrapper leaves a dangling pointer that
+// faults the moment the next BeginGfx() touches it. An IDirect3DDevice9 is a COM object living in
+// the D3D9 DLL's own heap, untouched by the arena reset, so it survives and the cheap wrapper is
+// simply rebuilt around it.
+static IDirect3DDevice9* s_parked_device = nullptr;
+
+i32 agiDX9Pipeline::BeginGfx()
+{
+    if (gfx_started_)
+        return AGI_ERROR_ALREADY_INITIALIZED;
+
+    valid_bit_depths_ = 0x4;
+    flags_ = 0x1 | 0x4 | 0x10;
+
+    if (i32 error = agiSDLPipeline::BeginGfx())
+    {
+        return error;
+    }
+
+    SDL_GetWindowSizeInPixels(window_, &horz_res_, &vert_res_);
+    Displayf("Window Resolution: %u x %u", horz_res_, vert_res_);
+
+    // Adopts the parked device when there is one, resetting it to the new size, rather than building
+    // a second device on the same window. See s_parked_device.
+    dx9_context_ = arnew agiDX9Context(window_, static_cast<u32>(horz_res_), static_cast<u32>(vert_res_),
+        !dxiIsFullScreen(), (device_flags_1_ & 0x1) != 0, s_parked_device);
+
+    s_parked_device = nullptr;
+
+    screen_format_ = agiSurfaceDesc::FromFormat(PixelFormat_A8R8G8B8);
+    opaque_format_ = agiSurfaceDesc::FromFormat(PixelFormat_X8R8G8B8);
+    alpha_format_ = agiSurfaceDesc::FromFormat(PixelFormat_A8R8G8B8);
+
+    screen_color_model_ = as_rc agiColorModel::FindMatch(&screen_format_);
+    opaque_color_model_ = as_rc agiColorModel::FindMatch(&opaque_format_);
+    alpha_color_model_ = as_rc agiColorModel::FindMatch(&alpha_format_);
+    text_color_model_ = alpha_color_model_;
+
+    TexSearchPath = "tex16a\0tex16o\0tex16\0"_xconst;
+
+    agiCurState.SetCullMode(agiCullMode::None);
+    agiCurState.SetBlendSet(agiBlendSet::SrcAlpha_InvSrcAlpha);
+    agiCurState.SetTexturePerspective(true);
+    agiCurState.SetMaxTextures(1);
+    agiCurState.SetSmoothShading(true);
+
+    rasterizer_ = arnewr agiDX9Rasterizer(this);
+    renderer_ = arnewr agiZBufRenderer(rasterizer_.get());
+
+    // Pathway B is opt-in. Pathway A stays the default because it is the one RTX Remix can
+    // reconstruct a scene from - see docs/dx9_rendering_pathways.md. A failure here is soft: the
+    // shader system reports it and we simply carry on fixed-function.
+    if (PARAM_d3d9_shaders.get_or(false))
+        world_shader_.Init(dx9_context_->GetDevice());
+
+    InitScaling();
+
+    gfx_started_ = true;
+
+    return AGI_ERROR_SUCCESS;
+}
+
+void agiDX9Pipeline::EndGfx()
+{
+    text_color_model_ = nullptr;
+    screen_color_model_ = nullptr;
+    opaque_color_model_ = nullptr;
+    alpha_color_model_ = nullptr;
+
+    renderer_ = nullptr;
+    rasterizer_ = nullptr;
+
+    // Before the context: these are device objects and must not outlive the device.
+    world_shader_.Shutdown();
+
+    // Park the device rather than destroying it - the reference moves to s_parked_device and the
+    // next BeginGfx() adopts it. Changing resolution (the 640x480 menu into a 1280x800 race) runs a
+    // full EndGfx/BeginGfx cycle, and destroying a D3D9 device only to immediately create another
+    // on the same HWND is what breaks RTX Remix: dxvk subclasses the window procedure, and that
+    // subclass outlives the swapchain it refers to across the gap. The runtime says so on its way
+    // down - "[D3D9WindowProc] Swapchain handle is invalid" - and the 64-bit bridge server then
+    // faults, taking the game with it. The window itself is never recreated here (dxiWindowCreate
+    // returns early when the renderer type is unchanged), so the device stays valid for it and a
+    // Reset() to the new size is all that was ever needed.
+    if (dx9_context_)
+        s_parked_device = dx9_context_->DetachDevice();
+
+    dx9_context_ = nullptr;
+
+    gfx_started_ = false;
+}
+
+// NOTE: Not named "frameclear" - agigl/glpipe.cpp already declares a cmd_param with that name,
+// and mem::cmd_param aborts the process if two instances ever share a name (both agigl and
+// agidx9 are always linked together, so a name clash here is not hypothetical).
+static mem::cmd_param PARAM_d3d9_frameclear {"d3d9frameclear"};
+
+
+void agiDX9Pipeline::BeginFrame()
+{
+    ARTS_UTIMED(agiBeginFrame);
+
+    // Age the live light set and retire lights whose sprite has not been drawn recently.
+    // See agiworld/glowlight.h - lights persist across frames rather than being rebuilt, so a
+    // momentary culling or LOD hiccup no longer makes them blink out.
+    agiUpdateGlowLights();
+
+    agiPipeline::BeginFrame();
+
+    if (!dx9_context_->BeginFrame())
+        return;
+
+    IDirect3DDevice9* device = dx9_context_->GetDevice();
+
+    if (PARAM_d3d9_frameclear.get_or(true))
+    {
+        device->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, D3DCOLOR_ARGB(0, 0, 0, 0), 1.0f, 0);
+    }
+
+    // Rebuild the frame's point-light pool and cluster grid, now that agiUpdateGlowLights() above
+    // has aged the registry. Once per frame, not once per draw: the pixel shader finds its own
+    // lights by world position, so there is no per-mesh light selection left to do. See
+    // agiDX9ClusterGrid in dx9shader.h.
+    if (world_shader_.IsValid())
+        world_shader_.UpdateLights(device);
+
+    // D3D9 requires DrawPrimitive calls to happen between BeginScene/EndScene, but callers
+    // (e.g. loading-screen/menu 2D drawing via asCullManager) don't always go through the
+    // explicit BeginScene()/EndScene() pipeline calls below - those are only invoked when a
+    // 3D camera is active. So the D3D9 scene has to span the *entire* frame here instead,
+    // rather than being nested inside the (possibly skipped) BeginScene()/EndScene() pair.
+    d3d_scene_active_ = SUCCEEDED(device->BeginScene());
+}
+
+void agiDX9Pipeline::BeginScene()
+{
+    ARTS_UTIMED(agiBeginScene);
+
+    UpdateZTrick();
+
+    agiPipeline::BeginScene();
+    agiLighter::BeginScene();
+
+    in_scene_ = true;
+
+    renderer_->BeginGroup();
+}
+
+void agiDX9Pipeline::EndScene()
+{
+    ARTS_UTIMED(agiEndScene);
+
+    rasterizer_->EndGroup();
+
+    in_scene_ = false;
+
+    // agiDX9Viewport::Activate() now sets the device viewport, so whichever agiViewport rendered
+    // last leaves its rectangle on the device - and the HUD, text and minimap are all drawn after
+    // this point (see the census note in EndFrame). Restore the full backbuffer so a sub-viewport
+    // pass, notably the rear view mirror at 0.75/0.0 0.25x0.25, cannot clip them.
+    D3DVIEWPORT9 viewport {};
+    viewport.X = 0;
+    viewport.Y = 0;
+    viewport.Width = static_cast<DWORD>(horz_res_);
+    viewport.Height = static_cast<DWORD>(vert_res_);
+    viewport.MinZ = 0.0f;
+    viewport.MaxZ = 1.0f;
+
+    dx9_context_->GetDevice()->SetViewport(&viewport);
+
+    agiPipeline::EndScene();
+}
+
+void agiDX9Pipeline::EndFrame()
+{
+    ARTS_UTIMED(agiEndFrame);
+
+    if (ScreenShotRequested())
+        SaveScreenShot(CaptureScreen());
+
+    if (std::exchange(d3d_scene_active_, false))
+        dx9_context_->GetDevice()->EndScene();
+
+    dx9_context_->Present();
+
+    // Submission census. Reports how much of the frame actually went out as world-space geometry
+    // (model-space vertices + real SetTransform calls, which is what RTX Remix reconstructs from)
+    // versus CPU-pretransformed XYZRHW screen-space triangles, which carry no world information.
+    // Sampled every 120th frame so it stays readable rather than one line per frame.
+    {
+        static u32 census_frames = 0;
+
+        if ((++census_frames % 120) == 0)
+        {
+            u32 world = agiDX9Census.WorldTris;
+            u32 screen = agiDX9Census.ScreenTris;
+            u32 total = world + screen;
+
+            // in-scene screen triangles are the ones that still matter: real 3D content that
+            // never got a world transform. The rest is HUD/text/minimap and is meant to be 2D.
+            u32 screen_3d = agiDX9Census.ScreenTrisInScene;
+            u32 total_3d = world + screen_3d;
+
+            Displayf("DX9 CENSUS: frame=%u world=%u tris in %u calls (%u static-lit, %u unlit) | screen=%u tris in %u "
+                     "calls, of which IN-SCENE(3D)=%u tris in %u calls | lines=%u in %u calls | "
+                     "glowlights=%u live, %u pooled, %u cell slots | "
+                     "cards=%u seen (%u no-tex, %u not-glow, %u harvested) | "
+                     "world share(3D only)=%.1f%% | world share(all)=%.1f%% | tris/call world=%.1f",
+                census_frames, world, agiDX9Census.WorldCalls, agiDX9Census.WorldStaticLitTris,
+                agiDX9Census.WorldUnlitTris, screen, agiDX9Census.ScreenCalls, screen_3d,
+                agiDX9Census.ScreenCallsInScene, agiDX9Census.ScreenLines, agiDX9Census.ScreenLineCalls,
+                agiGlowLightCount, world_shader_.LightCount(), world_shader_.CellFill(), agiGlowCardsSeen,
+                agiGlowCardsNoTexture, agiGlowCardsNotGlow, agiGlowCardsHarvested,
+                total_3d ? (100.0 * world / total_3d) : 0.0, total ? (100.0 * world / total) : 0.0,
+                agiDX9Census.WorldCalls ? (1.0 * world / agiDX9Census.WorldCalls) : 0.0);
+        }
+
+        agiDX9Census = {};
+    }
+
+    agiPipeline::EndFrame();
+}
+
+RcOwner<agiTexDef> agiDX9Pipeline::CreateTexDef()
+{
+    return as_owner arnewr agiDX9TexDef(this);
+}
+
+RcOwner<agiTexLut> agiDX9Pipeline::CreateTexLut()
+{
+    return nullptr;
+}
+
+RcOwner<DLP> agiDX9Pipeline::CreateDLP()
+{
+    return as_owner arnewr RDLP(this);
+}
+
+RcOwner<agiLight> agiDX9Pipeline::CreateLight()
+{
+    return as_owner arnewr agiBILight(this);
+}
+
+RcOwner<agiLightModel> agiDX9Pipeline::CreateLightModel()
+{
+    return as_owner arnewr agiBILightModel(this);
+}
+
+RcOwner<agiViewport> agiDX9Pipeline::CreateViewport()
+{
+    return as_owner arnewr agiDX9Viewport(this);
+}
+
+RcOwner<agiBitmap> agiDX9Pipeline::CreateBitmap()
+{
+    return as_owner arnewr agiDX9Bitmap(this);
+}
+
+void agiDX9Pipeline::CopyBitmap(i32 dst_x, i32 dst_y, agiBitmap* src, i32 src_x, i32 src_y, i32 width, i32 height)
+{
+    if (!IsAppActive())
+        return;
+
+    // FIXME: https://github.com/0x1F9F1/Open1560/issues/22
+    if (src_y + height > src->GetHeight())
+        return;
+
+#ifdef ARTS_DEV_BUILD
+    ++agiBitmapCount;
+    agiBitmapPixels += width * height;
+#endif
+
+    agiTexDef* texture = static_cast<agiDX9Bitmap*>(src)->GetHandle();
+
+    bool debug_draw = agiCurState.GetDrawMode() == agiDrawDepth;
+
+    auto old_tex = agiCurState.SetTexture(debug_draw ? nullptr : texture);
+    auto old_draw_mode = agiCurState.SetDrawMode(agiDrawTextured);
+    auto old_depth = agiCurState.SetZEnable(false);
+    auto old_zwrite = agiCurState.SetZWrite(false);
+    auto old_alpha = agiCurState.SetAlphaEnable(debug_draw ? true : false);
+    auto old_filter = agiCurState.SetTexFilter(agiTexFilter::Point);
+    auto old_fog_mode = agiCurState.SetFogMode(agiFogMode::None);
+    auto old_fog_color = agiCurState.SetFogColor(0x00000000);
+    auto old_blend_set = agiCurState.SetBlendSet(debug_draw ? agiBlendSet::One_One : agiBlendSet::SrcAlpha_InvSrcAlpha);
+
+    agiScreenVtx blank {0.0f, 0.0f, 0.0f, 1.0f, debug_draw ? 0xFF000044 : 0xFFFFFFFF, 0xFFFFFFFF, 0.0f, 0.0f};
+    agiScreenVtx verts[4] {blank, blank, blank, blank};
+    u16 indices[6] {0, 1, 3, 1, 2, 3};
+
+    verts[3].x = verts[0].x = static_cast<f32>(dst_x);
+    verts[1].y = verts[0].y = static_cast<f32>(dst_y);
+    verts[3].tu = verts[0].tu = static_cast<f32>(src_x) / static_cast<f32>(src->GetWidth());
+    verts[1].tv = verts[0].tv = static_cast<f32>(src_y) / static_cast<f32>(src->GetHeight());
+
+    verts[1].x = verts[2].x = static_cast<f32>(dst_x + width);
+    verts[3].y = verts[2].y = static_cast<f32>(dst_y + height);
+    verts[1].tu = verts[2].tu = static_cast<f32>(src_x + width) / static_cast<f32>(src->GetWidth());
+    verts[3].tv = verts[2].tv = static_cast<f32>(src_y + height) / static_cast<f32>(src->GetHeight());
+
+    rasterizer_->Mesh(agiVtxType::Screen, (agiVtx*) verts, 4, indices, 6);
+
+    agiCurState.SetTexture(old_tex);
+    agiCurState.SetDrawMode(old_draw_mode);
+    agiCurState.SetZEnable(old_depth);
+    agiCurState.SetZWrite(old_zwrite);
+    agiCurState.SetAlphaEnable(old_alpha);
+    agiCurState.SetTexFilter(old_filter);
+    agiCurState.SetFogMode(old_fog_mode);
+    agiCurState.SetFogColor(old_fog_color);
+    agiCurState.SetBlendSet(old_blend_set);
+}
+
+void agiDX9Pipeline::ClearAll(i32 color)
+{
+    u8 r = static_cast<u8>(color & 0xFF);
+    u8 g = static_cast<u8>((color >> 8) & 0xFF);
+    u8 b = static_cast<u8>((color >> 16) & 0xFF);
+
+    dx9_context_->GetDevice()->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_XRGB(r, g, b), 1.0f, 0);
+}
+
+void agiDX9Pipeline::ClearRect(i32 x, i32 y, i32 width, i32 height, u32 color)
+{
+    auto tex = agiCurState.SetTexture(nullptr);
+    auto draw_mode = agiCurState.SetDrawMode(agiDrawTextured);
+    auto depth = agiCurState.SetZEnable(false);
+    auto zwrite = agiCurState.SetZWrite(false);
+    auto alpha = agiCurState.SetAlphaEnable(false);
+    auto filter = agiCurState.SetTexFilter(agiTexFilter::Point);
+    auto fog_mode = agiCurState.SetFogMode(agiFogMode::None);
+    auto fog_color = agiCurState.SetFogColor(0x00000000);
+
+    agiScreenVtx blank {0.0f, 0.0f, 0.0f, 1.0f, color | 0xFF000000, 0xFFFFFFFF, 0.0f, 0.0f};
+    agiScreenVtx verts[4] {blank, blank, blank, blank};
+    u16 indices[6] {0, 1, 3, 1, 2, 3};
+
+    verts[3].x = verts[0].x = static_cast<f32>(x);
+    verts[1].y = verts[0].y = static_cast<f32>(y);
+
+    verts[1].x = verts[2].x = static_cast<f32>(x + width);
+    verts[3].y = verts[2].y = static_cast<f32>(y + height);
+
+    rasterizer_->Mesh(agiVtxType::Screen, (agiVtx*) verts, 4, indices, 6);
+
+    agiCurState.SetTexture(tex);
+    agiCurState.SetDrawMode(draw_mode);
+    agiCurState.SetZEnable(depth);
+    agiCurState.SetZWrite(zwrite);
+    agiCurState.SetAlphaEnable(alpha);
+    agiCurState.SetTexFilter(filter);
+    agiCurState.SetFogMode(fog_mode);
+    agiCurState.SetFogColor(fog_color);
+}
+
+void agiDX9Pipeline::Init()
+{
+    // TODO: Properly use width/height/depth
+    width_ = PARAM_width.get_or<i32>(640);
+    height_ = PARAM_height.get_or<i32>(480);
+    bit_depth_ = PARAM_depth.get_or<i32>(32);
+
+    device_flags_1_ = 0x1032; // hal, zbuffer, vram
+
+    if (PARAM_vsync.get_or(true))
+        device_flags_1_ |= 0x1;
+
+    device_flags_2_ = device_flags_1_;
+    device_flags_3_ = device_flags_1_;
+
+    PackShift = PARAM_pack.get_or<i32>(0);
+    AnnotateTextures = PARAM_annotate.get_or(false);
+}
+
+Ptr<agiSurfaceDesc> agiDX9Pipeline::CaptureScreen()
+{
+    IDirect3DDevice9* device = dx9_context_->GetDevice();
+
+    IDirect3DSurface9* backbuffer = nullptr;
+    device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
+
+    D3DSURFACE_DESC desc {};
+    backbuffer->GetDesc(&desc);
+
+    Ptr<agiSurfaceDesc> surface =
+        as_ptr agiSurfaceDesc::Init(desc.Width, desc.Height, agiSurfaceDesc::FromFormat(PixelFormat_B8G8R8));
+
+    IDirect3DSurface9* sysmem = nullptr;
+
+    if (SUCCEEDED(
+            device->CreateOffscreenPlainSurface(desc.Width, desc.Height, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM, &sysmem, nullptr)))
+    {
+        if (SUCCEEDED(device->GetRenderTargetData(backbuffer, sysmem)))
+        {
+            D3DLOCKED_RECT locked;
+
+            if (SUCCEEDED(sysmem->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+            {
+                u8* dst = static_cast<u8*>(surface->Surface);
+                const u8* src = static_cast<const u8*>(locked.pBits);
+
+                for (u32 y = 0; y < desc.Height; ++y)
+                {
+                    const u32* src_row = reinterpret_cast<const u32*>(src + static_cast<usize>(y) * locked.Pitch);
+                    u8* dst_row = dst + static_cast<usize>(y) * surface->Pitch;
+
+                    for (u32 x = 0; x < desc.Width; ++x)
+                    {
+                        u32 pixel = src_row[x];
+                        dst_row[x * 3 + 0] = static_cast<u8>(pixel & 0xFF);
+                        dst_row[x * 3 + 1] = static_cast<u8>((pixel >> 8) & 0xFF);
+                        dst_row[x * 3 + 2] = static_cast<u8>((pixel >> 16) & 0xFF);
+                    }
+                }
+
+                sysmem->UnlockRect();
+            }
+        }
+
+        sysmem->Release();
+    }
+
+    backbuffer->Release();
+
+    return surface;
+}
+
+Owner<agiPipeline> dx9CreatePipeline([[maybe_unused]] i32 argc, [[maybe_unused]] char** argv)
+{
+    Ptr<agiDX9Pipeline> result = arnew agiDX9Pipeline();
+    result->Init();
+    return as_owner result;
+}

@@ -23,6 +23,16 @@
 
 class agiMtlDef;
 class agiTexDef;
+class Matrix34;
+class agiViewParameters;
+struct agiNativeMaterialFx
+{
+    agiTexDef* ReflectionTexture {};
+    f32 ReflectionAmount {0.35f};
+    f32 FresnelBias {0.06f};
+    f32 FresnelScale {0.55f};
+    f32 SpecularBoost {1.0f};
+};
 
 class agiRasterizer : public agiRefreshable
 {
@@ -64,6 +74,42 @@ public:
 
     // ?LineList@agiRasterizer@@UAEXW4agiVtxType@@PATagiVtx@@H@Z
     ARTS_EXPORT virtual void LineList(agiVtxType type, agiVtx* vertices, i32 vertex_count);
+
+    // Not part of the original engine/binary - appended after every original virtual so the
+    // vtable slots ARTS_IMPORT code relies on (by original offset) are left undisturbed.
+    // Lets a renderer with native hardware transform/lighting (agidx9) draw a facet directly
+    // from untransformed model-space data, bypassing agiScreenVtx/RAST->Mesh entirely. Default
+    // implementation reports "unsupported" so every other renderer is unaffected.
+    // static_lighting selects which CPU lighting model this draw would otherwise have used, so
+    // the renderer can replicate the right one in hardware: false = the real-time dynamic light
+    // list (agiLighter::LIGHTS[]/SceneAmbient, correct for cars/wheels/moving objects), true =
+    // the fixed sun/fill1/fill2 + ambient rig (agiMeshLighterSun/Fill1/Fill2/Ambient) that
+    // agiMeshLighterTriple/Quarter compute for StaticLighter/DynamicLighter-lit city geometry
+    // (buildings, terrain) - these are two genuinely different, unrelated lighting sources in
+    // the original engine, not degrees of the same one.
+    // hardware_lighting: false means the vertices already carry their final colors and the
+    // renderer must light nothing (D3DRS_LIGHTING off, vertex diffuse used as-is). Meshes loaded
+    // without MESH_SET_NORMAL have no per-vertex normals at all - the CPU path draws them straight
+    // from their baked agiMeshSet::Colors, and agiMeshLighter* would fault on mesh->Normals[i] if
+    // asked to light them - so they can still take this path, just unlit. The `normal` field of
+    // the submitted vertices is then meaningless and must not be read.
+    virtual bool MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* indices, i32 index_count,
+        const Matrix34& world, const Matrix34& view, const agiViewParameters& proj_params, bool static_lighting,
+        const agiNativeMaterialFx* fx = nullptr, bool hardware_lighting = true)
+    {
+        (void) vertices;
+        (void) vertex_count;
+        (void) indices;
+        (void) index_count;
+        (void) world;
+        (void) view;
+        (void) proj_params;
+        (void) static_lighting;
+        (void) fx;
+        (void) hardware_lighting;
+
+        return false;
+    }
 };
 
 check_size(agiRasterizer, 0x18);

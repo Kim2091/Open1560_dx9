@@ -19,6 +19,18 @@ title: Open1560
     * See a list of changes [here](./changes.md).
 * How do I work with the Open1560 code?
     * See the build instructions [here](./building.md).
+* How does the DirectX 9 renderer work, and how do I build it quickly?
+    * See the [renderer handoff](./handoff_dx9_renderer.md) — project structure, the assembly/C++
+      seam, fast build workflow, and the roadmap.
+* What are the two D3D9 rendering pathways?
+    * See the [rendering pathways design](./dx9_rendering_pathways.md) — fixed-function (RTX Remix
+      compatible) versus programmable (PBR shaders), and the rationale for keeping both.
+* How bright is each kind of light, and what should I tune?
+    * See the [light intensity reference](./light_intensities.md) — every value that feeds a light's
+      brightness, what it was measured at in-game, and a suggested order for a tuning pass.
+* What is planned for the programmable renderer next?
+    * See the [future renderer plan](./future_renderer.md) — sun shadows, area lights, environment
+      probes, water and road reflections without screen space, procedural rain puddles, and AO.
 
 # Support
 

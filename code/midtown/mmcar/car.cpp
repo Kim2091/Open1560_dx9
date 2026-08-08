@@ -64,7 +64,9 @@ mmCar::mmCar()
 
 void mmCar::TranslateFlags(i32 info_flags)
 {
-    u32 flags = CAR_FLAG_ACTIVE;
+    // All four wheels start attached (EjectWheels/EjectPart, both still closed/ARTS_IMPORT, are
+    // the only place that ever clears an individual wheel's bit again after damage).
+    u32 flags = CAR_FLAG_ACTIVE | CAR_FLAG_FL_WHEEL | CAR_FLAG_FR_WHEEL | CAR_FLAG_BL_WHEEL | CAR_FLAG_BR_WHEEL;
 
     flags |= (info_flags & VEH_INFO_FLAG_6_WHEELS) ? CAR_FLAG_6_WHEELS : 0;
     flags |= (info_flags & VEH_INFO_FLAG_TRAILER) ? CAR_FLAG_TRAILER : 0;

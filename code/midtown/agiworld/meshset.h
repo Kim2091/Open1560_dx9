@@ -27,6 +27,7 @@
 
 struct agiMeshCardInfo;
 struct agiMeshCardVertex;
+struct agiNativeMaterialFx;
 class agiTexDef;
 class agiViewParameters;
 
@@ -103,7 +104,7 @@ public:
     ARTS_EXPORT void DrawLitEnv(agiMeshLighter lighter, agiTexDef* env_map, Matrix34& transform, u32 flags);
 
     // ?DrawLitSph@agiMeshSet@@QAEXP6AXPAEPAI1PAV1@@ZPAVagiTexDef@@I@Z | agiworld:meshrend
-    ARTS_IMPORT void DrawLitSph(agiMeshLighter lighter, agiTexDef* sph_map, u32 flags);
+    ARTS_EXPORT void DrawLitSph(agiMeshLighter lighter, agiTexDef* sph_map, u32 flags);
 
     // ?DrawNormals@agiMeshSet@@QAEXAAVVector3@@@Z | agiworld:meshrend
     ARTS_EXPORT void DrawNormals(Vector3& color);
@@ -357,6 +358,29 @@ protected:
     ARTS_EXPORT static i16 vertCounts[256];
 
 private:
+    // Not part of the original engine/binary. Used by Draw()/DrawLit()/DrawLitEnv()/DrawLitSph()
+    // when the active pipeline supports native (hardware) transform + lighting
+    // (agiPipeline::SupportsNativeTransform) - draws directly from untransformed model-space data
+    // via agiRasterizer::MeshWorld(), bypassing Transform/ToScreen/FirstPass entirely. Returns
+    // false (leaving the mesh undrawn) if it can't be handled this way (no per-vertex normals, or
+    // fully outside the view frustum).
+    //
+    // This is the path that makes the scene legible to NVIDIA RTX Remix, which reconstructs 3D
+    // geometry from D3D9 draw calls: it needs model-space vertices plus real
+    // SetTransform(WORLD/VIEW/PROJECTION) calls. CPU-pretransformed screen-space vertices - what
+    // every other renderer here submits - carry no world-space information for it to recover, no
+    // matter how correct they look on screen.
+    //
+    // static_lighting: forwarded to agiRasterizer::MeshWorld() - see its declaration
+    // (agi/rsys.h) for why StaticLighter/DynamicLighter-lit content (buildings/terrain) needs a
+    // different hardware lighting setup than cars/wheels.
+    // base_colors: replaces the mesh's own per-adjunct Colors (DrawColor()'s blended result, or a
+    // caller-supplied override), matching what FirstPass() would have been handed.
+    // unlit: forces hardware lighting off even when the mesh has normals - for draws whose colors
+    // are already final (DrawColor). Meshes without normals are always submitted unlit regardless.
+    b32 DrawNativeTransform(u32 flags, bool static_lighting = false, const agiNativeMaterialFx* fx = nullptr,
+        const u32* base_colors = nullptr, bool unlit = false);
+
     u32 GetBaseCacheSize() const;
 
     // ?DoPageIn@agiMeshSet@@AAEXXZ | agiworld:meshload

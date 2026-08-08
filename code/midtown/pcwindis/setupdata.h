@@ -37,6 +37,7 @@ enum class dxiRendererType : i32
     Removed_DX6 = 2,      // DX6 Hardware
     OpenGL = 3,           // OpenGL Hardware
     SDL2 = 4,             // SDL_Renderer Software
+    D3D9 = 5,             // Direct3D9 Hardware
 };
 
 struct dxiRendererInfo_t
@@ -128,5 +129,5 @@ inline bool IsSoftwareRenderer(dxiRendererType type)
 
 inline bool IsSDLRenderer(dxiRendererType type)
 {
-    return (type == dxiRendererType::OpenGL) || (type == dxiRendererType::SDL2);
+    return (type == dxiRendererType::OpenGL) || (type == dxiRendererType::SDL2) || (type == dxiRendererType::D3D9);
 }

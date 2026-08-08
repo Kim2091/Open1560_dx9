@@ -98,6 +98,10 @@ void AutoDetect(i32 renderer, i32 resolution)
     LightQualityOption = static_cast<f32>(agiRQ.LightQuality);
 
     agiRQ.EnvMap = info.SmoothAlpha && !(info.SpecialFlags & 0x2);
+
+    // DX9 now handles vehicle reflections through agiMeshSet::DrawLitSph()'s native replacement
+    // path rather than the original imported SphereMap() routine, so keep sphere-map quality
+    // toggles enabled across renderers.
     agiRQ.SphMap = info.AdditiveBlending;
 
     MMSTATE.DisablePeds = false;

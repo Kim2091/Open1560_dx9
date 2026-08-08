@@ -26,7 +26,7 @@
 
 static u32 GetSpecialFlags(dxiRendererType type)
 {
-    if (type == dxiRendererType::OpenGL)
+    if (type == dxiRendererType::OpenGL || type == dxiRendererType::D3D9)
         return 0x10 | 0x20;
 
     return 0;
@@ -207,6 +207,9 @@ void EnumerateRenderersSDL()
 
     for (i32 i = 0; i < num_displays; ++i)
         AddVideoDisplay(displays[i], dxiRendererType::OpenGL);
+
+    for (i32 i = 0; i < num_displays; ++i)
+        AddVideoDisplay(displays[i], dxiRendererType::D3D9);
 
     for (i32 i = 0; i < num_displays; ++i)
         AddVideoDisplay(displays[i], dxiRendererType::SDL2);
