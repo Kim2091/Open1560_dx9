@@ -891,6 +891,27 @@ void agiDX9WorldShader::UpdateLights(IDirect3DDevice9* device)
         device->SetSamplerState(stage, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
         device->SetSamplerState(stage, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
     }
+
+    // The reflection probe and the sphere-map sampler belong here too, once per frame.
+    //
+    // They were being re-issued inside Setup(), which runs per DRAW - so on a frame with ~900 draws
+    // that was several thousand redundant SetTexture/SetSamplerState calls. Only the sphere-map
+    // TEXTURE genuinely varies per draw (it is the vehicle's own), and that one binding stays in
+    // Setup; nothing else here changes within a frame.
+    if (Probe.IsValid())
+    {
+        device->SetTexture(3, Probe.GetTexture());
+
+        device->SetSamplerState(3, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(3, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(3, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+    }
+
+    device->SetSamplerState(4, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(4, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(4, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(4, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(4, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 }
 
 static D3DMATRIX ToD3D(const Matrix34& m)
@@ -1070,12 +1091,6 @@ void agiDX9WorldShader::Setup(IDirect3DDevice9* device, const agiDX9WorldDrawInf
 
     if (Probe.IsValid())
     {
-        device->SetTexture(3, Probe.GetTexture());
-
-        device->SetSamplerState(3, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-        device->SetSamplerState(3, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-        device->SetSamplerState(3, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
-
         SetVec4(device, 16, Probe.GetMipCount() - 1.0f, PARAM_d3d9_reflect.get_or(1.0f), agiNativeReflectivity, 1.0f);
 
         // The vehicle's own authored sphere map, when this draw is a car body and the game supplied
@@ -1109,16 +1124,9 @@ void agiDX9WorldShader::Setup(IDirect3DDevice9* device, const agiDX9WorldDrawInf
             }
         }
 
+        // Only the texture, not its sampler state - that is set once per frame in UpdateLights().
         if (sphere)
-        {
             device->SetTexture(4, sphere);
-
-            device->SetSamplerState(4, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
-            device->SetSamplerState(4, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
-            device->SetSamplerState(4, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
-            device->SetSamplerState(4, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-            device->SetSamplerState(4, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-        }
 
         // Sphere-map coordinates are generated from the reflection vector in VIEW space, which is
         // the convention BuildVehicleReflectionVertices() worked out for the fixed-function pass
