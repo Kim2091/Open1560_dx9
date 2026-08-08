@@ -690,6 +690,13 @@ static u32 BuildLightPool(PooledLight* out, u32 max_out)
                 // a warm amber sheet was being classified as white. Only the renderer knows both, so
                 // this is the right place to settle it.
                 intensity = agiClassifyGlowIntensity(tex->Tex.Name, color);
+
+                // Re-checked here as well as at harvest, for the same reason the intensity is:
+                // this is the first point that knows the flare's real hue, and a light the
+                // harvester read as one kind can resolve to another once the texture is sampled.
+                // A kind switched off must stay off through that reclassification.
+                if (!agiGlowKindEnabled(agiClassifyGlowKind(tex->Tex.Name, color)))
+                    continue;
             }
         }
 
@@ -1082,7 +1089,12 @@ void agiDX9WorldShader::Setup(IDirect3DDevice9* device, const agiDX9WorldDrawInf
             if (agiNativeReflectionTex != reported)
             {
                 reported = agiNativeReflectionTex;
-                Displayf("DX9 reflection map: '%s'", agiNativeReflectionTex->Tex.Name);
+
+                // TimeOfDay and Weather are logged alongside it so the mapping is checkable from a
+                // single line: mmEnvSetup[TimeOfDay][Weather] should give REFL_NC at Noon/Clear,
+                // REFL_SC at Sunset/Clear, REFL_DC at Night/Clear, and so on across all sixteen.
+                Displayf("DX9 reflection map: '%s' (TimeOfDay=%d Weather=%d)", agiNativeReflectionTex->Tex.Name,
+                    static_cast<i32>(MMSTATE.TimeOfDay), static_cast<i32>(MMSTATE.Weather));
             }
         }
 

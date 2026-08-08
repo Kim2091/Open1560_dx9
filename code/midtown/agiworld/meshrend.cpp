@@ -1960,6 +1960,61 @@ static mem::cmd_param PARAM_light_generic {"lightgeneric", "Intensity of neutral
 //   amber signal  1.00/0.60/0.10 -> 0.90   hue
 static constexpr f32 kGlowHueSaturation = 0.65f;
 
+// Per-kind on/off, so a light source can be removed from the scene entirely rather than merely
+// dimmed. Setting a kind's intensity to 0 leaves it occupying a pool slot and a cell-grid entry for
+// nothing; these are checked at harvest time, so a disabled kind never enters the registry at all.
+//
+// The kinds are the ones the classifier can genuinely tell apart from the draw stream. Brake and
+// tail lights are deliberately NOT separate switches: both are FXLTGLOWRED on the same mesh and the
+// engine gives no state flag distinguishing them, so a "brakes only" toggle would be a guess
+// dressed up as a setting. Reverse lamps come out as neutral whites and so live under `generic`.
+static mem::cmd_param PARAM_glow_on_head {"glowheadlights", "Headlight cones emit light"};
+static mem::cmd_param PARAM_glow_on_vehicle {"glowvehiclelights", "Vehicle tail and brake lights emit light"};
+static mem::cmd_param PARAM_glow_on_traffic {"glowtrafficlights", "Traffic signals emit light"};
+static mem::cmd_param PARAM_glow_on_lamp {"glowstreetlamps", "Street lamps emit light"};
+static mem::cmd_param PARAM_glow_on_generic {"glowgenericlights", "Neutral white glows (reverse lamps, coronas) emit light"};
+
+bool agiGlowKindEnabled(agiGlowKind kind)
+{
+    switch (kind)
+    {
+        case agiGlowKind::Headlight: return PARAM_glow_on_head.get_or(true);
+        case agiGlowKind::Vehicle: return PARAM_glow_on_vehicle.get_or(true);
+        case agiGlowKind::Traffic: return PARAM_glow_on_traffic.get_or(true);
+        case agiGlowKind::Lamp: return PARAM_glow_on_lamp.get_or(true);
+        default: return PARAM_glow_on_generic.get_or(true);
+    }
+}
+
+// The classification itself, split out so intensity and the on/off switch cannot disagree about
+// what a light is - which is exactly the failure the saturation note below describes.
+agiGlowKind agiClassifyGlowKind(const char* name, const Vector3& color)
+{
+    if (!name)
+        return agiGlowKind::Generic;
+
+    if (std::strstr(name, "CONE"))
+        return agiGlowKind::Headlight;
+
+    if (std::strstr(name, "FXLTGLOWRED") || std::strstr(name, "FXLTGLOWAMBER"))
+        return agiGlowKind::Vehicle;
+
+    const f32 peak = std::max({color.x, color.y, color.z});
+
+    if (peak <= 1e-4f)
+        return agiGlowKind::Lamp;
+
+    const f32 floor_ = std::min({color.x, color.y, color.z});
+
+    if (((peak - floor_) / peak) > kGlowHueSaturation)
+        return agiGlowKind::Traffic;
+
+    if ((color.z / peak) < 0.85f)
+        return agiGlowKind::Lamp;
+
+    return agiGlowKind::Generic;
+}
+
 f32 agiClassifyGlowIntensity(const char* name, const Vector3& color)
 {
     if (!name)
@@ -2036,6 +2091,13 @@ void agiAddGlowLightRGB(
     // well under the ~1.5 m spacing between a car's two tail lights stops them trading slots frame
     // to frame, which is what made them flicker at speed.
     constexpr f32 kMatchDistSq = 0.81f;
+
+    // Kind switches are applied here, before a slot is claimed, so a disabled kind occupies neither
+    // a pool entry nor a cell-grid bucket. The flare itself still draws - these settings control
+    // what a glow EMITS, not whether it is visible, which is the distinction the original engine
+    // draws too (every one of these was a pure billboard that lit nothing).
+    if (!agiGlowKindEnabled(agiClassifyGlowKind(texture ? texture->Tex.Name : nullptr, tint)))
+        return;
 
     f32 best_dist_sq = kMatchDistSq;
     agiGlowLight* slot = nullptr;

@@ -172,6 +172,25 @@ f32 agiGlowLightReach(f32 flare_half_extent);
 //
 // `color` may be at any brightness: the test is on RELATIVE saturation, so a flare that has faded to
 // a tenth of its brightness still classifies as the same kind of light.
+// What sort of light a glow is. These are the distinctions the draw stream actually supports:
+// the engine records no "kind" field, so everything below is recovered from the glow texture's name
+// and the flare's tint. Brake and tail are one kind on purpose - both draw FXLTGLOWRED off the same
+// mesh with no state flag between them, so splitting them would be a guess presented as a setting.
+enum class agiGlowKind
+{
+    Headlight, // FXLTCONE - the headlight cone mesh
+    Vehicle,   // FXLTGLOWRED / FXLTGLOWAMBER - tail and brake lamps
+    Traffic,   // a pure hue - traffic signals
+    Lamp,      // warm near-white - street lamps
+    Generic,   // neutral white - reverse lamps, coronas, everything else
+};
+
+agiGlowKind agiClassifyGlowKind(const char* name, const Vector3& color);
+
+// False when the ini or command line has switched this kind off. Checked at harvest time, so a
+// disabled kind costs no pool slot and no cell-grid entry.
+bool agiGlowKindEnabled(agiGlowKind kind);
+
 f32 agiClassifyGlowIntensity(const char* name, const Vector3& color);
 
 // Called by agiMeshSet::DrawCard for each AlphaGlow billboard it submits.
