@@ -19,6 +19,7 @@
 #pragma once
 
 #include "meshset.h"
+#include "skeleton.h"
 
 class agiMeshModel;
 class bnAnimation;
@@ -28,6 +29,17 @@ class agiLitAnimation
 public:
     // ??0agiLitAnimation@@QAE@PAVagiMeshModel@@PAVbnAnimation@@PAVStream@@@Z
     ARTS_IMPORT agiLitAnimation(agiMeshModel* arg1, bnAnimation* arg2, Stream* arg3);
+
+    // Straight out of the constructor (game.asm ~339488): it writes the model to +0x00 and the
+    // animation to +0x04, then allocates FrameCount pointers at +0x08 and, behind them, one block
+    // of `FrameCount * model->AdjunctCount` BYTES which it Stream::Read()s in whole.
+    //
+    // One byte per adjunct per frame is exactly the shape of agiMeshSet::Normals - a packed index
+    // into the 198-entry UnpackNormal[] table - which is what agiMeshModel::ModelDrawLit relies on:
+    // it swaps this frame's array into Normals for the duration of the lighting call.
+    offset_field(0x00, agiMeshModel*, Model);
+    offset_field(0x04, bnAnimation*, Anim);
+    offset_field(0x08, u8**, Frames);
 
     u8 gap0[0x10];
 };
@@ -44,13 +56,39 @@ public:
     ARTS_IMPORT i32 ModelDraw(u32 arg1, bnAnimation* arg2, i32 arg3);
 
     // ?ModelDrawLit@agiMeshModel@@QAEHP6AXPAEPAI1PAVagiMeshSet@@@ZIPAVagiLitAnimation@@H@Z
-    ARTS_IMPORT i32 ModelDrawLit(void (*arg1)(u8*, u32*, u32*, agiMeshSet*), u32 arg2, agiLitAnimation* arg3, i32 arg4);
+    //
+    // Reimplemented in agiworld/meshmodel.cpp to add the world-space path for pedestrians. The
+    // signature is spelled with agiMeshLighter rather than the raw function-pointer type it was
+    // written as - they are the same type (meshset.h), so the mangled name the assembly calls is
+    // unchanged.
+    ARTS_EXPORT i32 ModelDrawLit(agiMeshLighter arg1, u32 arg2, agiLitAnimation* arg3, i32 arg4);
 
     // ?ModelDrawSkel@agiMeshModel@@QAEHIPAVbnAnimation@@H@Z
     ARTS_IMPORT i32 ModelDrawSkel(u32 arg1, bnAnimation* arg2, i32 arg3);
 
     // ?ModelGeometry@agiMeshModel@@QAEHIPAVbnAnimation@@H@Z
     ARTS_IMPORT i32 ModelGeometry(u32 arg1, bnAnimation* arg2, i32 arg3);
+
+    // The skinning inputs, read from agiMeshModel::ModelGeometry (game.asm ~339065). It walks
+    // SkinGroupCount groups, taking SkinGroupVerts[g] vertices from agiMeshSet::Vertices in order
+    // and transforming each by Skeleton.BoneMatrices[g] - so the mesh's vertex array is partitioned
+    // into runs, one run rigidly bound per bone. There is no per-vertex weighting.
+    //
+    // The skeleton is embedded rather than pointed to: ModelGeometry does `lea ecx, [this+0x7C]`
+    // and calls bnSkeleton::Pose on it directly. It is 0x20 bytes (check_size in skeleton.h), so it
+    // spans 0x7C..0x9C - which is what identifies the two fields the assembly reads as [this+0x90]
+    // and [this+0x98] as Skeleton.BoneCount and Skeleton.BoneMatrices rather than fields of this
+    // class.
+    offset_field(0x6C, i32, SkinGroupCount);
+    offset_field(0x70, u8*, SkinGroupVerts);
+    offset_field(0x7C, bnSkeleton, Skeleton);
+
+    // Per-variation base colours. ModelDrawLit picks VariantColors[MESH_DRAW_GET_VARIANT(flags)]
+    // when VariantColors is non-null and falls back to agiMeshSet::Colors otherwise - the `flags >> 4`
+    // in the assembly is the same variant encoding meshset.h spells as MESH_DRAW_GET_VARIANT, which
+    // is what identifies these two.
+    offset_field(0x9C, u32, HasVariantColors);
+    offset_field(0xA0, u32**, VariantColors);
 
     u8 gap64[0x44];
 };

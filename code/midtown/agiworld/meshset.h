@@ -357,7 +357,11 @@ protected:
     // ?vertCounts@agiMeshSet@@1PAFA | agiworld:meshrend
     ARTS_EXPORT static i16 vertCounts[256];
 
-private:
+    // protected, not private: agiMeshModel::ModelDrawLit (agiworld/meshmodel.cpp) routes animated
+    // pedestrian geometry through the same path. Safe to widen - this is new C++ with no assembly
+    // caller, so unlike an ARTS_IMPORT/EXPORT member its access level is not part of a linked
+    // symbol name.
+protected:
     // Not part of the original engine/binary. Used by Draw()/DrawLit()/DrawLitEnv()/DrawLitSph()
     // when the active pipeline supports native (hardware) transform + lighting
     // (agiPipeline::SupportsNativeTransform) - draws directly from untransformed model-space data
@@ -381,6 +385,11 @@ private:
     b32 DrawNativeTransform(u32 flags, bool static_lighting = false, const agiNativeMaterialFx* fx = nullptr,
         const u32* base_colors = nullptr, bool unlit = false);
 
+    // Back to private immediately. Everything below is either ARTS_IMPORT/EXPORT or a static the
+    // assembly references, and MSVC encodes private/protected/public into the mangled name - so
+    // widening EndGfx() or PageOutCallback() would silently change the symbol this links against.
+    // Only DrawNativeTransform(), which has no assembly caller, may be protected.
+private:
     u32 GetBaseCacheSize() const;
 
     // ?DoPageIn@agiMeshSet@@AAEXXZ | agiworld:meshload

@@ -131,6 +131,27 @@ void agiDX9Pipeline::EndGfx()
     // Before the context: these are device objects and must not outlive the device.
     world_shader_.Shutdown();
 
+    // Drop both light registries. Neither is owned by this pipeline, and both hold pointers that
+    // are about to become dangling: agiGlowLights[] borrows an agiTexDef* per harvested light, and
+    // agiLighter::LIGHTS holds agiLight* registered by DeclareLight(). Quitting a race back to the
+    // menu tears the pipeline down and then resets the engine's memory arena, which frees every one
+    // of those objects wholesale without running a destructor - so RemoveLight() never gets to
+    // compact LIGHTS, and nothing at all trims the glow registry.
+    //
+    // The next BeginFrame() then walks both from agiDX9WorldShader::UpdateLights() -> BuildLightPool
+    // and faults on the first one it dereferences. That is the "ABORT: Exception caught during init"
+    // on Quit to Race Menu, seen as ACCESS_VIOLATION in BuildLightPool with mmLoader::Init below it
+    // on the stack. It needs the programmable path to be enabled, which is why it only shows up with
+    // d3d9shaders = 1.
+    //
+    // Both describe a city that no longer exists, so clearing them loses nothing.
+    agiResetGlowLights();
+
+    agiLighter::Current = 0;
+
+    for (i32 i = 0; i < agiLighter::MAX_LIGHTS; ++i)
+        agiLighter::LIGHTS[i] = nullptr;
+
     // Park the device rather than destroying it - the reference moves to s_parked_device and the
     // next BeginGfx() adopts it. Changing resolution (the 640x480 menu into a 1280x800 race) runs a
     // full EndGfx/BeginGfx cycle, and destroying a D3D9 device only to immediately create another

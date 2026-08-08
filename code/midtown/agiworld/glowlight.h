@@ -190,6 +190,17 @@ void agiAddGlowLightRGB(
 // Called once per frame by the pipeline (agidx9/dx9pipe.cpp, BeginFrame).
 void agiUpdateGlowLights();
 
+// Drops every harvested light. Must be called when the pipeline is torn down.
+//
+// agiGlowLight::Texture is an agiTexDef* borrowed from the draw the light was harvested out of, but
+// this registry is a process-lifetime global while the texture is owned by the pipeline. Quitting a
+// race back to the menu destroys the pipeline AND resets the engine's memory arena, freeing every
+// agiTexDef wholesale, so without this the registry survives holding dangling pointers - and the
+// very next BeginFrame walks them (agiDX9WorldShader::UpdateLights -> BuildLightPool ->
+// agiDX9TexDef::SampleGlowColor) and faults. The lights described here belong to a city that no
+// longer exists, so there is nothing to preserve.
+void agiResetGlowLights();
+
 // 0..1 fade for a light, from its age. Reaches 0 exactly as the light expires.
 inline f32 agiGlowLightFade(u32 age)
 {

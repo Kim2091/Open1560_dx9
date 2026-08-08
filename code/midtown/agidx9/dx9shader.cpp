@@ -256,23 +256,30 @@ bool agiDX9WorldShader::Init(IDirect3DDevice9* device)
         }
     }
 
-    // Clustered lighting storage. A32B32G32R32F because the bucket texture stores light INDICES,
-    // which have to come back out of the sampler exactly - a packed 8-bit format would need a
-    // sentinel value stolen out of the index range, and a half-float one would need conversion on
-    // the CPU for no saving worth having: the two textures together are 136 KB.
+    // Clustered lighting storage. Float formats because both textures store light INDICES and
+    // positions, which have to come back out of the sampler exactly - a packed 8-bit format would
+    // need a sentinel value stolen out of the index range, and a half-float one would need
+    // conversion on the CPU for no saving worth having.
+    //
+    // The bucket texture is single-channel: one light index per texel is what lets the pixel shader
+    // evaluate the light body once instead of four times. See agiDX9ClusterGrid::TexelsPerCell for
+    // the measurements. R32F holds the same 16 floats per cell that A32B32G32R32F did, in the same
+    // 512 KB, so this is a layout change rather than a memory one - which is also why the writer
+    // below is unchanged: it always wrote LightsPerCell contiguous floats per cell.
     //
     // A failure here is soft in the usual way, but it takes the whole path down rather than
     // degrading, because the pixel shader has no non-clustered branch to fall back to. On anything
-    // that reports ps_3_0 this format is present.
+    // that reports ps_3_0 both formats are present.
     const HRESULT light_hr = device->CreateTexture(
         agiDX9ClusterGrid::MaxLights, 2, 1, 0, D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED, &light_tex_, nullptr);
 
-    const HRESULT cell_hr = device->CreateTexture(agiDX9ClusterGrid::TexWidth, agiDX9ClusterGrid::TexHeight, 1, 0,
-        D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED, &cell_tex_, nullptr);
+    const HRESULT cell_hr = device->CreateTexture(
+        agiDX9ClusterGrid::TexWidth, agiDX9ClusterGrid::TexHeight, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED, &cell_tex_, nullptr);
 
     if (FAILED(light_hr) || FAILED(cell_hr))
     {
-        Warningf("DX9 Pathway B: no A32B32G32R32F texture support (0x%X / 0x%X) - staying on the fixed-function path",
+        Warningf(
+            "DX9 Pathway B: no A32B32G32R32F/R32F texture support (0x%X / 0x%X) - staying on the fixed-function path",
             static_cast<u32>(light_hr), static_cast<u32>(cell_hr));
         Shutdown();
         return false;
@@ -756,9 +763,10 @@ void agiDX9WorldShader::UpdateLights(IDirect3DDevice9* device)
 
                 for (u32 slot = 0; slot < agiDX9ClusterGrid::LightsPerCell; ++slot)
                 {
-                    // -1 terminates. The shader stops at the first empty TEXEL, so a partially
-                    // filled texel still has to mask its own tail - hence every unused slot is
-                    // written, not just the first.
+                    // -1 terminates, and the shader breaks on the first one. Every unused slot is
+                    // still written rather than just the first: this is a persistent D3DPOOL_MANAGED
+                    // texture reused every frame, so a stale index left behind by a busier frame
+                    // would be read as a live light.
                     out[slot] = (slot < fill) ? src[slot] : -1.0f;
                 }
             }

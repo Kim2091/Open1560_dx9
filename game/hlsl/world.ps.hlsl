@@ -52,7 +52,12 @@ float4 g_LightCol[3] : register(c10); // c10..c12
 // Light indices per cell, and how many texels that is at 4 indices per texel. Must match
 // agiDX9ClusterGrid::LightsPerCell.
 #define CELL_LIGHTS 16
-#define CELL_TEXELS (CELL_LIGHTS / 4)
+
+// One index per texel - the bucket texture is R32F. ps_3_0 has no relative addressing for
+// temporaries, so the components of a fetched float4 cannot be looped over and four indices to a
+// texel meant the light body was emitted four times. At a measured 59 slots per inlining that was
+// 454 of 512 used. One per texel is one body. See agiDX9ClusterGrid::TexelsPerCell.
+#define CELL_TEXELS CELL_LIGHTS
 
 float4 g_GridDim  : register(c13); // xyz = cells per axis, w = 1 / cell size
 float4 g_GridTex  : register(c14); // x = cells per texture row, y = cell tex width, z = height,
@@ -346,20 +351,22 @@ float4 main(VSOut i, float face : VFACE) : COLOR0
     // texture. The body is counted once against the instruction budget however many lights the cell
     // holds, and the [loop] break means a cell with two lights in it costs two lights' work rather
     // than the worst case.
+    //
+    // One EvalPointLight call, deliberately. Four calls here - one per component of an RGBA bucket
+    // texel - cost four inlined copies of the entire Cook-Torrance body, because ps_3_0 cannot index
+    // a temporary register dynamically and so cannot loop over slot.x/y/z/w. That was 454 of 512
+    // slots. With one index per texel the trip count carries the remaining lights for free.
     [loop]
     for (int t = 0; t < CELL_TEXELS; ++t)
     {
-        float4 slot = tex2Dlod(g_CellTex, float4(cell_u + ((float) t * cell_du), cell_v, 0.0f, 0.0f));
+        float index = tex2Dlod(g_CellTex, float4(cell_u + ((float) t * cell_du), cell_v, 0.0f, 0.0f)).x;
 
-        // The builder fills slots in order, so an empty first index means this texel and every one
-        // after it is empty.
-        if (slot.x < 0.0f)
+        // The builder fills slots in order and writes -1 to the rest, so the first empty slot ends
+        // the cell.
+        if (index < 0.0f)
             break;
 
-        direct += EvalPointLight(slot.x, i.WorldPos, N, V, diffuse_color, f0, a, NdotV);
-        direct += EvalPointLight(slot.y, i.WorldPos, N, V, diffuse_color, f0, a, NdotV);
-        direct += EvalPointLight(slot.z, i.WorldPos, N, V, diffuse_color, f0, a, NdotV);
-        direct += EvalPointLight(slot.w, i.WorldPos, N, V, diffuse_color, f0, a, NdotV);
+        direct += EvalPointLight(index, i.WorldPos, N, V, diffuse_color, f0, a, NdotV);
     }
 
     // --- Indirect ------------------------------------------------------------------------------

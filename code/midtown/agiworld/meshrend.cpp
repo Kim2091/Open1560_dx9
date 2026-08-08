@@ -834,7 +834,15 @@ void agiMeshSet::InitViewport(agiViewParameters& params)
 #define NATIVE_DRAWLITENV 0x4u
 #define NATIVE_DRAWCOLOR 0x8u
 
+// Default rises to 0x1F with the model path (pedestrians, agiworld/meshmodel.cpp) added.
+bool agiNativePathEnabled(u32 which);
+
 static bool NativePathEnabled(u32 which)
+{
+    return agiNativePathEnabled(which);
+}
+
+bool agiNativePathEnabled(u32 which)
 {
     static const u32 mask = []() -> u32 {
         // std::getenv is deprecated by MSVC and this build is /WX; the alternatives are either
@@ -845,7 +853,10 @@ static bool NativePathEnabled(u32 which)
         const char* value = std::getenv("OPEN1560_NATIVE_MASK");
 #pragma warning(pop)
 
-        u32 parsed = value ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0xFu;
+        // 0x1F, i.e. including NATIVE_DRAWMODEL (0x10) for pedestrians - verified in game: peds are
+        // submitted through DrawNativeTransform and light per-pixel off the clustered point lights,
+        // where before they were CPU-pretransformed and reacted to nothing.
+        u32 parsed = value ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0x1Fu;
         Displayf("DX9 NATIVE_MASK = 0x%X (%s)", parsed, value ? "from environment" : "default");
         return parsed;
     }();
@@ -2098,6 +2109,17 @@ void agiAddGlowLightRGB(
                 slot->Intensity, u, v, position.x, position.y, position.z);
         }
     }
+}
+
+void agiResetGlowLights()
+{
+    // Zero the slots as well as the count. The count alone would be enough for the loops that read
+    // this registry, but leaving freed agiTexDef pointers lying in the array is exactly the state
+    // that produced the crash this exists to prevent - so do not leave them readable.
+    for (u32 i = 0; i < agiGlowLightCount; ++i)
+        agiGlowLights[i] = {};
+
+    agiGlowLightCount = 0;
 }
 
 void agiUpdateGlowLights()

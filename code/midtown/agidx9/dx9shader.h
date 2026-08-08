@@ -107,7 +107,24 @@ struct agiDX9ClusterGrid
     // Lights considered per cell. Overflow drops the weakest, because the pool is inserted in
     // descending energy order.
     static constexpr u32 LightsPerCell = 16;
-    static constexpr u32 TexelsPerCell = LightsPerCell / 4;
+
+    // One index per texel, not four. The bucket texture is D3DFMT_R32F rather than a packed RGBA
+    // format, which costs nothing in memory - 16 floats per cell either way, 512 KB total - and buys
+    // back a third of the ps_3_0 instruction budget.
+    //
+    // With four indices to a texel the shader had to evaluate slot.x/y/z/w explicitly, and since
+    // ps_3_0 has no relative addressing for temporaries there is no way to loop over the components
+    // of a fetched vector: the light body was emitted four times inside the loop. Measured with fxc,
+    // each inlining costs 59 slots (4 texture, 55 arithmetic), so the four cost 454 of 512 and left
+    // 58 for everything else. One index per texel means one body, and the loop trip count carries
+    // the other fifteen lights at no static cost - which is the entire point of putting the lights
+    // in a texture (see the tex2Dlod note in dx9_rendering_pathways.md §B0c).
+    //
+    // The dynamic cost is near enough unchanged: a full cell now runs 16 iterations of one light
+    // instead of 4 iterations of four, so the same 16 lights are evaluated, and the early break gets
+    // finer-grained rather than coarser - a cell holding one light now stops after one fetch instead
+    // of evaluating a whole texel's worth of empty slots.
+    static constexpr u32 TexelsPerCell = LightsPerCell;
 
     // Buckets are laid out as a 2D texture rather than one enormous column: 64 cells per row keeps
     // both dimensions well inside the 4096 limit every ps_3_0 part guarantees.
