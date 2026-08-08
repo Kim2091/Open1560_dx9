@@ -60,6 +60,7 @@ static mem::cmd_param PARAM_d3d9_flashpower {"d3d9flashpower", "Brightness of th
 static mem::cmd_param PARAM_d3d9_cellsize {"d3d9cellsize", "Cluster grid cell size, in world units"};
 static mem::cmd_param PARAM_d3d9_lightspec {"d3d9lightspec", "Specular response from clustered point lights"};
 static mem::cmd_param PARAM_d3d9_sun {"d3d9sun", "Time-of-day and weather driven sun instead of the engine's"};
+static mem::cmd_param PARAM_d3d9_reflect {"d3d9reflect", "Strength of environment reflections"};
 
 // Sun direction and colour for the current MMSTATE.TimeOfDay x MMSTATE.Weather.
 //
@@ -359,6 +360,10 @@ bool agiDX9WorldShader::Init(IDirect3DDevice9* device)
 
     cell_size_ = std::max(PARAM_d3d9_cellsize.get_or(24.0f), 1.0f);
 
+    // Soft failure: without a probe the shader falls back to the flat hemisphere term it used
+    // before, which is worse-looking but perfectly functional.
+    Probe.Init(device);
+
     valid_ = true;
     Displayf("DX9 Pathway B: programmable path active (vs_3_0/ps_3_0), clustered lighting %ux%ux%u cells, %u lights",
         agiDX9ClusterGrid::DimX, agiDX9ClusterGrid::DimY, agiDX9ClusterGrid::DimZ, agiDX9ClusterGrid::MaxLights);
@@ -369,6 +374,8 @@ bool agiDX9WorldShader::Init(IDirect3DDevice9* device)
 void agiDX9WorldShader::Shutdown()
 {
     valid_ = false;
+
+    Probe.Shutdown();
 
     if (vs_)
     {
@@ -1037,6 +1044,27 @@ void agiDX9WorldShader::Setup(IDirect3DDevice9* device, const agiDX9WorldDrawInf
     // the parity baseline (dx9_rendering_pathways.md §2). -d3d9sun 0 restores the engine's own.
     if (PARAM_d3d9_sun.get_or(true))
         agiDX9ComputeSunLight(dirs[0], cols[0]);
+
+    // Refresh the reflection probe from the same sun and sky this frame is lit by, so what a car
+    // reflects and what lights it cannot disagree. Update() is a no-op unless something moved.
+    Probe.Update(dirs[0], cols[0], Vector3 {amb_r * 1.35f, amb_g * 1.35f, amb_b * 1.35f},
+        Vector3 {amb_r * 0.50f, amb_g * 0.50f, amb_b * 0.50f});
+
+    if (Probe.IsValid())
+    {
+        device->SetTexture(3, Probe.GetTexture());
+
+        device->SetSamplerState(3, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(3, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        device->SetSamplerState(3, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+
+        SetVec4(device, 16, Probe.GetMipCount() - 1.0f, PARAM_d3d9_reflect.get_or(1.0f), agiNativeReflectivity, 1.0f);
+    }
+    else
+    {
+        // w = 0 tells the shader there is no probe, so it keeps the flat hemisphere term.
+        SetVec4(device, 16, 0.0f, 0.0f, 0.0f, 0.0f);
+    }
 
     f32 light_dirs[12] {};
     f32 light_cols[12] {};

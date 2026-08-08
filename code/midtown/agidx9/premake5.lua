@@ -19,6 +19,8 @@ arts_component "agidx9"
         "dx9shader.h",
         "dx9target.cpp",
         "dx9target.h",
+        "dx9probe.cpp",
+        "dx9probe.h",
     }
 
     -- Deliberately no `links { "d3d9" }`. A link-time import binds d3d9.dll at process load, which

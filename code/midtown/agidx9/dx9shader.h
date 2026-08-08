@@ -28,6 +28,8 @@
 
 #include "vector7/vector3.h"
 
+#include "dx9probe.h"
+
 class Matrix34;
 class agiDX9TexDef;
 class agiViewParameters;
@@ -140,6 +142,11 @@ struct agiDX9ClusterGrid
 
 class agiDX9WorldShader
 {
+public:
+    // The environment probe cars reflect. Owned here because it is rebuilt from the same sun and
+    // sky the constant upload already has in hand. See dx9probe.h.
+    agiDX9SkyProbe Probe;
+
 public:
     // Returns false if this device or this machine cannot support the path (no ps_3_0, no
     // d3dcompiler, a shader that failed to compile). The caller then simply stays on Pathway A -

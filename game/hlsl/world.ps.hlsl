@@ -63,10 +63,12 @@ float4 g_GridDim  : register(c13); // xyz = cells per axis, w = 1 / cell size
 float4 g_GridTex  : register(c14); // x = cells per texture row, y = cell tex width, z = height,
                                    // w = specular from point lights on/off
 float4 g_LightTexInfo : register(c15); // x = 1 / max lights (light texture width)
+float4 g_EnvInfo : register(c16); // x = highest mip index, y = reflection strength, w = 0 when no probe
 
 sampler2D g_Albedo   : register(s0);
 sampler2D g_LightTex : register(s1); // row 0: xyz = world pos, w = 1/reach^2. row 1: rgb = colour
-sampler2D g_CellTex  : register(s2); // xyzw = four light indices, -1 = empty
+sampler2D g_CellTex  : register(s2); // x = one light index, -1 = empty (see CELL_TEXELS)
+samplerCUBE g_EnvCube : register(s3); // analytic sky/ground/sun probe, mip = roughness (dx9probe.h)
 
 static const float PI = 3.14159265f;
 
@@ -386,18 +388,50 @@ float4 main(VSOut i, float face : VFACE) : COLOR0
     // it again would square it and crush every painted surface.
     float3 indirect = diffuse_color * irradiance;
 
-    // Environment specular, damped by roughness.
+    // Environment specular.
     //
-    // EnvBRDFApprox already folds roughness into the split-sum fit, but its Fresnel rise at grazing
-    // angles is strong - and a road is the worst case for it, because it is enormous, flat, and
-    // viewed almost edge-on across most of the screen. Against a bright sky irradiance that produced
-    // the broad wet-looking sheen sweeping down the carriageway, which is not what dry asphalt does.
+    // With a real prefiltered probe this is finally the textbook split-sum term: a reflection vector
+    // into a cubemap whose mip level stands for roughness, multiplied by the EnvBRDF fit. That is
+    // what makes car paint read as paint - it has something specific to reflect (sky above, road
+    // below, a hot sun lobe) instead of one flat irradiance value from every direction.
     //
-    // Damping by (1 - roughness) is a judgement call rather than a derivation: it leaves smooth
-    // materials (glass, car lacquer) their full environment response and pulls it out of the rough
-    // ones, which is where the artefact lives. The physically tidier fix is a real prefiltered
-    // environment probe, which needs render targets this path does not have yet.
-    indirect += irradiance * EnvBRDFApprox(f0, roughness, NdotV) * (1.0f - roughness);
+    // It also retires a workaround. This used to be `irradiance * EnvBRDF * (1 - roughness)`, and
+    // the damping term was a judgement call to kill a broad wet-looking sheen that swept down the
+    // carriageway: a road is enormous, flat and viewed almost edge-on, so EnvBRDFApprox's grazing
+    // Fresnel rise against a single bright irradiance value lit the whole thing. A prefiltered probe
+    // fixes that at the source rather than by subtraction, because a rough road samples the bottom
+    // of the mip chain and sees the dim ground colour, not the bright sky. The note in
+    // dx9_rendering_pathways.md §B6 called this out as the physically tidier fix; this is it.
+    //
+    // g_EnvInfo.w is 0 when no probe could be created, in which case the old flat term is kept -
+    // worse looking, still correct.
+    if (g_EnvInfo.w > 0.5f)
+    {
+        // g_EnvInfo.z is the draw's reflectivity - 1 on a vehicle body, 0 on everything else. A car
+        // is lacquered, so it reflects far more sharply than the roughness its material table gives
+        // it, which is tuned for the body's diffuse response. Pulling the sampled roughness down
+        // rather than overriding it keeps a matte-painted vehicle matte relative to a glossy one.
+        //
+        // This is what agiRQ.SphMap now controls: the engine's own "vehicle reflections" option,
+        // driving a cubemap lookup instead of the CPU sphere-map pass that cannot run on this path.
+        float refl = g_EnvInfo.z;
+
+        float env_rough = roughness * (1.0f - (refl * 0.75f));
+
+        float3 R = reflect(-V, N);
+
+        float3 env = texCUBElod(g_EnvCube, float4(R, env_rough * g_EnvInfo.x)).rgb;
+
+        // A clearcoat lobe on top of the body's own response, rather than in place of it - the
+        // paint underneath still reads as its own colour.
+        float strength = g_EnvInfo.y * (1.0f + (refl * 1.5f));
+
+        indirect += env * EnvBRDFApprox(f0, env_rough, NdotV) * strength;
+    }
+    else
+    {
+        indirect += irradiance * EnvBRDFApprox(f0, roughness, NdotV) * (1.0f - roughness);
+    }
 
     float3 color = direct + indirect;
 

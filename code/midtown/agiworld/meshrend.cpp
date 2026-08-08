@@ -1105,6 +1105,13 @@ b32 agiMeshSet::DrawLit(agiMeshLighter lighter, u32 flags, u32* colors)
     return drawn;
 }
 
+// Reflectivity of the draw in flight, 0 for ordinary geometry and 1 for a vehicle body.
+//
+// A global rather than a parameter because agiMeshSet's layout is frozen and DrawLitSph reaches
+// MeshWorld through DrawLit and DrawNativeTransform, neither of which can grow an argument without
+// touching call sites the assembly owns. agiNativeDrawRadius sets the precedent.
+f32 agiNativeReflectivity = 0.0f;
+
 void agiMeshSet::DrawLitSph(agiMeshLighter lighter, agiTexDef* sph_map, u32 flags)
 {
     // Vehicle bodies. DrawLit() now takes the hardware-transform path here too, which is what puts
@@ -1117,7 +1124,26 @@ void agiMeshSet::DrawLitSph(agiMeshLighter lighter, agiTexDef* sph_map, u32 flag
     // The sphere-map specular overlay stays off on the native path: SphereMap() is closed
     // ARTS_IMPORT code that reads the CPU Geometry() pass's leftover scratch state, which this
     // path never populates, and calling it there hard-crashes.
-    if (DrawLit(lighter, flags, nullptr) && sph_map && !Pipe()->SupportsNativeTransform())
+    //
+    // What replaces it is the environment probe (agidx9/dx9probe.h). This is the one entry point
+    // vehicle bodies come through - the player's car, traffic and opponents all reach it via
+    // aiVehicleInstance::Draw and mmCarModel - so it is where a body is identified as something
+    // that should reflect its surroundings rather than merely be shaded.
+    //
+    // agiRQ.SphMap keeps its meaning as "vehicle reflections on", which is what the graphics option
+    // says it is. It just drives a cubemap lookup in the pixel shader now instead of a second CPU
+    // pass that could not run here without aborting.
+    const bool reflective = sph_map && agiRQ.SphMap && Pipe()->SupportsNativeTransform();
+
+    agiNativeReflectivity = reflective ? 1.0f : 0.0f;
+
+    const b32 drawn = DrawLit(lighter, flags, nullptr);
+
+    // Strictly scoped: anything drawn after this - road, buildings, particles - must not inherit a
+    // car's reflectivity.
+    agiNativeReflectivity = 0.0f;
+
+    if (drawn && sph_map && !Pipe()->SupportsNativeTransform())
         SphereMap(sph_map, 0xFFFFFFFF);
 }
 

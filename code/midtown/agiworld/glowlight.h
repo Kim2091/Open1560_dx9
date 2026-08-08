@@ -94,6 +94,11 @@ inline constexpr u32 AGI_GLOW_LIGHT_FADE = 6;
 // culling described in §1.3 of the design doc will want it.
 extern f32 agiNativeDrawRadius;
 
+// Reflectivity of the draw in flight: 0 for ordinary geometry, 1 for a vehicle body. Set by
+// agiMeshSet::DrawLitSph and consumed by the DX9 world shader to pick up the environment probe.
+// See the note where it is defined (agiworld/meshrend.cpp).
+extern f32 agiNativeReflectivity;
+
 // Lightning intensity, 0..1, latched and decayed once per frame by mmCullCity::Cull().
 //
 // The original lightning is a one-frame swap of the sky texture (see mmSky::DoFlash) and lights
