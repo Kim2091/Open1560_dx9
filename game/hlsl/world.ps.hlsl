@@ -49,8 +49,6 @@ float4 g_LightCol[3] : register(c10); // c10..c12
 // view matrix and a mirrored projection) and a world-space grid is correct for all of them with no
 // rebuild. See agiDX9ClusterGrid in agidx9/dx9shader.h.
 
-// Light indices per cell, and how many texels that is at 4 indices per texel. Must match
-// agiDX9ClusterGrid::LightsPerCell.
 // Quality tier, from -d3d9quality / the ini. Set by the compiler, not edited here.
 //
 //   2 - everything. Three analytic directionals with full Cook-Torrance, specular from every
@@ -70,11 +68,16 @@ float4 g_LightCol[3] : register(c10); // c10..c12
 
 #define CELL_LIGHTS 16
 
-// One index per texel - the bucket texture is R32F. ps_3_0 has no relative addressing for
-// temporaries, so the components of a fetched float4 cannot be looped over and four indices to a
-// texel meant the light body was emitted four times. At a measured 59 slots per inlining that was
-// 454 of 512 used. One per texel is one body. See agiDX9ClusterGrid::TexelsPerCell.
-#define CELL_TEXELS CELL_LIGHTS
+// Light indices per cell. Must match agiDX9ClusterGrid::LightsPerCell.
+// Indices per bucket texel, from -d3d9cellpack. 1 = R32F, 16 iterations, light body emitted once.
+// 4 = A32B32G32R32F, 4 iterations, body emitted four times (ps_3_0 cannot index a fetched vector's
+// components, so they must be written out). The first frees ~170 instruction slots; the second runs
+// a quarter of the loop iterations. Which wins is hardware-dependent - see agiDX9ClusterGrid.
+#ifndef CELL_PACK
+#define CELL_PACK 1
+#endif
+
+#define CELL_TEXELS (CELL_LIGHTS / CELL_PACK)
 
 float4 g_GridDim  : register(c13); // xyz = cells per axis, w = 1 / cell size
 float4 g_GridTex  : register(c14); // x = cells per texture row, y = cell tex width, z = height,
@@ -414,14 +417,20 @@ float4 main(VSOut i, float face : VFACE) : COLOR0
     [loop]
     for (int t = 0; t < CELL_TEXELS; ++t)
     {
-        float index = tex2Dlod(g_CellTex, float4(cell_u + ((float) t * cell_du), cell_v, 0.0f, 0.0f)).x;
+        float4 slot = tex2Dlod(g_CellTex, float4(cell_u + ((float) t * cell_du), cell_v, 0.0f, 0.0f));
 
         // The builder fills slots in order and writes -1 to the rest, so the first empty slot ends
         // the cell.
-        if (index < 0.0f)
+        if (slot.x < 0.0f)
             break;
 
-        direct += EvalPointLight(index, i.WorldPos, N, V, diffuse_color, f0, a, NdotV);
+        direct += EvalPointLight(slot.x, i.WorldPos, N, V, diffuse_color, f0, a, NdotV);
+
+#if CELL_PACK == 4
+        direct += EvalPointLight(slot.y, i.WorldPos, N, V, diffuse_color, f0, a, NdotV);
+        direct += EvalPointLight(slot.z, i.WorldPos, N, V, diffuse_color, f0, a, NdotV);
+        direct += EvalPointLight(slot.w, i.WorldPos, N, V, diffuse_color, f0, a, NdotV);
+#endif
     }
 
     // --- Indirect ------------------------------------------------------------------------------

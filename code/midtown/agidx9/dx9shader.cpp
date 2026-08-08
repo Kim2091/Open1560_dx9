@@ -27,6 +27,9 @@
 #include "agiworld/meshset.h"
 #include "agiworld/texsheet.h"
 #include "mmcityinfo/state.h"
+// OpenFile: the same loader agigl uses for its GLSL (agigl/glrsys.cpp, LoadShader), so shaders can
+// live in an archive or as loose files.
+#include "stream/fsystem.h"
 #include "stream/stream.h"
 #include "vector7/matrix34.h"
 
@@ -46,11 +49,6 @@
 
 define_dummy_symbol(agidx9_dx9shader);
 
-// ?OpenFile@@YA?AV?$Ptr@VStream@@@@PBD00HPBD@Z - the same loader agigl uses for its GLSL
-// (agigl/glrsys.cpp, LoadShader), so shaders can live in an archive or as loose files.
-ARTS_IMPORT extern Ptr<Stream> OpenFile(const char* file, const char* folder, const char* ext, i32 ext_id,
-    const char* desc);
-
 static mem::cmd_param PARAM_d3d9_exposure {"d3d9exposure", "Pathway B exposure multiplier"};
 static mem::cmd_param PARAM_d3d9_heightfog {"d3d9heightfog", "Pathway B fog height falloff (per world unit)"};
 static mem::cmd_param PARAM_d3d9_tonemap {"d3d9tonemap", "Pathway B ACES filmic tonemapping"};
@@ -68,6 +66,14 @@ static mem::cmd_param PARAM_d3d9_reflect {"d3d9reflect", "Strength of environmen
 // auto-detect because there is nothing reliable to detect on: D3DCAPS9 reports what a part can do,
 // not how fast, and every ps_3_0 device claims the same feature set.
 static mem::cmd_param PARAM_d3d9_quality {"d3d9quality", "Shader quality tier: 0 low, 1 medium, 2 high"};
+
+// Light indices per bucket texel: 1 (R32F, 16 loop iterations) or 4 (A32B32G32R32F, 4 iterations).
+static mem::cmd_param PARAM_d3d9_cellpack {"d3d9cellpack", "Light indices per bucket texel: 1 or 4"};
+
+u32 agiDX9CellPack()
+{
+    return (PARAM_d3d9_cellpack.get_or(1) >= 4) ? 4u : 1u;
+}
 
 const char* agiDX9QualityString()
 {
@@ -126,6 +132,21 @@ static void agiDX9ComputeSunLight(Vector3& out_dir, Vector3& out_color)
     const i32 time_index = std::clamp(static_cast<i32>(MMSTATE.TimeOfDay), 0, 3);
     const i32 weather_index = std::clamp(static_cast<i32>(MMSTATE.Weather), 0, 3);
 
+    // Memoised on the preset pair, because this is reached from Setup() - once per DRAW - and the
+    // answer only changes when the player changes the race settings. Two sin and two cos per draw
+    // is not much on its own, but at ~900 draws a frame nothing in this function should run twice.
+    static i32 cached_time = -1;
+    static i32 cached_weather = -1;
+    static Vector3 cached_dir {};
+    static Vector3 cached_color {};
+
+    if ((time_index == cached_time) && (weather_index == cached_weather))
+    {
+        out_dir = cached_dir;
+        out_color = cached_color;
+        return;
+    }
+
     const SunPreset& time = kByTime[time_index];
     const WeatherPreset& weather = kByWeather[weather_index];
 
@@ -147,6 +168,11 @@ static void agiDX9ComputeSunLight(Vector3& out_dir, Vector3& out_color)
     out_color.x = (time.R + ((luma - time.R) * desat)) * weather.Scale;
     out_color.y = (time.G + ((luma - time.G) * desat)) * weather.Scale;
     out_color.z = (time.B + ((luma - time.B) * desat)) * weather.Scale;
+
+    cached_time = time_index;
+    cached_weather = weather_index;
+    cached_dir = out_dir;
+    cached_color = out_color;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -210,6 +236,7 @@ static ConstString LoadShaderSource(const char* name, const char* ext)
 }
 
 const char* agiDX9QualityString();
+u32 agiDX9CellPack();
 
 // Compiles one shader. `lit` selects the LIT permutation of the pixel shader; see world.ps.hlsl.
 static ID3DBlob* CompileShader(const char* name, const char* ext, const char* target, bool lit)
@@ -230,9 +257,10 @@ static ID3DBlob* CompileShader(const char* name, const char* ext, const char* ta
     // QUALITY selects the tier permutation; see the note at the top of world.ps.hlsl. It is passed
     // to both permutations so the unlit one stays in step, even though it uses none of it today.
     const char* quality = agiDX9QualityString();
+    const char* pack = (agiDX9CellPack() == 4) ? "4" : "1";
 
-    const D3D_SHADER_MACRO lit_defines[] {{"LIT", "1"}, {"QUALITY", quality}, {nullptr, nullptr}};
-    const D3D_SHADER_MACRO unlit_defines[] {{"QUALITY", quality}, {nullptr, nullptr}};
+    const D3D_SHADER_MACRO lit_defines[] {{"LIT", "1"}, {"QUALITY", quality}, {"CELL_PACK", pack}, {nullptr, nullptr}};
+    const D3D_SHADER_MACRO unlit_defines[] {{"QUALITY", quality}, {"CELL_PACK", pack}, {nullptr, nullptr}};
 
     ID3DBlob* code = nullptr;
     ID3DBlob* errors = nullptr;
@@ -254,8 +282,8 @@ static ID3DBlob* CompileShader(const char* name, const char* ext, const char* ta
     //
     // If a future shader genuinely benefits from the higher levels, measure it the same way before
     // raising this - and note the ceiling is the 512-slot limit, which level 1 is already meeting.
-    HRESULT hr = compile(source.get(), std::strlen(source.get()), name, lit ? lit_defines : unlit_defines, nullptr, "main",
-        target, D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errors);
+    HRESULT hr = compile(source.get(), std::strlen(source.get()), name, lit ? lit_defines : unlit_defines, nullptr,
+        "main", target, D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errors);
 
     if (errors)
     {
@@ -303,7 +331,8 @@ bool agiDX9WorldShader::Init(IDirect3DDevice9* device)
     if (ok)
     {
         ok = SUCCEEDED(device->CreateVertexShader(static_cast<const DWORD*>(vs_code->GetBufferPointer()), &vs_)) &&
-            SUCCEEDED(device->CreatePixelShader(static_cast<const DWORD*>(ps_lit_code->GetBufferPointer()), &ps_lit_)) &&
+            SUCCEEDED(
+                device->CreatePixelShader(static_cast<const DWORD*>(ps_lit_code->GetBufferPointer()), &ps_lit_)) &&
             SUCCEEDED(
                 device->CreatePixelShader(static_cast<const DWORD*>(ps_unlit_code->GetBufferPointer()), &ps_unlit_));
     }
@@ -330,8 +359,7 @@ bool agiDX9WorldShader::Init(IDirect3DDevice9* device)
         {0, 0, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
         {0, 12, D3DDECLTYPE_FLOAT3, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL, 0},
         {0, 24, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR, 0},
-        {0, 28, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0},
-        D3DDECL_END()};
+        {0, 28, D3DDECLTYPE_FLOAT2, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0}, D3DDECL_END()};
 
     if (FAILED(device->CreateVertexDeclaration(kElements, &decl_)))
     {
@@ -370,8 +398,21 @@ bool agiDX9WorldShader::Init(IDirect3DDevice9* device)
     const HRESULT light_hr = device->CreateTexture(
         agiDX9ClusterGrid::MaxLights, 2, 1, 0, D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED, &light_tex_, nullptr);
 
-    const HRESULT cell_hr = device->CreateTexture(
-        agiDX9ClusterGrid::TexWidth, agiDX9ClusterGrid::TexHeight, 1, 0, D3DFMT_R32F, D3DPOOL_MANAGED, &cell_tex_, nullptr);
+    // Bucket packing, and the whole reason it is switchable.
+    //
+    // One index per texel frees ~170 ps_3_0 instruction slots, because the light body is emitted
+    // once instead of four times - but it also makes the shader's loop run up to 16 iterations
+    // instead of 4, quadrupling the loop-control and bucket-fetch work. Static slots and dynamic
+    // cost pull in opposite directions here, and which one dominates is a property of the hardware:
+    // dynamic flow control in ps_3_0 is disproportionately expensive on older integrated parts.
+    //
+    // So it is measurable rather than assumed. -d3d9cellpack 4 restores the original packing.
+    cell_pack_ = (PARAM_d3d9_cellpack.get_or(1) >= 4) ? 4u : 1u;
+    texels_per_cell_ = agiDX9ClusterGrid::LightsPerCell / cell_pack_;
+    cell_tex_width_ = agiDX9ClusterGrid::CellsPerRow * texels_per_cell_;
+
+    const HRESULT cell_hr = device->CreateTexture(cell_tex_width_, agiDX9ClusterGrid::TexHeight, 1, 0,
+        (cell_pack_ == 4) ? D3DFMT_A32B32G32R32F : D3DFMT_R32F, D3DPOOL_MANAGED, &cell_tex_, nullptr);
 
     if (FAILED(light_hr) || FAILED(cell_hr))
     {
@@ -530,8 +571,8 @@ static void Mul4x4(D3DMATRIX& out, const D3DMATRIX& a, const D3DMATRIX& b)
     {
         for (i32 c = 0; c < 4; ++c)
         {
-            out.m[r][c] = (a.m[r][0] * b.m[0][c]) + (a.m[r][1] * b.m[1][c]) + (a.m[r][2] * b.m[2][c]) +
-                (a.m[r][3] * b.m[3][c]);
+            out.m[r][c] =
+                (a.m[r][0] * b.m[0][c]) + (a.m[r][1] * b.m[1][c]) + (a.m[r][2] * b.m[2][c]) + (a.m[r][3] * b.m[3][c]);
         }
     }
 }
@@ -565,16 +606,58 @@ static void SetNormalMatrix(IDirect3DDevice9* device, u32 reg, const Matrix34& w
     Vector3 r2 {(a.y * b.z) - (a.z * b.y), (a.z * b.x) - (a.x * b.z), (a.x * b.y) - (a.y * b.x)};
 
     // (cofactor matrix) is already the inverse-transpose up to scale. Transpose for HLSL packing.
-    const f32 values[12] {
-        r0.x, r1.x, r2.x, 0.0f, //
-        r0.y, r1.y, r2.y, 0.0f, //
+    const f32 values[12] {r0.x, r1.x, r2.x, 0.0f, //
+        r0.y, r1.y, r2.y, 0.0f,                   //
         r0.z, r1.z, r2.z, 0.0f};
 
     device->SetVertexShaderConstantF(reg, values, 3);
 }
 
+// Pixel-shader constant cache.
+//
+// Setup() runs once per DRAW and uploads roughly seventeen float4 constants, but almost none of them
+// actually change between draws: fog, camera, ambient, the sun/fill rig, the cluster grid
+// description and the view rotation are all constant for a view, and the grid registers are
+// literally compile-time values. At ~900 draws a frame that was ~15,000 SetPixelShaderConstantF
+// calls, nearly all of them re-uploading a value the device already held.
+//
+// That is pure CPU-side driver overhead, and it is the reason Pathway B was so much slower than
+// Pathway A on a modest CPU - Pathway A never calls Setup() at all, so it never paid it. It also
+// explains why the shader getting cheaper (454 -> 327 slots, 19 -> 10 texture ops) did not make the
+// game faster: the cost was never in the shader.
+//
+// A cache rather than splitting Setup() into per-frame and per-draw halves, because "per frame" is
+// not quite true: the rear-view mirror renders a second view with its own view matrix and
+// projection inside one frame. Comparing against the last value uploaded is correct for that case
+// without anyone having to remember it.
+static f32 g_PsConstCache[32][4] {};
+static bool g_PsConstValid[32] {};
+
+// Called once per frame. The device's constant registers survive across draws but NOT across a
+// device reset, and nothing else here would notice one, so the cache is dropped every frame rather
+// than tracked - it costs one memset and removes a whole class of stale-state bug.
+static void InvalidatePsConstCache()
+{
+    std::memset(g_PsConstValid, 0, sizeof(g_PsConstValid));
+}
+
 static void SetVec4(IDirect3DDevice9* device, u32 reg, f32 x, f32 y, f32 z, f32 w)
 {
+    if (reg < 32)
+    {
+        f32* cached = g_PsConstCache[reg];
+
+        if (g_PsConstValid[reg] && (cached[0] == x) && (cached[1] == y) && (cached[2] == z) && (cached[3] == w))
+            return;
+
+        cached[0] = x;
+        cached[1] = y;
+        cached[2] = z;
+        cached[3] = w;
+
+        g_PsConstValid[reg] = true;
+    }
+
     const f32 values[4] {x, y, z, w};
     device->SetPixelShaderConstantF(reg, values, 1);
 }
@@ -763,6 +846,9 @@ static u32 BuildLightPool(PooledLight* out, u32 max_out)
 
 void agiDX9WorldShader::UpdateLights(IDirect3DDevice9* device)
 {
+    // Once per frame: everything Setup() uploads is re-tested against this from here on.
+    InvalidatePsConstCache();
+
     light_count_ = 0;
     cell_fill_ = 0;
 
@@ -779,8 +865,8 @@ void agiDX9WorldShader::UpdateLights(IDirect3DDevice9* device)
     // keeps its street lamps and drops the tail light of a car three cars back, which is the right
     // way round. (The old per-draw sort ranked by energy/distance^2 to the receiving mesh; there is
     // no single receiver here, and distance is what the grid is for.)
-    std::sort(g_Pool, g_Pool + pool_count,
-        [](const PooledLight& a, const PooledLight& b) { return a.Energy > b.Energy; });
+    std::sort(
+        g_Pool, g_Pool + pool_count, [](const PooledLight& a, const PooledLight& b) { return a.Energy > b.Energy; });
 
     if (pool_count > agiDX9ClusterGrid::MaxLights)
         pool_count = agiDX9ClusterGrid::MaxLights;
@@ -845,8 +931,8 @@ void agiDX9WorldShader::UpdateLights(IDirect3DDevice9* device)
             {
                 const i32 cy = WrapCell(y0 + dy, static_cast<i32>(agiDX9ClusterGrid::DimY));
 
-                const i32 plane = ((cz * static_cast<i32>(agiDX9ClusterGrid::DimY)) + cy) *
-                    static_cast<i32>(agiDX9ClusterGrid::DimX);
+                const i32 plane =
+                    ((cz * static_cast<i32>(agiDX9ClusterGrid::DimY)) + cy) * static_cast<i32>(agiDX9ClusterGrid::DimX);
 
                 for (i32 dx = 0; dx <= nx; ++dx)
                 {
@@ -944,10 +1030,22 @@ static D3DMATRIX ToD3D(const Matrix34& m)
 {
     D3DMATRIX r;
 
-    r._11 = m.m0.x; r._12 = m.m0.y; r._13 = m.m0.z; r._14 = 0.0f;
-    r._21 = m.m1.x; r._22 = m.m1.y; r._23 = m.m1.z; r._24 = 0.0f;
-    r._31 = m.m2.x; r._32 = m.m2.y; r._33 = m.m2.z; r._34 = 0.0f;
-    r._41 = m.m3.x; r._42 = m.m3.y; r._43 = m.m3.z; r._44 = 1.0f;
+    r._11 = m.m0.x;
+    r._12 = m.m0.y;
+    r._13 = m.m0.z;
+    r._14 = 0.0f;
+    r._21 = m.m1.x;
+    r._22 = m.m1.y;
+    r._23 = m.m1.z;
+    r._24 = 0.0f;
+    r._31 = m.m2.x;
+    r._32 = m.m2.y;
+    r._33 = m.m2.z;
+    r._34 = 0.0f;
+    r._41 = m.m3.x;
+    r._42 = m.m3.y;
+    r._43 = m.m3.z;
+    r._44 = 1.0f;
 
     return r;
 }
@@ -997,7 +1095,6 @@ void agiDX9WorldShader::Setup(IDirect3DDevice9* device, const agiDX9WorldDrawInf
 
     // --- Pixel constants -----------------------------------------------------------------------
     SetVec4(device, 0, material.Roughness, material.Metalness, material.Emissive, material.AoAmount);
-
 
     agiFogMode fog_mode = agiCurState.GetFogMode();
 
@@ -1185,8 +1282,13 @@ void agiDX9WorldShader::Setup(IDirect3DDevice9* device, const agiDX9WorldDrawInf
         light_cols[(i * 4) + 2] = cols[i].z;
     }
 
-    device->SetPixelShaderConstantF(7, light_dirs, 3);
-    device->SetPixelShaderConstantF(10, light_cols, 3);
+    // Through the cache as well: six registers, unchanged for the whole view, previously re-sent
+    // on every draw.
+    for (i32 i = 0; i < 3; ++i)
+    {
+        SetVec4(device, 7 + i, light_dirs[(i * 4) + 0], light_dirs[(i * 4) + 1], light_dirs[(i * 4) + 2], 0.0f);
+        SetVec4(device, 10 + i, light_cols[(i * 4) + 0], light_cols[(i * 4) + 1], light_cols[(i * 4) + 2], 0.0f);
+    }
 
     // Cluster grid description. There is no per-draw light work left at all: the pool and the grid
     // were built once in UpdateLights(), and the pixel shader looks up its own cell from world
@@ -1195,7 +1297,7 @@ void agiDX9WorldShader::Setup(IDirect3DDevice9* device, const agiDX9WorldDrawInf
     SetVec4(device, 13, static_cast<f32>(agiDX9ClusterGrid::DimX), static_cast<f32>(agiDX9ClusterGrid::DimY),
         static_cast<f32>(agiDX9ClusterGrid::DimZ), 1.0f / std::max(cell_size_, 1.0f));
 
-    SetVec4(device, 14, static_cast<f32>(agiDX9ClusterGrid::CellsPerRow), static_cast<f32>(agiDX9ClusterGrid::TexWidth),
+    SetVec4(device, 14, static_cast<f32>(agiDX9ClusterGrid::CellsPerRow), static_cast<f32>(cell_tex_width_),
         static_cast<f32>(agiDX9ClusterGrid::TexHeight), PARAM_d3d9_lightspec.get_or(true) ? 1.0f : 0.0f);
 
     SetVec4(device, 15, 1.0f / static_cast<f32>(agiDX9ClusterGrid::MaxLights), 0.0f, 0.0f, 0.0f);

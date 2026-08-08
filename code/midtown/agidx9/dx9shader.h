@@ -110,29 +110,22 @@ struct agiDX9ClusterGrid
     // descending energy order.
     static constexpr u32 LightsPerCell = 16;
 
-    // One index per texel, not four. The bucket texture is D3DFMT_R32F rather than a packed RGBA
-    // format, which costs nothing in memory - 16 floats per cell either way, 512 KB total - and buys
-    // back a third of the ps_3_0 instruction budget.
+    // Indices per bucket TEXEL. 1 means an R32F texture and one light per iteration; 4 means
+    // A32B32G32R32F and four. Selected at runtime by -d3d9cellpack; see agiDX9WorldShader.
     //
-    // With four indices to a texel the shader had to evaluate slot.x/y/z/w explicitly, and since
-    // ps_3_0 has no relative addressing for temporaries there is no way to loop over the components
-    // of a fetched vector: the light body was emitted four times inside the loop. Measured with fxc,
-    // each inlining costs 59 slots (4 texture, 55 arithmetic), so the four cost 454 of 512 and left
-    // 58 for everything else. One index per texel means one body, and the loop trip count carries
-    // the other fifteen lights at no static cost - which is the entire point of putting the lights
-    // in a texture (see the tex2Dlod note in dx9_rendering_pathways.md §B0c).
-    //
-    // The dynamic cost is near enough unchanged: a full cell now runs 16 iterations of one light
-    // instead of 4 iterations of four, so the same 16 lights are evaluated, and the early break gets
-    // finer-grained rather than coarser - a cell holding one light now stops after one fetch instead
-    // of evaluating a whole texel's worth of empty slots.
-    static constexpr u32 TexelsPerCell = LightsPerCell;
+    // The bucket LAYOUT is identical either way - LightsPerCell contiguous floats per cell, which is
+    // 16 floats however they are grouped into texels - so the grid writer does not care and is not
+    // parameterised. Only the texture format, its width in texels, and how many the shader reads per
+    // iteration change.
+    static constexpr u32 MaxTexelsPerCell = LightsPerCell;
 
     // Buckets are laid out as a 2D texture rather than one enormous column: 64 cells per row keeps
     // both dimensions well inside the 4096 limit every ps_3_0 part guarantees.
     static constexpr u32 CellsPerRow = 64;
-    static constexpr u32 TexWidth = CellsPerRow * TexelsPerCell; // 256
-    static constexpr u32 TexHeight = CellCount / CellsPerRow;    // 128
+    static constexpr u32 TexHeight = CellCount / CellsPerRow; // 128
+
+    // Widest the bucket texture can get, for anything that needs a compile-time bound.
+    static constexpr u32 MaxTexWidth = CellsPerRow * MaxTexelsPerCell; // 1024
 
     // Simultaneous lights in the frame's pool. The index is stored as a float in the bucket texture,
     // so this is not a packing limit - it is where the per-frame build cost and the light texture
@@ -212,6 +205,14 @@ private:
     IDirect3DTexture9* cell_tex_ {};
 
     f32 cell_size_ {};
+
+    // Bucket packing, chosen at Init from -d3d9cellpack. See the note where it is set.
+
+    u32 cell_pack_ {1};
+
+    u32 texels_per_cell_ {agiDX9ClusterGrid::MaxTexelsPerCell};
+
+    u32 cell_tex_width_ {agiDX9ClusterGrid::MaxTexWidth};
     u32 light_count_ {};
     u32 cell_fill_ {};
 };
