@@ -1112,6 +1112,12 @@ b32 agiMeshSet::DrawLit(agiMeshLighter lighter, u32 flags, u32* colors)
 // touching call sites the assembly owns. agiNativeDrawRadius sets the precedent.
 f32 agiNativeReflectivity = 0.0f;
 
+// The game's own authored reflection texture for the vehicle in flight - the sphere map
+// DrawLitSph() is handed, which is what the original renderer wrapped around a car body. Preferred
+// over the synthesised probe for vehicles: it is real art, it is what the cars were built to look
+// like, and it costs nothing to use because the engine already loaded and passed it.
+agiTexDef* agiNativeReflectionTex = nullptr;
+
 void agiMeshSet::DrawLitSph(agiMeshLighter lighter, agiTexDef* sph_map, u32 flags)
 {
     // Vehicle bodies. DrawLit() now takes the hardware-transform path here too, which is what puts
@@ -1136,12 +1142,14 @@ void agiMeshSet::DrawLitSph(agiMeshLighter lighter, agiTexDef* sph_map, u32 flag
     const bool reflective = sph_map && agiRQ.SphMap && Pipe()->SupportsNativeTransform();
 
     agiNativeReflectivity = reflective ? 1.0f : 0.0f;
+    agiNativeReflectionTex = reflective ? sph_map : nullptr;
 
     const b32 drawn = DrawLit(lighter, flags, nullptr);
 
     // Strictly scoped: anything drawn after this - road, buildings, particles - must not inherit a
-    // car's reflectivity.
+    // car's reflectivity or its reflection texture.
     agiNativeReflectivity = 0.0f;
+    agiNativeReflectionTex = nullptr;
 
     if (drawn && sph_map && !Pipe()->SupportsNativeTransform())
         SphereMap(sph_map, 0xFFFFFFFF);

@@ -1059,6 +1059,39 @@ void agiDX9WorldShader::Setup(IDirect3DDevice9* device, const agiDX9WorldDrawInf
         device->SetSamplerState(3, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
 
         SetVec4(device, 16, Probe.GetMipCount() - 1.0f, PARAM_d3d9_reflect.get_or(1.0f), agiNativeReflectivity, 1.0f);
+
+        // The vehicle's own authored sphere map, when this draw is a car body and the game supplied
+        // one. Preferred over the synthesised probe for vehicles: it is the art the cars were built
+        // against, and MM1 authored it precisely so bodywork would have something to mirror.
+        //
+        // agiNativeReflectionTex is set for the duration of one DrawLitSph and cleared after it, so
+        // this is null for everything that is not a car.
+        IDirect3DTexture9* sphere = nullptr;
+
+        if (agiNativeReflectionTex)
+            sphere = static_cast<agiDX9TexDef*>(agiNativeReflectionTex)->GetHandle();
+
+        if (sphere)
+        {
+            device->SetTexture(4, sphere);
+
+            device->SetSamplerState(4, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(4, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(4, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+            device->SetSamplerState(4, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+            device->SetSamplerState(4, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        }
+
+        // Sphere-map coordinates are generated from the reflection vector in VIEW space, which is
+        // the convention BuildVehicleReflectionVertices() worked out for the fixed-function pass
+        // (dx9rsys.cpp) and which the authored texture is drawn for. The pixel shader has world
+        // space, so hand it the view rotation transposed into columns - three dot products and no
+        // extra interpolator.
+        const Matrix34& v = *info.ViewZFlip;
+
+        SetVec4(device, 17, v.m0.x, v.m1.x, v.m2.x, sphere ? 1.0f : 0.0f);
+        SetVec4(device, 18, v.m0.y, v.m1.y, v.m2.y, 0.0f);
+        SetVec4(device, 19, v.m0.z, v.m1.z, v.m2.z, 0.0f);
     }
     else
     {

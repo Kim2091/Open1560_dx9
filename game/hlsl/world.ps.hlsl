@@ -63,12 +63,16 @@ float4 g_GridDim  : register(c13); // xyz = cells per axis, w = 1 / cell size
 float4 g_GridTex  : register(c14); // x = cells per texture row, y = cell tex width, z = height,
                                    // w = specular from point lights on/off
 float4 g_LightTexInfo : register(c15); // x = 1 / max lights (light texture width)
-float4 g_EnvInfo : register(c16); // x = highest mip index, y = reflection strength, w = 0 when no probe
+float4 g_EnvInfo : register(c16); // x = highest mip index, y = reflection strength, z = draw reflectivity, w = probe
+// View rotation, transposed into columns, so a world-space vector reaches view space in three dots.
+// c17.w is 1 when this draw has an authored sphere map bound on s4.
+float4 g_ViewCol[3] : register(c17); // c17..c19
 
 sampler2D g_Albedo   : register(s0);
 sampler2D g_LightTex : register(s1); // row 0: xyz = world pos, w = 1/reach^2. row 1: rgb = colour
 sampler2D g_CellTex  : register(s2); // x = one light index, -1 = empty (see CELL_TEXELS)
 samplerCUBE g_EnvCube : register(s3); // analytic sky/ground/sun probe, mip = roughness (dx9probe.h)
+sampler2D g_SphereMap : register(s4); // the game's own authored vehicle reflection texture
 
 static const float PI = 3.14159265f;
 
@@ -421,6 +425,31 @@ float4 main(VSOut i, float face : VFACE) : COLOR0
         float3 R = reflect(-V, N);
 
         float3 env = texCUBElod(g_EnvCube, float4(R, env_rough * g_EnvInfo.x)).rgb;
+
+        // On a car body with an authored sphere map, use the game's own reflection art instead of
+        // the synthesised probe. MM1 drew that texture specifically for bodywork, so it carries the
+        // look the vehicles were designed against - the probe is the fallback for everything the
+        // game never authored a reflection for.
+        //
+        // The mapping is the one BuildVehicleReflectionVertices() established for the fixed-function
+        // pass, reproduced here per pixel rather than per vertex: take the reflection vector into
+        // view space, then m = 2*sqrt(Rx^2 + Ry^2 + (Rz+1)^2) and read (Rx/m + 0.5, 0.5 - Ry/m).
+        if (g_ViewCol[0].w > 0.5f)
+        {
+            float3 Rv;
+            Rv.x = dot(R, g_ViewCol[0].xyz);
+            Rv.y = dot(R, g_ViewCol[1].xyz);
+            Rv.z = dot(R, g_ViewCol[2].xyz);
+
+            float m = 2.0f * sqrt(dot(Rv.xy, Rv.xy) + ((Rv.z + 1.0f) * (Rv.z + 1.0f)));
+
+            float2 sph = float2(0.5f, 0.5f);
+
+            if (m > 1e-5f)
+                sph = float2((Rv.x / m) + 0.5f, 0.5f - (Rv.y / m));
+
+            env = tex2D(g_SphereMap, saturate(sph)).rgb;
+        }
 
         // A clearcoat lobe on top of the body's own response, rather than in place of it - the
         // paint underneath still reads as its own colour.

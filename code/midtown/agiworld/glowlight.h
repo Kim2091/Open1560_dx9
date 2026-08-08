@@ -99,6 +99,10 @@ extern f32 agiNativeDrawRadius;
 // See the note where it is defined (agiworld/meshrend.cpp).
 extern f32 agiNativeReflectivity;
 
+// The vehicle's own authored sphere map for the draw in flight, or null. See its definition.
+class agiTexDef;
+extern agiTexDef* agiNativeReflectionTex;
+
 // Lightning intensity, 0..1, latched and decayed once per frame by mmCullCity::Cull().
 //
 // The original lightning is a one-frame swap of the sky texture (see mmSky::DoFlash) and lights
