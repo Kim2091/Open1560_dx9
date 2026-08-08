@@ -65,7 +65,14 @@ Start-Sleep -Seconds 10
 Save-MMShot (Join-Path $OutDir '02-gameplay.png') | Out-Null
 
 $res = Get-MMClientRect
-Add-Result 'device survived resolution change' ($res.Width -gt 640) "client $($res.Width)x$($res.Height)"
+
+# What matters after the menu -> gameplay pipeline restart is that the device survived and is still
+# drawing, NOT that the resolution changed: gameplay only differs from the 640x480 menus if the
+# player's profile asks for it, and asserting on width fails on a 640x480 profile for no reason.
+$census = Get-MMLogLines 'DX9 CENSUS' -Last 1
+$drawing = $census -and ($census -match 'world=(\d+) tris') -and ([int]$Matches[1] -gt 2000)
+
+Add-Result 'device survived pipeline restart' $drawing "client $($res.Width)x$($res.Height)"
 Add-Result 'no crash entering gameplay' ((Get-MMCrash) -eq $null) (Get-MMCrash)
 
 # --- 3. camera sweep, to put a vehicle and the environment on screen --------------------------

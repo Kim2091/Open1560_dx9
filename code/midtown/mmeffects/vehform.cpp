@@ -26,6 +26,9 @@ define_dummy_symbol(mmeffects_vehform);
 #include "agiworld/texsort.h"
 #include "arts7/cullmgr.h"
 #include "mmcity/cullcity.h"
+#include "mmcityinfo/state.h"
+
+#include <algorithm>
 
 static mem::cmd_param PARAM_menu_refl {"menurefl"};
 
@@ -40,7 +43,21 @@ mmVehicleForm::mmVehicleForm()
     {
         if (agiRQ.SphMap && PARAM_menu_refl.get_or<bool>(true))
         {
-            t_mmEnvSetup* env = &mmEnvSetup[1][0];
+            // The player's own preset, not a hardcoded one.
+            //
+            // This was &mmEnvSetup[1][0] - Noon/Clear - so the vehicle-select preview always
+            // reflected a clear midday sky no matter what the race was set to, and a car previewed
+            // before a night race looked nothing like the car that then drove out of it. The table
+            // is indexed [TimeOfDay][Weather] exactly as mmCullCity::Init indexes it for the city.
+            //
+            // Bound once per showroom entry rather than continuously: SphMapTex is a shared static
+            // whose lifetime is refcounted across every mmVehicleForm, so swapping it underneath
+            // live holders would unbalance their Release(). The last form to die nulls it, and the
+            // next entry re-reads the preset - which is the behaviour that matters here.
+            const i32 time_index = std::clamp(static_cast<i32>(MMSTATE.TimeOfDay), 0, 3);
+            const i32 weather_index = std::clamp(static_cast<i32>(MMSTATE.Weather), 0, 3);
+
+            t_mmEnvSetup* env = &mmEnvSetup[time_index][weather_index];
 
             SphMapTex = as_raw GetPackedTexture(xconst(env->SphereMap), 0);
 

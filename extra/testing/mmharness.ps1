@@ -277,7 +277,11 @@ function Wait-MMGameplay {
 
         $last = Get-MMLogLines 'DX9 CENSUS' -LogPath $LogPath -Last 1
 
-        if ($last -and ($last -match 'world=(\d+) tris') -and ([int]$Matches[1] -gt 200)) {
+        # The threshold has to clear the VEHICLE-SELECT screen, not just the menus. That screen
+        # renders a car through the same world path and submits ~450 triangles, so a low threshold
+        # reports it as gameplay and the test then screenshots a showroom while believing it is in
+        # the city. A loaded city is several thousand.
+        if ($last -and ($last -match 'world=(\d+) tris') -and ([int]$Matches[1] -gt 2000)) {
             return $true
         }
 

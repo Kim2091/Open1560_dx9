@@ -650,13 +650,24 @@ static u32 BuildLightPool(PooledLight* out, u32 max_out)
     {
         const agiGlowLight& glow = agiGlowLights[i];
 
-        // Extrapolate to where the light is NOW.
+        // Extrapolate to where the light is NOW - by ONE frame, never by Age.
         //
-        // A slot holds the position from the last frame its sprite was drawn. This pool is built at
-        // BeginFrame, before any of this frame's sprites have been harvested, so every entry is at
-        // least one frame old by construction and at speed that is the light pool visibly trailing
-        // the car. Age is exactly the number of frames to extrapolate over.
-        const Vector3 light_pos = glow.Position + (glow.Velocity * static_cast<f32>(glow.Age));
+        // A slot holds the position from the last frame its sprite was drawn, and this pool is
+        // built at BeginFrame before any of this frame's sprites have been harvested, so every
+        // entry is one frame stale by construction. Correcting for that one frame is sound and is
+        // what stops the light pool visibly trailing a car at speed.
+        //
+        // Extrapolating by Age is NOT sound, and was the cause of lights flying off in straight
+        // lines. Age only grows when a sprite has STOPPED being drawn - which is exactly the
+        // situation in which the old velocity is no longer evidence of anything. Turn away from a
+        // car and its glow is culled; the slot then survives its full TTL while being pushed
+        // further along its last known velocity every frame. At 137 km/h that is about a metre per
+        // frame for up to twelve frames, so the light detaches from the car and shoots off across
+        // the city - which is precisely what it looked like.
+        //
+        // The fade already handles the uncertainty of a stale slot by dimming it. Position is not
+        // something to guess at on top of that.
+        const Vector3 light_pos = glow.Position + (glow.Velocity * ((glow.Age > 0) ? 1.0f : 0.0f));
 
         // Fade a light out as it ages towards expiry, so one whose sprite stops being drawn leaves
         // smoothly instead of blinking off. See agiGlowLightFade.
