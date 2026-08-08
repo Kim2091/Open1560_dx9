@@ -50,6 +50,10 @@ agiDX9Pipeline::~agiDX9Pipeline() = default;
 // Selects Pathway B (programmable vs_3_0/ps_3_0 world shading) over Pathway A (fixed function).
 static mem::cmd_param PARAM_d3d9_shaders {"d3d9shaders", "Use the programmable PBR world path"};
 
+// Renders the frame into an offscreen target and blits it back. Exercises the render-target
+// framework end to end; also the hook a post-processing chain will attach to. Not Remix-compatible.
+static mem::cmd_param PARAM_d3d9_scenetarget {"d3d9scenetarget", "Render the scene through an offscreen target"};
+
 // The live D3D9 device between EndGfx() and the BeginGfx() that follows it, holding it alive across
 // a pipeline restart. See EndGfx() for why the device must not simply be destroyed.
 //
@@ -111,6 +115,17 @@ i32 agiDX9Pipeline::BeginGfx()
     if (PARAM_d3d9_shaders.get_or(false))
         world_shader_.Init(dx9_context_->GetDevice());
 
+    // Offscreen scene target. Off unless asked for, and deliberately so: routing the frame through
+    // a texture and blitting it back is invisible to RTX Remix, which reconstructs from the draws
+    // it sees rather than from the image (dx9target.h). It exists now because the render-target
+    // framework is the thing shadows, bloom and environment probes are all waiting on, and a
+    // framework nothing exercises is a framework nobody knows is broken - this path proves create,
+    // bind, draw-into, unbind, sample, blit and survive-a-device-reset in one go.
+    if (PARAM_d3d9_scenetarget.get_or(false))
+    {
+        scene_target_.Init(dx9_context_->GetDevice(), static_cast<u32>(horz_res_), static_cast<u32>(vert_res_));
+    }
+
     InitScaling();
 
     gfx_started_ = true;
@@ -130,6 +145,7 @@ void agiDX9Pipeline::EndGfx()
 
     // Before the context: these are device objects and must not outlive the device.
     world_shader_.Shutdown();
+    scene_target_.Shutdown();
 
     // Drop both light registries. Neither is owned by this pipeline, and both hold pointers that
     // are about to become dangling: agiGlowLights[] borrows an agiTexDef* per harvested light, and
@@ -190,6 +206,10 @@ void agiDX9Pipeline::BeginFrame()
         return;
 
     IDirect3DDevice9* device = dx9_context_->GetDevice();
+
+    // Bind the offscreen target before the clear, so the clear lands on it rather than on a
+    // backbuffer that is about to be overwritten by the blit anyway.
+    scene_target_bound_ = scene_target_.IsValid() && scene_target_.Begin(device);
 
     if (PARAM_d3d9_frameclear.get_or(true))
     {
@@ -254,11 +274,44 @@ void agiDX9Pipeline::EndFrame()
 {
     ARTS_UTIMED(agiEndFrame);
 
+    IDirect3DDevice9* device = dx9_context_->GetDevice();
+
+    // Resolve the offscreen target back to the backbuffer before anything reads the frame.
+    //
+    // The scene is ended first and a fresh one opened for the blit, rather than swapping targets
+    // mid-scene. D3D9 is lenient about SetRenderTarget inside BeginScene/EndScene and some drivers
+    // are not; the extra pair costs nothing once a frame and removes the question.
+    //
+    // This is where a post-processing chain goes: bind a shader, blit through it, repeat. The quad
+    // does not care what is bound (see agiDX9BlitFullscreen).
+    if (scene_target_bound_)
+    {
+        scene_target_bound_ = false;
+
+        if (std::exchange(d3d_scene_active_, false))
+            device->EndScene();
+
+        scene_target_.End(device);
+
+        if (SUCCEEDED(device->BeginScene()))
+        {
+            agiDX9BlitFullscreen(
+                device, scene_target_.GetTexture(), static_cast<u32>(horz_res_), static_cast<u32>(vert_res_));
+
+            device->EndScene();
+        }
+
+        // The blit wrote render, sampler and texture-stage state straight to the device, behind the
+        // agiCurState/agiLastState pair's back. Poison the cache so the next frame re-issues
+        // everything instead of trusting a stale record - the same hazard MeshWorld documents.
+        agiLastState.Reset();
+    }
+
     if (ScreenShotRequested())
         SaveScreenShot(CaptureScreen());
 
     if (std::exchange(d3d_scene_active_, false))
-        dx9_context_->GetDevice()->EndScene();
+        device->EndScene();
 
     dx9_context_->Present();
 

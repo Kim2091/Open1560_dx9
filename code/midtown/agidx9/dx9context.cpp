@@ -18,6 +18,8 @@
 
 #include "dx9context.h"
 
+#include "dx9target.h"
+
 #include "dx9_windows.h"
 
 #include <SDL3/SDL_video.h>
@@ -321,13 +323,37 @@ bool agiDX9Context::ResetDevice()
     FillPresentParams(
         pp, static_cast<HWND>(window_), width_, height_, windowed_, vsync_, static_cast<D3DFORMAT>(depth_format_));
 
+    // Release every D3DPOOL_DEFAULT allocation first. D3D9 fails Reset with D3DERR_INVALIDCALL
+    // while even one is alive, and here that failure is not something to shrug at: Reset is on the
+    // path the menu <-> gameplay resolution change takes when a new context adopts the parked
+    // device, and the fallback when it fails is to destroy the device and build a new one - exactly
+    // what breaks the RTX Remix bridge the parked device exists to protect.
+    //
+    // Everything else this backend allocates is D3DPOOL_MANAGED and survives a reset untouched, so
+    // with no render targets in play this list is empty and costs nothing. See
+    // agiDX9DefaultPoolResource in dx9target.h.
+    agiDX9ReleaseDefaultPoolResources();
+
     HRESULT hr = device_->Reset(&pp);
 
     if (FAILED(hr))
     {
-        CheckErrors("Reset", hr);
+        if (hr == D3DERR_INVALIDCALL)
+        {
+            Errorf("D3D9: Reset returned D3DERR_INVALIDCALL - a D3DPOOL_DEFAULT resource outlived "
+                   "agiDX9ReleaseDefaultPoolResources() (%s)",
+                agiDX9HasDefaultPoolResources() ? "registered resources remain" : "no registered resources - unowned allocation");
+        }
+        else
+        {
+            CheckErrors("Reset", hr);
+        }
+
         return false;
     }
+
+    if (!agiDX9RestoreDefaultPoolResources(device_))
+        Warningf("D3D9: some default-pool resources could not be recreated after Reset");
 
     return true;
 }
@@ -376,10 +402,11 @@ void agiDX9Context::Resize(u32 width, u32 height, bool windowed, bool vsync)
     if (ResetDevice())
         return;
 
-    // Reset() is expected to succeed here: it only fails while a D3DPOOL_DEFAULT resource is still
-    // alive, and this backend allocates none - every texture is D3DPOOL_MANAGED (which survives a
-    // reset by design, see the note in dx9shader.h), the only offscreen surface is SYSTEMMEM and
-    // transient, and geometry goes out through DrawPrimitiveUP rather than device-owned buffers.
+    // Reset() is expected to succeed here: ResetDevice() releases every registered D3DPOOL_DEFAULT
+    // resource before calling it, and everything else this backend allocates is D3DPOOL_MANAGED
+    // (which survives a reset by design, see the note in dx9shader.h), the only offscreen surface
+    // is SYSTEMMEM and transient, and geometry goes out through DrawPrimitiveUP rather than
+    // device-owned buffers.
     //
     // If it fails anyway, fall back to building a new device so the game keeps running rather than
     // rendering through a dead one. Note this is the path that upsets the Remix bridge, so say so
@@ -388,4 +415,9 @@ void agiDX9Context::Resize(u32 width, u32 height, bool windowed, bool vsync)
 
     ReleaseDevice();
     CreateDevice();
+
+    // The failed ResetDevice() already released them; the new device needs them back. Without this
+    // every render target would stay dead for the rest of the run after one failed reset.
+    if (!agiDX9RestoreDefaultPoolResources(device_))
+        Warningf("D3D9: some default-pool resources could not be recreated on the new device");
 }

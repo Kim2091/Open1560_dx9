@@ -21,6 +21,7 @@
 #include "agisdl/sdlpipe.h"
 
 #include "dx9shader.h"
+#include "dx9target.h"
 
 class agiDX9Context;
 class agiDX9Rasterizer;
@@ -85,8 +86,19 @@ public:
         return world_shader_.IsValid() ? &world_shader_ : nullptr;
     }
 
+    // The frame's offscreen colour target, or null when the scene renders straight to the
+    // backbuffer (the default, and the only Remix-compatible arrangement). Shadow maps and
+    // post-processing passes get their own targets; this one exists so the framework is exercised
+    // by something real rather than only by code that does not exist yet.
+    agiDX9RenderTarget* SceneTarget()
+    {
+        return scene_target_.IsValid() ? &scene_target_ : nullptr;
+    }
+
 private:
     agiDX9WorldShader world_shader_ {};
+    agiDX9RenderTarget scene_target_ {};
+    bool scene_target_bound_ {};
 
     Ptr<agiSurfaceDesc> CaptureScreen();
 
