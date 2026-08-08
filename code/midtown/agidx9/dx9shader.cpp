@@ -62,6 +62,23 @@ static mem::cmd_param PARAM_d3d9_lightspec {"d3d9lightspec", "Specular response 
 static mem::cmd_param PARAM_d3d9_sun {"d3d9sun", "Time-of-day and weather driven sun instead of the engine's"};
 static mem::cmd_param PARAM_d3d9_reflect {"d3d9reflect", "Strength of environment reflections"};
 
+// Shader quality tier: 0 diffuse-only, 1 sun specular + vehicle reflections, 2 everything.
+//
+// Default 2, i.e. no change for anyone already running this path. It is a knob rather than an
+// auto-detect because there is nothing reliable to detect on: D3DCAPS9 reports what a part can do,
+// not how fast, and every ps_3_0 device claims the same feature set.
+static mem::cmd_param PARAM_d3d9_quality {"d3d9quality", "Shader quality tier: 0 low, 1 medium, 2 high"};
+
+const char* agiDX9QualityString()
+{
+    switch (PARAM_d3d9_quality.get_or(2))
+    {
+        case 0: return "0";
+        case 1: return "1";
+        default: return "2";
+    }
+}
+
 // Sun direction and colour for the current MMSTATE.TimeOfDay x MMSTATE.Weather.
 //
 // Azimuth as well as elevation, so the sun crosses the sky over the day instead of pivoting in one
@@ -192,6 +209,8 @@ static ConstString LoadShaderSource(const char* name, const char* ext)
     return result;
 }
 
+const char* agiDX9QualityString();
+
 // Compiles one shader. `lit` selects the LIT permutation of the pixel shader; see world.ps.hlsl.
 static ID3DBlob* CompileShader(const char* name, const char* ext, const char* target, bool lit)
 {
@@ -208,7 +227,12 @@ static ID3DBlob* CompileShader(const char* name, const char* ext, const char* ta
         return nullptr;
     }
 
-    const D3D_SHADER_MACRO lit_defines[] {{"LIT", "1"}, {nullptr, nullptr}};
+    // QUALITY selects the tier permutation; see the note at the top of world.ps.hlsl. It is passed
+    // to both permutations so the unlit one stays in step, even though it uses none of it today.
+    const char* quality = agiDX9QualityString();
+
+    const D3D_SHADER_MACRO lit_defines[] {{"LIT", "1"}, {"QUALITY", quality}, {nullptr, nullptr}};
+    const D3D_SHADER_MACRO unlit_defines[] {{"QUALITY", quality}, {nullptr, nullptr}};
 
     ID3DBlob* code = nullptr;
     ID3DBlob* errors = nullptr;
@@ -230,7 +254,7 @@ static ID3DBlob* CompileShader(const char* name, const char* ext, const char* ta
     //
     // If a future shader genuinely benefits from the higher levels, measure it the same way before
     // raising this - and note the ceiling is the 512-slot limit, which level 1 is already meeting.
-    HRESULT hr = compile(source.get(), std::strlen(source.get()), name, lit ? lit_defines : nullptr, nullptr, "main",
+    HRESULT hr = compile(source.get(), std::strlen(source.get()), name, lit ? lit_defines : unlit_defines, nullptr, "main",
         target, D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errors);
 
     if (errors)
@@ -365,8 +389,10 @@ bool agiDX9WorldShader::Init(IDirect3DDevice9* device)
     Probe.Init(device);
 
     valid_ = true;
-    Displayf("DX9 Pathway B: programmable path active (vs_3_0/ps_3_0), clustered lighting %ux%ux%u cells, %u lights",
-        agiDX9ClusterGrid::DimX, agiDX9ClusterGrid::DimY, agiDX9ClusterGrid::DimZ, agiDX9ClusterGrid::MaxLights);
+    Displayf("DX9 Pathway B: programmable path active (vs_3_0/ps_3_0), quality tier %s, clustered lighting "
+             "%ux%ux%u cells, %u lights",
+        agiDX9QualityString(), agiDX9ClusterGrid::DimX, agiDX9ClusterGrid::DimY, agiDX9ClusterGrid::DimZ,
+        agiDX9ClusterGrid::MaxLights);
 
     return true;
 }

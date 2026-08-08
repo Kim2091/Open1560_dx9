@@ -51,6 +51,23 @@ float4 g_LightCol[3] : register(c10); // c10..c12
 
 // Light indices per cell, and how many texels that is at 4 indices per texel. Must match
 // agiDX9ClusterGrid::LightsPerCell.
+// Quality tier, from -d3d9quality / the ini. Set by the compiler, not edited here.
+//
+//   2 - everything. Three analytic directionals with full Cook-Torrance, specular from every
+//       clustered point light, and environment reflections on all surfaces.
+//   1 - the sun keeps its full BRDF; the two fill lights go diffuse-only, because a fill exists to
+//       lift shadow and its specular lobe is nearly never the highlight anyone is looking at.
+//       Environment reflections narrow to vehicles, which is the surface they were added for.
+//   0 - diffuse only, everywhere. One specular-free lighting model, no environment term.
+//
+// This exists because the lit permutation costs 327 of 512 ps_3_0 slots of almost pure arithmetic,
+// per pixel, with overdraw - measured at 3 FPS against 54 for the fixed-function path on the same
+// scene, with the clustered lights switched OFF. The submission architecture is not the problem
+// (Pathway A shares it); the per-pixel arithmetic is, so that is what the tiers cut.
+#ifndef QUALITY
+#define QUALITY 2
+#endif
+
 #define CELL_LIGHTS 16
 
 // One index per texel - the bucket texture is R32F. ps_3_0 has no relative addressing for
@@ -206,12 +223,17 @@ float3 EvalPointLight(float index, float3 world_pos, float3 N, float3 V, float3 
 
     float3 contribution = diffuse_color * INV_PI_COMPENSATED;
 
+    // At tier 0 the point lights are diffuse-only unconditionally: this body is emitted once but
+    // executed per light per pixel, so its specular branch is the dominant runtime cost on a busy
+    // night street even though it is small statically.
+#if QUALITY >= 1
     if (g_GridTex.w > 0.5f)
     {
         float3 H = normalize(L + V);
         contribution += D_GGX(saturate(dot(N, H)), a) * V_SmithHeightCorrelated(NdotV, NdotL, a) *
             F_Schlick(f0, saturate(dot(V, H)));
     }
+#endif
 
     return contribution * light_col.rgb * (NdotL * atten);
 }
@@ -316,6 +338,9 @@ float4 main(VSOut i, float face : VFACE) : COLOR0
     // agiMeshLighterSun/Fill1/Fill2 - the same three directions and colours the CPU rig uses, so
     // time of day and weather still drive the scene exactly as the engine intends. Only the
     // response curve changes.
+    // The specular half of this loop is the single most expensive thing in the shader: three
+    // unrolled copies of GGX + Smith + Schlick. The tiers cut it back before anything else.
+#if QUALITY >= 2
     [unroll]
     for (int s = 0; s < 3; ++s)
     {
@@ -329,6 +354,30 @@ float4 main(VSOut i, float face : VFACE) : COLOR0
         float3 spec = D_GGX(NdotH, a) * V_SmithHeightCorrelated(NdotV, NdotL, a) * F_Schlick(f0, VdotH);
         direct += (diffuse_color * INV_PI_COMPENSATED + spec) * g_LightCol[s].rgb * NdotL;
     }
+#elif QUALITY == 1
+    // Sun keeps its highlight; the fills do not. A fill light exists to lift shadow, and its
+    // specular lobe is almost never the highlight the eye is actually reading - so two thirds of
+    // the cost goes for very little of the look.
+    {
+        float3 L = g_LightDir[0].xyz;
+        float NdotL = saturate(dot(N, L));
+
+        float3 H = normalize(L + V);
+
+        float3 spec = D_GGX(saturate(dot(N, H)), a) * V_SmithHeightCorrelated(NdotV, NdotL, a) *
+            F_Schlick(f0, saturate(dot(V, H)));
+
+        direct += (diffuse_color * INV_PI_COMPENSATED + spec) * g_LightCol[0].rgb * NdotL;
+    }
+
+    [unroll]
+    for (int s = 1; s < 3; ++s)
+        direct += diffuse_color * INV_PI_COMPENSATED * g_LightCol[s].rgb * saturate(dot(N, g_LightDir[s].xyz));
+#else
+    [unroll]
+    for (int s = 0; s < 3; ++s)
+        direct += diffuse_color * INV_PI_COMPENSATED * g_LightCol[s].rgb * saturate(dot(N, g_LightDir[s].xyz));
+#endif
 
     // --- Clustered point lights ------------------------------------------------------------------
     // Street lamps, traffic signals, lit signage, coronas, head/tail/brake lights - the game's own
@@ -409,6 +458,10 @@ float4 main(VSOut i, float face : VFACE) : COLOR0
     //
     // g_EnvInfo.w is 0 when no probe could be created, in which case the old flat term is kept -
     // worse looking, still correct.
+    // Environment reflections. Tier 1 keeps them on vehicles - the surface they exist for - and
+    // drops the probe lookup everywhere else. Tier 0 drops both and keeps the flat hemisphere term,
+    // which is what this path used before any of the reflection work.
+#if QUALITY >= 1
     float3 R = reflect(-V, N);
 
     if (g_ViewCol[0].w > 0.5f)
@@ -447,6 +500,7 @@ float4 main(VSOut i, float face : VFACE) : COLOR0
 
         indirect += tex2D(g_SphereMap, saturate(sph)).rgb * coat * g_EnvInfo.y;
     }
+#if QUALITY >= 2
     else if (g_EnvInfo.w > 0.5f)
     {
         // --- Everything else: the prefiltered probe ----------------------------------------------
@@ -461,12 +515,16 @@ float4 main(VSOut i, float face : VFACE) : COLOR0
 
         indirect += env * EnvBRDFApprox(f0, roughness, NdotV) * g_EnvInfo.y * (1.0f - roughness);
     }
+#endif // QUALITY >= 2
     else
     {
-        // No probe could be created: the flat hemisphere term, as before. Worse looking, still
-        // correct.
+        // No probe, or a tier that does not use one: the flat hemisphere term, as this path used
+        // before any of the reflection work. Worse looking, still correct.
         indirect += irradiance * EnvBRDFApprox(f0, roughness, NdotV) * (1.0f - roughness);
     }
+#else  // QUALITY == 0
+    indirect += irradiance * EnvBRDFApprox(f0, roughness, NdotV) * (1.0f - roughness);
+#endif
 
     float3 color = direct + indirect;
 
