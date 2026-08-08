@@ -37,7 +37,12 @@ public class MMWin32
 
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
 
-    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, IntPtr extra);
+
+    public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+    public const uint MOUSEEVENTF_LEFTUP   = 0x0004;
 
     public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
@@ -170,30 +175,44 @@ function Get-MMClientRect {
     }
 }
 
-# Click at client coordinates, by posting to the window rather than injecting at the desktop level.
+# Click at client coordinates.
 #
-# Deliberately NOT SetCursorPos + mouse_event: that moves the real pointer and clicks whatever is
-# actually on top, so a mistimed focus change turns a test into a click on the user's desktop. Posted
-# messages can only ever reach this window. A WM_MOUSEMOVE goes first because the menus highlight on
-# hover and some widgets only accept a click on an already-hovered item.
+# Uses the real pointer (SetCursorPos + mouse_event) rather than PostMessage, which was tried first
+# and does NOT work: SDL re-maps posted mouse coordinates, so a posted click lands somewhere other
+# than where it was aimed. That is worse than not working, because the click still hits *something* -
+# a test aimed at "Quit to Race Menu" landed on "Help" and then reported a pass for a transition it
+# had never performed.
+#
+# Because this moves the real pointer, it is guarded: the game window must be confirmed foreground
+# immediately beforehand, or the click is refused rather than delivered to whatever else is on
+# screen. The previous cursor position is restored afterwards.
 function Send-MMClick {
     param([int]$X, [int]$Y, [int]$Repeat = 2)
 
-    $hwnd = Get-MMWindow
-    if ($hwnd -eq [IntPtr]::Zero) { return $false }
+    if (-not (Focus-MMWindow)) {
+        Write-Host "  (click refused: game window is not foreground)"
+        return $false
+    }
 
-    [void](Focus-MMWindow)
+    $c = Get-MMClientRect
+    if (-not $c) { return $false }
 
-    $lparam = [IntPtr](($Y -shl 16) -bor ($X -band 0xFFFF))
+    $saved = New-Object MMWin32+POINT
+    [void][MMWin32]::GetCursorPos([ref]$saved)
 
     for ($i = 0; $i -lt $Repeat; $i++) {
-        [void][MMWin32]::PostMessage($hwnd, [MMWin32]::WM_MOUSEMOVE, [IntPtr]::Zero, $lparam)
-        Start-Sleep -Milliseconds 150
-        [void][MMWin32]::PostMessage($hwnd, [MMWin32]::WM_LBUTTONDOWN, [IntPtr][int][MMWin32]::MK_LBUTTON, $lparam)
-        Start-Sleep -Milliseconds 80
-        [void][MMWin32]::PostMessage($hwnd, [MMWin32]::WM_LBUTTONUP, [IntPtr]::Zero, $lparam)
+        # Re-check every iteration: focus can be lost between clicks.
+        if (([MMWin32]::GetForegroundWindow() -ne (Get-MMWindow))) { break }
+
+        [void][MMWin32]::SetCursorPos($c.ScreenX + $X, $c.ScreenY + $Y)
+        Start-Sleep -Milliseconds 200
+        [MMWin32]::mouse_event([MMWin32]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 70
+        [MMWin32]::mouse_event([MMWin32]::MOUSEEVENTF_LEFTUP, 0, 0, 0, [IntPtr]::Zero)
         Start-Sleep -Milliseconds 450
     }
+
+    [void][MMWin32]::SetCursorPos($saved.X, $saved.Y)
 
     return $true
 }

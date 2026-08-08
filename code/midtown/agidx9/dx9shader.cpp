@@ -1069,7 +1069,22 @@ void agiDX9WorldShader::Setup(IDirect3DDevice9* device, const agiDX9WorldDrawInf
         IDirect3DTexture9* sphere = nullptr;
 
         if (agiNativeReflectionTex)
+        {
             sphere = static_cast<agiDX9TexDef*>(agiNativeReflectionTex)->GetHandle();
+
+            // Report the reflection map whenever it changes. mmEnvSetup (mmcity/cullcity.cpp) holds
+            // a 4x4 TimeOfDay x Weather table with its own refl_* texture per cell - refl_nc for
+            // Noon/Clear, refl_sc for Sunset/Clear, refl_dc for Night/Clear and so on - and
+            // aiVehicleInstance::Draw passes CullCity()->SphereMap, so the right one should follow
+            // the preset. Logging it is how you confirm that rather than assume it.
+            static agiTexDef* reported = nullptr;
+
+            if (agiNativeReflectionTex != reported)
+            {
+                reported = agiNativeReflectionTex;
+                Displayf("DX9 reflection map: '%s'", agiNativeReflectionTex->Tex.Name);
+            }
+        }
 
         if (sphere)
         {

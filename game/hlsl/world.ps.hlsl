@@ -455,6 +455,19 @@ float4 main(VSOut i, float face : VFACE) : COLOR0
         // paint underneath still reads as its own colour.
         float strength = g_EnvInfo.y * (1.0f + (refl * 1.5f));
 
+        // Rough, non-reflective surfaces keep the (1 - roughness) damping.
+        //
+        // Removing it wholesale when the probe landed was wrong, and the road said so: asphalt is
+        // enormous, flat and viewed almost edge-on across most of the screen, so EnvBRDFApprox's
+        // grazing Fresnel rise sweeps a bright band down the carriageway - visible as a sheen
+        // running along the road in both directions from the camera. A prefiltered probe fixed the
+        // *colour* of that reflection (a rough road now samples dim ground rather than bright sky)
+        // but not its strength at grazing angles, which is what actually produced the artefact.
+        //
+        // Vehicles are exempt because they are the case the damping was hurting: a lacquered car
+        // genuinely is a near-mirror and should keep its full environment response.
+        strength *= lerp(1.0f - roughness, 1.0f, refl);
+
         indirect += env * EnvBRDFApprox(f0, env_rough, NdotV) * strength;
     }
     else
