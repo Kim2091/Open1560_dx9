@@ -56,6 +56,12 @@ static constexpr DWORD kWorldReflectFVF = D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_T
 // never receives its value, no matter what the user passes on the command line.
 static mem::cmd_param PARAM_d3d9_depthbias {"d3d9depthbias", "Depth bias for hardware-transformed geometry"};
 
+// Escape hatch for the projection reset in RestoreStateAfterWorldDraw - see the long note there.
+// Off by default: resetting it is what stops RTX Remix path tracing the moment the frame's first
+// blob shadow goes out.
+static mem::cmd_param PARAM_d3d9_identityproj {
+    "d3d9identityproj", "Reset PROJECTION to identity after world draws (breaks RTX Remix)"};
+
 static u32 ImmPrimType = D3DPT_TRIANGLELIST;
 
 static agiVtx* ImmVtxBase = nullptr;
@@ -1164,18 +1170,32 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
     device->SetTransform(D3DTS_WORLD, &identity);
     device->SetTransform(D3DTS_VIEW, &identity);
 
-    // RTX Remix exception: do NOT reset PROJECTION to identity under the Remix bridge. Remix
-    // classifies a fixed-function draw as UI when the current projection looks orthographic
-    // (_44 == 1.0f, identity qualifies) and D3DRS_ZWRITEENABLE is off, and the first "UI" draw of
-    // a frame latches RTX injection - every draw after it that frame is rasterized only, never
-    // path traced (and the game still looks normal, because rtx.skipDrawCallsPostRTXInjection
-    // defaults false). This engine draws its screen-space effects mid-scene - blob shadows, glow
-    // cards, smoke - all RHW with zwrite off, so with an identity projection left behind the first
-    // blob shadow of the frame quietly ended path tracing for everything after it. Leaving the
-    // last perspective projection (_44 == 0) is free: RHW draws ignore all three transforms per
-    // the D3D9 spec, and Remix's Vulkan fixed-function honours that. The genuine HUD still
-    // composites because Present() injects RTX at end of frame regardless.
-    if (!agiDX9RemixBridgeActive())
+    // PROJECTION is deliberately NOT reset, for RTX Remix's benefit.
+    //
+    // Remix classifies a fixed-function draw as UI when the current projection looks orthographic
+    // (_44 == 1.0f, and identity qualifies) and D3DRS_ZWRITEENABLE is off. The first "UI" draw of a
+    // frame latches RTX injection - every draw after it that frame is rasterized only, never path
+    // traced, and the game still looks normal because rtx.skipDrawCallsPostRTXInjection defaults
+    // false. This engine draws its screen-space effects mid-scene - blob shadows, glow cards, smoke
+    // - all RHW with zwrite off, so an identity projection left behind here means the frame's first
+    // blob shadow quietly ends path tracing for everything after it.
+    //
+    // The census measures exactly how much that costs: the showroom issues ZERO in-scene RHW draws
+    // and path traces correctly, while gameplay issues 12-27 of them EVERY frame. That is the whole
+    // "Remix works in the showroom but not in the race" report.
+    //
+    // This used to be conditional on agiDX9RemixBridgeActive(), which could not work: the test was
+    // for "remix" in the requested DLL name, but Remix's normal install is a drop-in called
+    // `d3d9.dll` and chaining proxies are called `d3d9.dll` too. The guard was dead code in every
+    // real configuration, which is why the symptom survived the fix that was supposed to cure it.
+    // Nothing is gained by knowing whether Remix is loaded, so the condition is gone: leaving the
+    // last perspective projection in place is free either way, because RHW draws ignore all three
+    // transforms per the D3D9 spec. The genuine HUD still composites, because Present() injects RTX
+    // at end of frame regardless.
+    //
+    // -d3d9identityproj restores the old unconditional reset, for the driver quirk described above
+    // (leftover transform state reaching supposedly transform-immune draws) if it ever shows up.
+    if (PARAM_d3d9_identityproj.get_or(false))
         device->SetTransform(D3DTS_PROJECTION, &identity);
 }
 

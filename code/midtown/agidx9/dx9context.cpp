@@ -55,20 +55,45 @@ bool agiDX9RemixBridgeActive()
     return g_remix_bridge_active;
 }
 
-// The Remix bridge client is recognised by DLL name: "d3d9_remix.dll" in the default candidate
-// list, or any -d3d9dll override with "remix" in it.
-static bool IsRemixBridgeName(const char* name)
+// Whether the module a name resolved to looks like an RTX Remix runtime.
+//
+// This used to test the *requested* name for "remix" and nothing else, which meant it could
+// essentially never fire in a real setup. Remix's normal install IS a drop-in called `d3d9.dll`,
+// and chaining proxies (the camera proxy, for one) are also called `d3d9.dll` and load the Remix
+// runtime themselves behind the scenes. Both resolve here as the plain name and tested negative.
+//
+// So test the loaded module instead: `remixapi_InitializeLibrary` is exported by the Remix runtime
+// and by nothing else, and the resolved path catches the case where the runtime sits under a name
+// of its own. Nothing depends on getting this right any more - see the projection note in
+// agiDX9Rasterizer::RestoreStateAfterWorldDraw - it is reported so the log can be believed.
+static bool ContainsRemix(const char* text)
 {
     char lower[MAX_PATH];
 
-    const size_t len = std::min(std::strlen(name), sizeof(lower) - 1);
+    const size_t len = std::min(std::strlen(text), sizeof(lower) - 1);
 
     for (size_t i = 0; i < len; ++i)
-        lower[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(name[i])));
+        lower[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(text[i])));
 
     lower[len] = '\0';
 
     return std::strstr(lower, "remix") != nullptr;
+}
+
+// Fills out_path with wherever `module` actually came from, which is worth logging on its own:
+// "d3d9.dll" resolving to C:\Windows\system32\d3d9.dll says at a glance that no wrapper is loaded,
+// and that is exactly the question being asked when path tracing has not turned on.
+static bool IsRemixBridgeModule(HMODULE module, const char* name, char* out_path, u32 out_len)
+{
+    out_path[0] = '\0';
+
+    if (GetModuleFileNameA(module, out_path, out_len) == 0)
+        out_path[0] = '\0';
+
+    if (GetProcAddress(module, "remixapi_InitializeLibrary") != nullptr)
+        return true;
+
+    return ContainsRemix(name) || ContainsRemix(out_path);
 }
 
 // RTX Remix ships its D3D9 entry point as a drop-in replacement *named* `d3d9.dll`, which is how it
@@ -123,12 +148,12 @@ static IDirect3D9* CreateD3D9()
 
             if (IDirect3D9* d3d = create(D3D_SDK_VERSION))
             {
-                Displayf("D3D9: Direct3DCreate9 from '%s'", name);
+                char path[MAX_PATH];
 
-                g_remix_bridge_active = IsRemixBridgeName(name);
+                g_remix_bridge_active = IsRemixBridgeModule(module, name, path, sizeof(path));
 
-                if (g_remix_bridge_active)
-                    Displayf("D3D9: RTX Remix bridge active - keeping perspective projection on screen draws");
+                Displayf("D3D9: Direct3DCreate9 from '%s' -> '%s'%s", name, (path[0] != '\0') ? path : "<unknown>",
+                    g_remix_bridge_active ? " [RTX Remix runtime detected]" : "");
 
                 return d3d;
             }
