@@ -788,7 +788,23 @@ static u64 agiDX9GHashRecord(const agiWorldVtx* vertices, i32 vertex_count, cons
 
     u64 hash = 0xCBF29CE484222325ull;
 
-    hash = agiDX9GHashBytes(vertices, static_cast<usize>(vertex_count) * sizeof(agiWorldVtx), hash);
+    // POSITION AND TEXCOORD ONLY - deliberately not the whole vertex.
+    //
+    // Remix's HashComponents (rtx_hashing.h) are VertexPosition, VertexTexcoord, Indices,
+    // GeometryDescriptor, VertexLayout and VertexShader. Normals and vertex COLOUR are not in the
+    // set, and colour is the one that matters here: vehicles are lit by the dynamic rig, so their
+    // per-vertex colours are recomputed every frame. Hashing the whole 0x24-byte agiWorldVtx made
+    // every car strobe under -ghashcolor even parked and undamaged, which is an artefact of this
+    // diagnostic rather than anything Remix would see.
+    //
+    // Pedestrians are a different case and will still flicker: they are genuinely CPU-skinned, so
+    // their POSITIONS change per frame, and Remix flickers on software-animated meshes too.
+    for (i32 i = 0; i < vertex_count; ++i)
+    {
+        hash = agiDX9GHashBytes(&vertices[i].pos, sizeof(vertices[i].pos), hash);
+        hash = agiDX9GHashBytes(&vertices[i].tu, sizeof(f32) * 2, hash);
+    }
+
     hash = agiDX9GHashBytes(indices, static_cast<usize>(index_count) * sizeof(u16), hash);
 
     const u32 descriptor[3] {static_cast<u32>(sizeof(agiWorldVtx)), static_cast<u32>(vertex_count), D3DPT_TRIANGLELIST};
