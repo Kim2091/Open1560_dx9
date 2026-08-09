@@ -1407,6 +1407,7 @@ include_dummy_symbol(mmcamcs_aicamcs);
 include_dummy_symbol(mmcamcs_appcamcs);
 include_dummy_symbol(mmcamcs_basecamcs);
 include_dummy_symbol(mmcamcs_carcamcs);
+include_dummy_symbol(mmcamcs_orbitcamcs);
 include_dummy_symbol(mmcamcs_pointcamcs);
 include_dummy_symbol(mmcamcs_polarcamcs);
 include_dummy_symbol(mmcamcs_postcamcs);
