@@ -48,9 +48,20 @@ struct agiDX9SubmitCensus
 
     u32 ScreenLineCalls;
     u32 ScreenLines;
+
+    // -ghash. Zero unless the switch is on. See agiDX9GHashRecord in dx9rsys.cpp for what is
+    // hashed and why the churn number is the one that matters.
+    u32 GHashDraws;
+    u32 GHashStable;
+    u32 GHashNew;
+    u32 GHashDistinct;
 };
 
 extern agiDX9SubmitCensus agiDX9Census;
+
+// Advances the -ghash frame counter. Called once per frame from agiDX9Pipeline::EndFrame, next to
+// the census reset, because "was this hash also seen last frame" needs a frame number to compare.
+void agiDX9GHashNextFrame();
 
 class agiDX9Rasterizer final : public agiRasterizer
 {

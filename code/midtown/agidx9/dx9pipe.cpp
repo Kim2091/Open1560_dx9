@@ -356,9 +356,23 @@ void agiDX9Pipeline::EndFrame()
                 agiGlowCardsNoTexture, agiGlowCardsNotGlow, agiGlowCardsHarvested,
                 total_3d ? (100.0 * world / total_3d) : 0.0, total ? (100.0 * world / total) : 0.0,
                 agiDX9Census.WorldCalls ? (1.0 * world / agiDX9Census.WorldCalls) : 0.0);
+
+            // -ghash, on its own line and only when the switch is on. CHURN is the number that
+            // matters: distinct hashes appearing for the first time this frame. On a settled view
+            // it should fall to zero, because MeshWorld submits model-space vertices and the world
+            // matrix goes out through SetTransform rather than into the vertex bytes. Churn that
+            // never settles means something rewrites geometry every frame, and Remix mesh
+            // replacements cannot stick to it.
+            if (agiDX9Census.GHashDraws)
+            {
+                Displayf("DX9 GHASH: frame=%u draws=%u distinct=%u stable=%u CHURN(new)=%u", census_frames,
+                    agiDX9Census.GHashDraws, agiDX9Census.GHashDistinct, agiDX9Census.GHashStable,
+                    agiDX9Census.GHashNew);
+            }
         }
 
         agiDX9Census = {};
+        agiDX9GHashNextFrame();
     }
 
     agiPipeline::EndFrame();

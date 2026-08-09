@@ -56,6 +56,26 @@ static constexpr DWORD kWorldReflectFVF = D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_T
 // never receives its value, no matter what the user passes on the command line.
 static mem::cmd_param PARAM_d3d9_depthbias {"d3d9depthbias", "Depth bias for hardware-transformed geometry"};
 
+// -ghash: does this engine's geometry hash the SAME way every frame?
+//
+// RTX Remix identifies a mesh by hashing it at DRAW time - vertex bytes for the drawn range, index
+// bytes, stride, vertex count, primitive type. Not textures, not transforms, not render state. That
+// hash is the key into the replacement database, so a mesh whose bytes differ frame to frame gets a
+// new identity every frame: replacements never stick, and the capture fills with thousands of
+// one-frame meshes. This is the failure the Max Payne d3d8 proxy work was built to fix, and the
+// hashing model here is taken from its analysis (MaxPayne_RTX_Remix_Hash_Stabilization_Analysis.md
+// §2, on D: - the D3D8 and D3D9 Remix runtimes hash the same way).
+//
+// The number that matters is CHURN (new hashes per frame), not the hash values. A steady scene that
+// keeps producing new hashes is broken for Remix even though it looks perfect on screen.
+//
+// The expectation for Pathway A is that churn settles to ~zero once a view stabilises, because
+// MeshWorld submits MODEL-space vertices - the world matrix goes out through SetTransform and never
+// touches the vertex bytes. If churn does NOT settle, something is rewriting vertex data per frame
+// and that is a real Remix blocker worth finding. Either way this answers it with a number instead
+// of a guess, which is the whole point.
+static mem::cmd_param PARAM_ghash {"ghash", "Report RTX Remix geometry hash stability for world draws"};
+
 // Escape hatch for the projection reset in RestoreStateAfterWorldDraw - see the long note there.
 // Off by default: resetting it is what stops RTX Remix path tracing the moment the frame's first
 // blob shadow goes out.
@@ -712,6 +732,109 @@ void agiDX9Rasterizer::FlushState()
 // Pretransformed (XYZRHW) draws carry no world-space information and are invisible to RTX Remix
 // as 3D geometry, no matter how they look on screen. Dumped by agiDX9Pipeline::EndFrame().
 agiDX9SubmitCensus agiDX9Census {};
+
+// -ghash storage. See PARAM_ghash for what this measures and why.
+//
+// Open addressing with linear probing over a fixed table, because this runs inside the draw loop
+// and must not allocate. The table deliberately stops accepting new entries at half full rather
+// than degrading into long probe chains - GHashDistinct then stops rising, which is visible in the
+// report, so a saturated table reads as saturated instead of as quietly wrong numbers.
+struct agiDX9GHashSlot
+{
+    u64 Hash;
+    u32 LastFrame;
+    bool Used;
+};
+
+static constexpr u32 kGHashSlots = 16384; // power of two
+static constexpr u32 kGHashMask = kGHashSlots - 1;
+
+static agiDX9GHashSlot g_GHashTable[kGHashSlots] {};
+static u32 g_GHashFrame = 0;
+static u32 g_GHashUsed = 0;
+
+// FNV-1a. Not a cryptographic choice and not Remix's own function - what is being measured is
+// whether the same bytes come back frame after frame, and any decent mixer answers that.
+static u64 agiDX9GHashBytes(const void* data, usize size, u64 hash)
+{
+    const u8* bytes = static_cast<const u8*>(data);
+
+    for (usize i = 0; i < size; ++i)
+    {
+        hash ^= bytes[i];
+        hash *= 0x100000001B3ull;
+    }
+
+    return hash;
+}
+
+// Hashes one world draw the way Remix would, and classifies it as new or returning.
+//
+// Inputs mirror the Remix key: vertex bytes for the drawn range, index bytes, stride, vertex count,
+// primitive type. Explicitly NOT the transforms - a mesh drawn in two places is ONE mesh to Remix,
+// and folding the world matrix in here would invent churn that Remix does not see.
+static void agiDX9GHashRecord(const agiWorldVtx* vertices, i32 vertex_count, const u16* indices, i32 index_count)
+{
+    if (!PARAM_ghash.get_or(false))
+        return;
+
+    if (!vertices || !indices || (vertex_count <= 0) || (index_count <= 0))
+        return;
+
+    u64 hash = 0xCBF29CE484222325ull;
+
+    hash = agiDX9GHashBytes(vertices, static_cast<usize>(vertex_count) * sizeof(agiWorldVtx), hash);
+    hash = agiDX9GHashBytes(indices, static_cast<usize>(index_count) * sizeof(u16), hash);
+
+    const u32 descriptor[3] {static_cast<u32>(sizeof(agiWorldVtx)), static_cast<u32>(vertex_count), D3DPT_TRIANGLELIST};
+
+    hash = agiDX9GHashBytes(descriptor, sizeof(descriptor), hash);
+
+    ++agiDX9Census.GHashDraws;
+
+    const u32 start = static_cast<u32>(hash) & kGHashMask;
+
+    for (u32 probe = 0; probe < 64; ++probe)
+    {
+        agiDX9GHashSlot& slot = g_GHashTable[(start + probe) & kGHashMask];
+
+        if (!slot.Used)
+        {
+            if (g_GHashUsed >= (kGHashSlots / 2))
+                return;
+
+            slot.Used = true;
+            slot.Hash = hash;
+            slot.LastFrame = g_GHashFrame;
+
+            ++g_GHashUsed;
+            ++agiDX9Census.GHashNew;
+            ++agiDX9Census.GHashDistinct;
+
+            return;
+        }
+
+        if (slot.Hash == hash)
+        {
+            // Count each distinct hash once per frame, however many times it is drawn - the same
+            // mesh submitted twice is one identity to Remix, not two.
+            if (slot.LastFrame != g_GHashFrame)
+            {
+                slot.LastFrame = g_GHashFrame;
+
+                ++agiDX9Census.GHashDistinct;
+                ++agiDX9Census.GHashStable;
+            }
+
+            return;
+        }
+    }
+}
+
+void agiDX9GHashNextFrame()
+{
+    ++g_GHashFrame;
+}
 
 // Fog must be OFF for additively-composited AlphaGlow content, and the engine says so itself.
 //
@@ -1736,6 +1859,10 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     device->SetFVF(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
     i32 primitive_count = index_count / 3;
+
+    // -ghash. Immediately before the draw, which is where Remix would hash it, and on exactly the
+    // bytes handed to the device.
+    agiDX9GHashRecord(vertices, vertex_count, indices, index_count);
 
     device->DrawIndexedPrimitiveUP(
         D3DPT_TRIANGLELIST, 0, vertex_count, primitive_count, indices, D3DFMT_INDEX16, vertices, sizeof(agiWorldVtx));
