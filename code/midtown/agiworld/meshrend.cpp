@@ -2334,48 +2334,22 @@ void agiMeshSet::DrawCard(Vector3& position, f32 scale, u32 rotation, u32 color,
         }
     }
 
-    if (card_texture && (card_texture->Tex.Props & agiTexProp::AlphaGlow))
-    {
-        ++agiGlowCardsHarvested;
-
-        // Sample where this frame actually reads. A traffic light is one texture holding red, amber
-        // and green, selected by `frame` - see the note in agiworld/glowlight.h.
-        const Vector2* frame_uvs = &CurrentMeshCard.Frames[4 * frame];
-
-        f32 u = 0.0f;
-        f32 v = 0.0f;
-
-        for (i32 k = 0; k < 4; ++k)
-        {
-            u += frame_uvs[k].x;
-            v += frame_uvs[k].y;
-        }
-
-        // `position` is in MODEL space, not world space.
-        //
-        // This is the bug that kept street lamps from lighting anything, and it hid well because it
-        // is invisible for half the callers. DrawCard projects through view_params.ModelView, which
-        // is View * World - so whatever world matrix is current when it is called applies to this
-        // position. asParticles::Cull() calls Viewport()->SetWorld(IDENTITY) before its cards, so for
-        // particles, smoke and vehicle glows model space *is* world space and harvesting `position`
-        // raw was accidentally correct. mmBangerInstance::DrawGlow() does not: it sets the banger's
-        // own transform, so the position it passes is the banger-local glow offset.
-        //
-        // The result was that every street lamp in the city registered a light at its raw
-        // mmBangerData::GlowOffset - measured in the log as (0.0, 1.8, 0.0) for `opstlite` and
-        // (-2.3, 6.3, 0.0) for `opstlite_blue`, which are the GlowOffset values themselves, not
-        // positions in Chicago. All of them piled up within a couple of metres of the world origin,
-        // lighting one arbitrary spot on the map and leaving every actual lamp dark while its flare
-        // still drew correctly on screen. The flare looked right because rendering uses ModelView;
-        // only the harvest took the number at face value.
-        //
-        // Transforming by ViewParams().World is correct for both populations: it is the matrix
-        // DrawCard is already implicitly using, and it collapses to a no-op for the identity case.
-        Vector3 world_position;
-        world_position.Dot(position, view_params.World);
-
-        agiAddGlowLight(world_position, color, scale, card_texture, u * 0.25f, v * 0.25f);
-    }
+    // The billboard glow harvest stood here - street lamps, traffic signals, lit signage - and is
+    // unwired along with the rest of Pathway B (agidx9/dx9pipe.cpp, BeginGfx). agiAddGlowLight()
+    // and agiAddGlowLightRGB() below are intact and simply have no caller.
+    //
+    // Removed rather than commented out because it computed the frame's UV centroid into locals
+    // that nothing would then read, and /W4 /WX rejects that. The two things it knew that are worth
+    // knowing again before anyone rebuilds it - that `position` is in MODEL space and must be
+    // transformed by ViewParams().World, and that the UV sub-rect must come from
+    // CurrentMeshCard.Frames[4 * frame] because one texture holds red, amber and green - are
+    // written up in docs/remix_api_data_sources.md §1.2 and §1.3. Getting either wrong is not a
+    // subtle degradation: the first put the whole city's street lighting on one light at the world
+    // origin, and the second gives every traffic signal the same muddy colour in all three states.
+    //
+    // The CardsSeen / CardsNoTexture / CardsNotGlow counters above are deliberately kept. They
+    // describe the draw stream rather than Pathway B, and they answer a question nothing visual
+    // can: whether a glow reaches this point at all.
 
     f32 x = matrix.m0.x * position.x + matrix.m1.x * position.y + matrix.m2.x * position.z + matrix.m3.x;
     f32 y = matrix.m0.y * position.x + matrix.m1.y * position.y + matrix.m2.y * position.z + matrix.m3.y;

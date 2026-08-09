@@ -118,22 +118,23 @@ i32 mmSky::IsFlashing()
 
 void mmCullCity::Cull()
 {
-    // Latch the lightning strike so it can light the world, not just the sky.
+    // The lightning latch stood here and is unwired along with the rest of Pathway B
+    // (agidx9/dx9pipe.cpp, BeginGfx) - agiLightningFlash had no other reader, so it now stays 0.
     //
-    // mmSky::DoFlash is a single-frame flag raised by mmRainAudio::Update when thunder plays, and
-    // mmSky::Draw clears it as it swaps in FlashTex. Sampling it here - during the cull pass, ahead
-    // of any drawing - is what makes it observable at all; reading it later would always see zero.
+    // Worth knowing before rebuilding it: mmSky::DoFlash is a single-frame flag raised by
+    // mmRainAudio::Update when thunder plays, and mmSky::Draw CLEARS it as it swaps in FlashTex.
+    // Sampling it here, during the cull pass ahead of any drawing, is what makes it observable at
+    // all - read it later and it is always zero, because the sky is drawn first. It was then
+    // decayed (~0.8/frame) rather than held for one frame, because a strike is not instantaneous
+    // and the falloff is what reads as a flash rather than as a dropped frame:
     //
-    // Decayed rather than held for one frame because a strike is not instantaneous: the falloff is
-    // what reads as a flash rather than a dropped frame. Roughly 0.8 per frame gives a visible
-    // flicker of a few frames at any sane frame rate.
-    if (mmSky::IsFlashing())
-        agiLightningFlash = 1.0f;
-    else
-        agiLightningFlash *= 0.80f;
-
-    if (agiLightningFlash < 0.01f)
-        agiLightningFlash = 0.0f;
+    //     if (mmSky::IsFlashing())
+    //         agiLightningFlash = 1.0f;
+    //     else
+    //         agiLightningFlash *= 0.80f;
+    //
+    //     if (agiLightningFlash < 0.01f)
+    //         agiLightningFlash = 0.0f;
 
     if (FogEnd == 0.0f || agiCurState.GetDrawMode() == agiDrawDepth)
     {

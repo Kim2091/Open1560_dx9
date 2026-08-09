@@ -47,8 +47,9 @@ define_dummy_symbol(agidx9_dx9pipe);
 agiDX9Pipeline::agiDX9Pipeline() = default;
 agiDX9Pipeline::~agiDX9Pipeline() = default;
 
-// Selects Pathway B (programmable vs_3_0/ps_3_0 world shading) over Pathway A (fixed function).
-static mem::cmd_param PARAM_d3d9_shaders {"d3d9shaders", "Use the programmable PBR world path"};
+// -d3d9shaders is deliberately no longer registered. It was the only way to select Pathway B, and
+// Pathway B is unwired (see BeginGfx). Leaving the switch registered would advertise a setting that
+// silently does nothing, which is worse than the flag being unrecognised.
 
 // Renders the frame into an offscreen target and blits it back. Exercises the render-target
 // framework end to end; also the hook a post-processing chain will attach to. Not Remix-compatible.
@@ -109,11 +110,24 @@ i32 agiDX9Pipeline::BeginGfx()
     rasterizer_ = arnewr agiDX9Rasterizer(this);
     renderer_ = arnewr agiZBufRenderer(rasterizer_.get());
 
-    // Pathway B is opt-in. Pathway A stays the default because it is the one RTX Remix can
-    // reconstruct a scene from - see docs/dx9_rendering_pathways.md. A failure here is soft: the
-    // shader system reports it and we simply carry on fixed-function.
-    if (PARAM_d3d9_shaders.get_or(false))
-        world_shader_.Init(dx9_context_->GetDevice());
+    // PATHWAY B IS UNWIRED. This is the one place it was ever turned on, and the call is gone.
+    //
+    // The work now goes into Pathway A, because Pathway A is the one RTX Remix can reconstruct a
+    // scene from - a draw issued through a vertex shader is opaque to Remix, which cannot know what
+    // the shader did to the position. Pathway B was pulling in the opposite direction.
+    //
+    // Nothing is deleted. agiDX9WorldShader, agiDX9SkyProbe, the HLSL in game/hlsl and the glow
+    // harvest in agiworld/meshrend.cpp are all still here and still compile; they simply have no
+    // caller. world_shader_ therefore never becomes valid, WorldShader() below returns nullptr for
+    // the rest of the process, and every programmable branch downstream is dead code.
+    //
+    // What Pathway B *learned* - where this engine keeps its light sources, its sun, its materials
+    // - is written up in docs/remix_api_data_sources.md, because that knowledge is what the Remix
+    // API wants and it long outlives the renderer that discovered it.
+    //
+    // To re-wire, this and re-registering -d3d9shaders above is the whole switch:
+    //     if (PARAM_d3d9_shaders.get_or(false))
+    //         world_shader_.Init(dx9_context_->GetDevice());
 
     // Offscreen scene target. Off unless asked for, and deliberately so: routing the frame through
     // a texture and blitting it back is invisible to RTX Remix, which reconstructs from the draws
@@ -194,11 +208,9 @@ void agiDX9Pipeline::BeginFrame()
 {
     ARTS_UTIMED(agiBeginFrame);
 
-    // Age the live light set and retire lights whose sprite has not been drawn recently.
-    // See agiworld/glowlight.h - lights persist across frames rather than being rebuilt, so a
-    // momentary culling or LOD hiccup no longer makes them blink out.
-    agiUpdateGlowLights();
-
+    // Not calling agiUpdateGlowLights() - Pathway B is unwired (see BeginGfx), nothing harvests
+    // into the registry any more, and ageing an empty set every frame is pure cost. The teardown
+    // reset in EndGfx() is kept regardless, because it is a safety net rather than an optimisation.
     agiPipeline::BeginFrame();
 
     if (!dx9_context_->BeginFrame())

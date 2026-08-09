@@ -242,8 +242,10 @@ i32 agiDX9TexDef::BeginGfx()
         mip_maps = false;
     }
 
-    if (alpha_glow)
-        BuildGlowColors(*surface);
+    // BuildGlowColors(*surface) stood here, building the per-texture colour grid that
+    // SampleGlowColor() reads. Its only consumer was Pathway B's light harvest, which is unwired
+    // (agidx9/dx9pipe.cpp, BeginGfx), so this is now a per-glow-texture cost with no reader. Both
+    // functions are intact. To re-wire: restore the call under `if (alpha_glow)`.
 
     bool alpha = (Tex.Flags & (agiTexParameters::Alpha | agiTexParameters::Chromakey)) != 0;
     bool needs_swizzle = false;

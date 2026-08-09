@@ -1208,7 +1208,11 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
 // Position and extent come from the submitted geometry rather than from the instance origin,
 // because a tail light sits well off a car's centre and the whole point is that the light lands
 // where the lamp is.
-static void HarvestWorldGlow(
+//
+// [[maybe_unused]] because its caller is gone with Pathway B and this is kept deliberately: a
+// static function with no references is C4505 at /W4, which /WX makes fatal. The attribute says
+// "unreferenced on purpose" rather than silencing the warning globally.
+[[maybe_unused]] static void HarvestWorldGlow(
     agiDX9TexDef* texture, agiWorldVtx* vertices, u16* indices, i32 index_count, const Matrix34& world)
 {
     if (!texture || (index_count <= 0))
@@ -1492,10 +1496,16 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     if (additive_glow)
         device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 
-    // Harvest this glow as a light source, but only for real 3D content - IsInScene() keeps menu
-    // and showroom glows (which have no city around them to light) out of the set.
-    if (additive_glow && Pipe()->IsInScene())
-        HarvestWorldGlow(native_tex, vertices, indices, index_count, world);
+    // Glow harvesting is unwired along with the rest of Pathway B (see agiDX9Pipeline::BeginGfx).
+    // This was the mesh route - vehicle head, tail, brake and reverse lights, which never reach
+    // agiMeshSet::DrawCard. HarvestWorldGlow() below is intact and simply has no caller.
+    //
+    // To re-wire:
+    //     if (additive_glow && Pipe()->IsInScene())
+    //         HarvestWorldGlow(native_tex, vertices, indices, index_count, world);
+    //
+    // IsInScene() is not incidental - it keeps menu and showroom glows, which have no city around
+    // them to light, out of the set.
 
     // Fog off for additive glows on this path as well - same reason as the screen path, see
     // IsAdditiveGlow(). Restored by RestoreStateAfterWorldDraw().
