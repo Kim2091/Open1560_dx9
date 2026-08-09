@@ -76,6 +76,11 @@ static mem::cmd_param PARAM_d3d9_depthbias {"d3d9depthbias", "Depth bias for har
 // of a guess, which is the whole point.
 static mem::cmd_param PARAM_ghash {"ghash", "Report RTX Remix geometry hash stability for world draws"};
 
+// The visual half: Remix's Debug View -> Geometry Hash, reproduced on the fixed-function path.
+// Tints every world draw flat with a colour derived from its geometry hash. Stable geometry holds
+// its colour; anything rehashed per frame strobes. See agiDX9GHashColor.
+static mem::cmd_param PARAM_ghashcolor {"ghashcolor", "Tint world draws by RTX Remix geometry hash (debug view)"};
+
 // Escape hatch for the projection reset in RestoreStateAfterWorldDraw - see the long note there.
 // Off by default: resetting it is what stops RTX Remix path tracing the moment the frame's first
 // blob shadow goes out.
@@ -773,13 +778,13 @@ static u64 agiDX9GHashBytes(const void* data, usize size, u64 hash)
 // Inputs mirror the Remix key: vertex bytes for the drawn range, index bytes, stride, vertex count,
 // primitive type. Explicitly NOT the transforms - a mesh drawn in two places is ONE mesh to Remix,
 // and folding the world matrix in here would invent churn that Remix does not see.
-static void agiDX9GHashRecord(const agiWorldVtx* vertices, i32 vertex_count, const u16* indices, i32 index_count)
+static u64 agiDX9GHashRecord(const agiWorldVtx* vertices, i32 vertex_count, const u16* indices, i32 index_count)
 {
-    if (!PARAM_ghash.get_or(false))
-        return;
+    if (!PARAM_ghash.get_or(false) && !PARAM_ghashcolor.get_or(false))
+        return 0;
 
     if (!vertices || !indices || (vertex_count <= 0) || (index_count <= 0))
-        return;
+        return 0;
 
     u64 hash = 0xCBF29CE484222325ull;
 
@@ -801,7 +806,7 @@ static void agiDX9GHashRecord(const agiWorldVtx* vertices, i32 vertex_count, con
         if (!slot.Used)
         {
             if (g_GHashUsed >= (kGHashSlots / 2))
-                return;
+                return hash;
 
             slot.Used = true;
             slot.Hash = hash;
@@ -811,7 +816,7 @@ static void agiDX9GHashRecord(const agiWorldVtx* vertices, i32 vertex_count, con
             ++agiDX9Census.GHashNew;
             ++agiDX9Census.GHashDistinct;
 
-            return;
+            return hash;
         }
 
         if (slot.Hash == hash)
@@ -826,9 +831,29 @@ static void agiDX9GHashRecord(const agiWorldVtx* vertices, i32 vertex_count, con
                 ++agiDX9Census.GHashStable;
             }
 
-            return;
+            return hash;
         }
     }
+
+    return hash;
+}
+
+// Hash -> flat colour, the same idea as Remix's Debug View -> Geometry Hash: a mesh whose hash is
+// stable holds one steady colour, and a mesh being rehashed every frame strobes. That is the
+// spatial question the numeric report cannot answer - WHICH mesh is unstable, not how many.
+//
+// Per NVIDIA's own guidance for that view, strobing is expected for particles and for CPU-skinned
+// ("software animation") meshes, while GPU-skinned geometry stays stable. MM1 animates pedestrians
+// on the CPU, so the prediction here is a solid city with strobing pedestrians.
+//
+// The low 24 bits become RGB, floored away from black so nothing reads as an unlit surface.
+static u32 agiDX9GHashColor(u64 hash)
+{
+    const u32 r = 64 + static_cast<u32>((hash >> 0) & 0x7F);
+    const u32 g = 64 + static_cast<u32>((hash >> 8) & 0x7F);
+    const u32 b = 64 + static_cast<u32>((hash >> 16) & 0x7F);
+
+    return D3DCOLOR_XRGB(r, g, b);
 }
 
 void agiDX9GHashNextFrame()
@@ -1862,7 +1887,23 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
 
     // -ghash. Immediately before the draw, which is where Remix would hash it, and on exactly the
     // bytes handed to the device.
-    agiDX9GHashRecord(vertices, vertex_count, indices, index_count);
+    const u64 geometry_hash = agiDX9GHashRecord(vertices, vertex_count, indices, index_count);
+
+    // -ghashcolor. Replace the texture with a flat hash colour for this draw only.
+    //
+    // TFACTOR rather than a vertex-colour rewrite, because the vertex data is the very thing being
+    // hashed and must not be touched - tinting through the vertices would change the hash it is
+    // supposed to be visualising. Nothing else on this path uses D3DRS_TEXTUREFACTOR.
+    //
+    // No explicit restore: RestoreStateAfterWorldDraw() below already re-applies ApplyTexEnv() from
+    // tex_env_, which puts COLOROP/COLORARG1 back, and the stale TEXTUREFACTOR value is only ever
+    // read when a stage selects TFACTOR, which nothing else does.
+    if (PARAM_ghashcolor.get_or(false))
+    {
+        device->SetRenderState(D3DRS_TEXTUREFACTOR, agiDX9GHashColor(geometry_hash));
+        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
+    }
 
     device->DrawIndexedPrimitiveUP(
         D3DPT_TRIANGLELIST, 0, vertex_count, primitive_count, indices, D3DFMT_INDEX16, vertices, sizeof(agiWorldVtx));
