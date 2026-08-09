@@ -8,6 +8,8 @@ arts_component "mmcamcs"
         "basecamcs.h",
         "carcamcs.cpp",
         "carcamcs.h",
+        "orbitcamcs.cpp",
+        "orbitcamcs.h",
         "pointcamcs.cpp",
         "pointcamcs.h",
         "polarcamcs.cpp",

@@ -25,6 +25,7 @@ define_dummy_symbol(mmgame_game);
 #include "arts7/cullmgr.h"
 #include "arts7/lamp.h"
 #include "arts7/sim.h"
+#include "data7/callback.h"
 #include "data7/memstat.h"
 #include "eventq7/eventq.h"
 #include "eventq7/keys.h"
@@ -43,6 +44,7 @@ define_dummy_symbol(mmgame_game);
 #include "mmaudio/mmvoicecommentary.h"
 #include "mmaudio/sound.h"
 #include "mmbangers/data.h"
+#include "mmcamcs/orbitcamcs.h"
 #include "mmcamcs/viewcs.h"
 #include "mmcar/carsimcheap.h"
 #include "mmcar/surfaceaudioinfo.h"
@@ -165,6 +167,48 @@ mmGame::~mmGame()
         // FIXME: Freed by some child classes, but not zeroed
         StartSounds.release();
     }
+}
+
+// Installs or removes the orbital camera, leaving the game's own camera state untouched: CamIndex
+// keeps pointing at whichever camera was in the rotation, and restoring simply hands that camera
+// back. The camera itself is never parented into the node tree - mmViewCS::Update calls the current
+// camera's Update() through the vtable and copies its matrix out - so nothing owns or frees it.
+static void ToggleOrbitCam(mmPlayer* player)
+{
+    if (!player || !player->ViewCS)
+        return;
+
+    // The same guards mmPlayer::ToggleCam applies before it will switch cameras.
+    if ((player->InAutoCam != 0) || (player->InPreRaceCam != 0))
+        return;
+
+    static OrbitCamCS orbit_cam;
+    static bool orbit_active = false;
+
+    // The camera outlives a race but its car does not. Anything left from a previous race is no
+    // longer installed, so treat it as inactive rather than restoring from a stale pointer.
+    if (orbit_cam.Car != &player->Car)
+        orbit_active = false;
+
+    // Transition kind 3 over 0.8 seconds, matching ToggleCam. NewCam returns 0 and changes nothing
+    // if the view is already blending, so only latch the state once it has actually accepted.
+    if (!orbit_active)
+    {
+        orbit_cam.Init(&player->Car);
+
+        if (player->ViewCS->NewCam(&orbit_cam, 3, 0.8f, Callback {}) != 0)
+            orbit_active = true;
+
+        return;
+    }
+
+    i32 index = player->CamIndex;
+    CarCamCS* previous =
+        (index >= 0 && index < static_cast<i32>(ARTS_SIZE(player->CarCams))) ? player->CarCams[index] : nullptr;
+
+    // NewCam dereferences its argument, so never hand it a null camera.
+    if ((previous != nullptr) && (player->ViewCS->NewCam(previous, 3, 0.8f, Callback {}) != 0))
+        orbit_active = false;
 }
 
 void mmGame::UpdateDebugInput()
@@ -395,6 +439,12 @@ void mmGame::UpdateDebugInput()
                         VoiceCommentary->StopNow();
 
                     Popup->ProcessEscape(!NETMGR.InSession());
+                    break;
+                }
+                // O for orbital. C is not available: it is the default binding for IOID_CAM
+                // ("Change Camera") in mmInput's keymap, so taking it would fire both.
+                case EQ_VK_O: {
+                    ToggleOrbitCam(Player.get());
                     break;
                 }
 #ifdef ARTS_DEV_BUILD
