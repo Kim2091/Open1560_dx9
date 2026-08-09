@@ -22,6 +22,10 @@
 
 // A mouse-driven orbital chase camera.
 //
+// Mouse input drives TargetYaw/TargetPitch; Yaw/Pitch chase them with a frame-rate independent
+// exponential filter, so the view is smooth and behaves the same at 30 and 300 fps. After a short
+// idle the target eases back behind the car, the way a driving game's chase camera does.
+//
 // This class does not exist in the original game, so unlike every other camera here it declares no
 // imported or exported members, no GetClass() override, and no check_size:
 //
@@ -44,15 +48,32 @@ public:
 
     void Update() override;
 
+    // Where the camera is now, and where the input wants it to be.
     f32 Yaw {};
     f32 Pitch {};
+    f32 TargetYaw {};
+    f32 TargetPitch {};
+
     f32 Distance {};
     f32 Height {};
+
+    // Radians per mouse count. Negative by default: raw mouse motion drives both axes the wrong
+    // way round for an orbital view.
     f32 YawScale {};
     f32 PitchScale {};
+
+    f32 SmoothRate {};
+    f32 RecenterDelay {};
+    f32 IdleTime {};
+
     i32 PrevMouseX {};
     i32 PrevMouseY {};
 
 private:
+    // Re-reads the mouse accumulator without applying it, so a stretch of suppressed input never
+    // arrives later as one accumulated jump.
     void SyncMouse();
+
+    // Eases the target back behind the car once the mouse has been idle for RecenterDelay.
+    void Recenter(f32 delta);
 };
