@@ -20,11 +20,17 @@
 
 #include "carcamcs.h"
 
-// A mouse-driven orbital chase camera.
+// A mouse-driven orbital chase camera with a speed-reactive shake.
 //
 // Mouse input drives TargetYaw/TargetPitch; Yaw/Pitch chase them with a frame-rate independent
 // exponential filter, so the view is smooth and behaves the same at 30 and 300 fps. After a short
 // idle the target eases back behind the car, the way a driving game's chase camera does.
+//
+// On top of that sits a trauma-driven shake. Four sources - speed, road roughness, longitudinal
+// acceleration and impacts - each contribute to a single normalised trauma value, and the shake
+// amplitude is its square, so low trauma stays imperceptible instead of becoming a constant buzz.
+// The displacement itself is layered sine noise at incommensurate frequencies rather than
+// per-frame randomness, which is what makes it read as vibration instead of jitter.
 //
 // This class does not exist in the original game, so unlike every other camera here it declares no
 // imported or exported members, no GetClass() override, and no check_size:
@@ -42,11 +48,15 @@ public:
     OrbitCamCS() = default;
     ~OrbitCamCS() override = default;
 
-    void Init(mmCar* car);
+    // The view is needed only so UpdateView() can push a changed FOV through to the asCamera;
+    // nothing else sets BaseCamCS::View for a camera the engine did not create itself.
+    void Init(mmCar* car, mmViewCS* view);
 
     void MakeActive() override;
 
     void Update() override;
+
+    // --- Orbit ---------------------------------------------------------------------------------
 
     // Where the camera is now, and where the input wants it to be.
     f32 Yaw {};
@@ -69,6 +79,46 @@ public:
     i32 PrevMouseX {};
     i32 PrevMouseY {};
 
+    // --- Speed response ------------------------------------------------------------------------
+
+    // Smoothed 0..1 position within the shake speed band, reused for the framing changes.
+    f32 SpeedFactor {};
+
+    f32 ShakeStartSpeed {};
+    f32 ShakeMaxSpeed {};
+
+    // Added to Distance/Height at full speed; the camera eases back and drops slightly.
+    f32 SpeedDistance {};
+    f32 SpeedHeight {};
+
+    // Degrees added to the FOV at full speed. Off by default - it changes the projection matrix,
+    // which the Remix work depends on. BaseFov remembers the value to widen from.
+    f32 SpeedFov {};
+    f32 BaseFov {};
+
+    // --- Shake ---------------------------------------------------------------------------------
+
+    // Per-source weights into the combined trauma. Any can be set to zero independently.
+    f32 ShakeScale {};
+    f32 ShakeRoughScale {};
+    f32 ShakeImpactScale {};
+    f32 ShakeAccelScale {};
+
+    // Phase of the noise, advanced at a rate that rises with trauma, and the current amplitude.
+    // Both are held still while paused so the shake freezes rather than idling in place.
+    f32 ShakeTime {};
+    f32 ShakeAmount {};
+
+    f32 SpeedTrauma {};
+    f32 RoughTrauma {};
+    f32 AccelTrauma {};
+    f32 ImpactTrauma {};
+
+    // Previous-frame state for the derivatives the trauma sources are built from.
+    Vector3 PrevVelocity {};
+    f32 PrevSuspension[4] {};
+    b32 HasHistory {};
+
 private:
     // Re-reads the mouse accumulator without applying it, so a stretch of suppressed input never
     // arrives later as one accumulated jump.
@@ -76,4 +126,10 @@ private:
 
     // Eases the target back behind the car once the mouse has been idle for RecenterDelay.
     void Recenter(f32 delta);
+
+    // Advances the four trauma sources from this frame's car state.
+    void UpdateTrauma(f32 delta);
+
+    // Combines the trauma sources into the amplitude the shake is driven at.
+    f32 GetShakeAmount() const;
 };

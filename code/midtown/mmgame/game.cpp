@@ -194,7 +194,7 @@ static void ToggleOrbitCam(mmPlayer* player)
     // if the view is already blending, so only latch the state once it has actually accepted.
     if (!orbit_active)
     {
-        orbit_cam.Init(&player->Car);
+        orbit_cam.Init(&player->Car, player->ViewCS);
 
         if (player->ViewCS->NewCam(&orbit_cam, 3, 0.8f, Callback {}) != 0)
             orbit_active = true;
