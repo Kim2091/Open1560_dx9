@@ -35,6 +35,7 @@ static mem::cmd_param PARAM_orbitrecenter {
     "orbitrecenter", "Seconds of mouse idle before the orbital camera eases back behind the car; 0 is off"};
 
 static mem::cmd_param PARAM_orbitshake {"orbitshake", "Orbital camera speed shake strength; 0 is off"};
+static mem::cmd_param PARAM_orbitshakeamp {"orbitshakeamp", "Overall orbital camera shake displacement multiplier"};
 static mem::cmd_param PARAM_orbitshakerough {"orbitshakerough", "Orbital camera road roughness shake strength"};
 static mem::cmd_param PARAM_orbitshakeimpact {"orbitshakeimpact", "Orbital camera collision impact shake strength"};
 static mem::cmd_param PARAM_orbitshakeaccel {"orbitshakeaccel", "Orbital camera acceleration shake strength"};
@@ -74,10 +75,24 @@ static constexpr f32 OrbitShakeRoll = 0.024f;
 // Peak positional displacement, in metres, along the camera's own right and up axes.
 static constexpr f32 OrbitShakeOffset = 0.05f;
 
-// The noise advances faster as trauma rises, so the vibration tightens with speed instead of
-// simply growing. Cycles per second, before the octave multipliers.
-static constexpr f32 OrbitShakeBaseRate = 11.0f;
-static constexpr f32 OrbitShakeRateRange = 9.0f;
+// Fundamental frequency of the shake, in cycles per second, rising with trauma so the vibration
+// tightens with speed instead of simply growing. The octave multipliers below sit on top of this.
+static constexpr f32 OrbitShakeBaseHz = 13.0f;
+static constexpr f32 OrbitShakeHzRange = 11.0f;
+
+// Rate the amplitude itself wanders at, relative to the shake frequency. Real vibration does not
+// hold a constant intensity - it gusts - and a fixed amplitude is most of what makes shake read as
+// artificial. This modulates between OrbitGustFloor and full strength.
+static constexpr f32 OrbitGustRatio = 0.25f;
+static constexpr f32 OrbitGustFloor = 0.4f;
+
+// Independent hash salts, so the axes never correlate into a single diagonal wobble.
+static constexpr i32 OrbitSaltPitch = 0;
+static constexpr i32 OrbitSaltYaw = 1;
+static constexpr i32 OrbitSaltRoll = 2;
+static constexpr i32 OrbitSaltRight = 3;
+static constexpr i32 OrbitSaltUp = 4;
+static constexpr i32 OrbitSaltGust = 5;
 
 // Envelope rates. Attack is quicker than release everywhere: effects should arrive promptly and
 // leave gently, or the camera feels twitchy.
@@ -120,14 +135,53 @@ static f32 OrbitEnvelope(f32 current, f32 target, f32 delta, f32 attack, f32 rel
     return current + ((target - current) * OrbitBlend((target > current) ? attack : release, delta));
 }
 
-// Three sine octaves at incommensurate frequencies. Because the ratios are irrational the sum has
-// no audible period, which is what stops the shake settling into a visible rhythm; and because it
-// is continuous in time it stays smooth at any frame rate, unlike per-frame randomness. Weights
-// sum to one, so the result is bounded to [-1, 1].
-static f32 OrbitShakeNoise(f32 time, f32 phase)
+// Length of the noise lattice. The hash index wraps within it, which makes every channel exactly
+// periodic over this many cells; that in turn lets the phase accumulator be wrapped without a
+// discontinuity, and keeps the values it feeds small enough for f32 to resolve them cleanly. At
+// the frequencies used here one period is several minutes, so the repeat is not perceptible.
+static constexpr f32 OrbitNoisePeriod = 4096.0f;
+static constexpr i32 OrbitNoiseMask = 4095;
+
+// Integer hash to [-1, 1]. Salt selects an independent sequence, so two channels sampled at the
+// same instant are uncorrelated.
+static f32 OrbitHash(i32 point, i32 salt)
 {
-    return (std::sin(time + phase) * 0.6f) + (std::sin((time * 2.269f) + (phase * 3.1f)) * 0.3f) +
-        (std::sin((time * 4.673f) + (phase * 7.7f)) * 0.1f);
+    u32 hash = static_cast<u32>(point & OrbitNoiseMask) + (static_cast<u32>(salt) * 0x9E3779B9u);
+
+    hash ^= hash >> 16;
+    hash *= 0x7FEB352Du;
+    hash ^= hash >> 15;
+    hash *= 0x846CA68Bu;
+    hash ^= hash >> 16;
+
+    return (static_cast<f32>(hash >> 8) * (2.0f / 16777215.0f)) - 1.0f;
+}
+
+// Value noise: random values on the integer lattice, smoothstepped between. Unlike a sum of sines
+// this has no period at all, which is what stops the shake being anticipatable, and unlike
+// per-frame randomness it is a continuous function of time, so it looks the same at any frame rate
+// rather than turning into strobing when the frame rate drops.
+static f32 OrbitValueNoise(f32 time, i32 salt)
+{
+    f32 base = std::floor(time);
+    f32 frac = time - base;
+    i32 point = static_cast<i32>(base);
+
+    f32 weight = frac * frac * (3.0f - (2.0f * frac));
+    f32 low = OrbitHash(point, salt);
+
+    return low + ((OrbitHash(point + 1, salt) - low) * weight);
+}
+
+// Three octaves of value noise. The high octaves are what give the motion its grain; without them
+// it reads as a slow sway rather than vibration. Weights sum to one, bounding the result to
+// [-1, 1]. The octave multipliers are whole numbers so that every octave completes a whole number
+// of periods together, which is what keeps the phase wrap seamless; the octaves are decorrelated
+// by salt instead, so nothing lines up into a beat.
+static f32 OrbitShakeNoise(f32 time, i32 salt)
+{
+    return (OrbitValueNoise(time, salt) * 0.55f) + (OrbitValueNoise(time * 2.0f, salt + 64) * 0.33f) +
+        (OrbitValueNoise(time * 4.0f, salt + 128) * 0.12f);
 }
 
 void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
@@ -147,6 +201,7 @@ void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
     YawScale = PARAM_orbitinvertx.get_or(false) ? sensitivity : -sensitivity;
     PitchScale = PARAM_orbitinverty.get_or(false) ? sensitivity : -sensitivity;
 
+    ShakeAmplitude = PARAM_orbitshakeamp.get_or(1.0f);
     ShakeScale = PARAM_orbitshake.get_or(1.0f);
     ShakeRoughScale = PARAM_orbitshakerough.get_or(0.55f);
     ShakeImpactScale = PARAM_orbitshakeimpact.get_or(1.0f);
@@ -176,10 +231,11 @@ void OrbitCamCS::MakeActive()
     if (Car->Trailer)
         Car->Trailer->Inst.SetFlags(INST_FLAG_ACTIVE);
 
-    // PolarView offsets along +Z before rotating, and the camera looks back towards the point it
-    // orbits, so the car's heading on its own would place us in front of it looking at the nose.
+    // Yawing to the car's own heading is what puts the camera behind it looking forward; adding
+    // half a turn on top swings it round to the nose. Verified in game - the geometry of
+    // PolarView's offset-then-rotate is easy to reason the wrong way round.
     if (CarMatrix)
-        TargetYaw = OrbitWrapAngle(std::atan2(CarMatrix->m2.x, CarMatrix->m2.z) + ARTS_PI);
+        TargetYaw = OrbitWrapAngle(std::atan2(CarMatrix->m2.x, CarMatrix->m2.z));
 
     TargetPitch = OrbitPitchStart;
 
@@ -197,6 +253,8 @@ void OrbitCamCS::MakeActive()
     ImpactTrauma = 0.0f;
     ShakeAmount = 0.0f;
     SpeedFactor = 0.0f;
+    ShakeTime = 0.0f;
+    GustTime = 0.0f;
     HasHistory = false;
 
     SyncMouse();
@@ -259,20 +317,30 @@ void OrbitCamCS::Update()
 
         ShakeAmount = GetShakeAmount();
 
-        // Wrapped to keep single-precision resolution usable across a long session.
-        ShakeTime =
-            std::fmod(ShakeTime + (delta * (OrbitShakeBaseRate + (OrbitShakeRateRange * ShakeAmount))), 100000.0f);
+        // Phase is integrated rather than time being scaled at the sample point, so that changing
+        // the frequency with trauma speeds the vibration up instead of jumping its phase.
+        f32 rate = OrbitShakeBaseHz + (OrbitShakeHzRange * ShakeAmount);
+
+        ShakeTime = std::fmod(ShakeTime + (delta * rate), OrbitNoisePeriod);
+        GustTime = std::fmod(GustTime + (delta * rate * OrbitGustRatio), OrbitNoisePeriod);
     }
 
     f32 pitch = Pitch;
     f32 yaw = Yaw;
     f32 roll = 0.0f;
+    f32 shake = 0.0f;
 
     if (ShakeAmount > 0.0f)
     {
-        pitch += OrbitShakeNoise(ShakeTime, 0.0f) * ShakeAmount * OrbitShakePitch;
-        yaw += OrbitShakeNoise(ShakeTime, 11.3f) * ShakeAmount * OrbitShakeYaw;
-        roll = OrbitShakeNoise(ShakeTime, 23.7f) * ShakeAmount * OrbitShakeRoll;
+        // Let the amplitude wander instead of holding steady. A constant-amplitude shake is the
+        // giveaway that it is being generated rather than caused.
+        f32 gust = (OrbitShakeNoise(GustTime, OrbitSaltGust) * 0.5f) + 0.5f;
+
+        shake = ShakeAmount * ShakeAmplitude * (OrbitGustFloor + ((1.0f - OrbitGustFloor) * gust));
+
+        pitch += OrbitShakeNoise(ShakeTime, OrbitSaltPitch) * shake * OrbitShakePitch;
+        yaw += OrbitShakeNoise(ShakeTime, OrbitSaltYaw) * shake * OrbitShakeYaw;
+        roll = OrbitShakeNoise(ShakeTime, OrbitSaltRoll) * shake * OrbitShakeRoll;
     }
 
     camera_.PolarView(
@@ -283,12 +351,12 @@ void OrbitCamCS::Update()
 
     camera_.m3.y += Height + (SpeedHeight * SpeedFactor);
 
-    if (ShakeAmount > 0.0f)
+    if (shake > 0.0f)
     {
         // Along the camera's own right and up axes rather than world axes, so the jitter stays
         // perpendicular to the view and never pushes the camera into or away from the car.
-        camera_.m3 += camera_.m0 * (OrbitShakeNoise(ShakeTime, 41.2f) * ShakeAmount * OrbitShakeOffset);
-        camera_.m3 += camera_.m1 * (OrbitShakeNoise(ShakeTime, 57.6f) * ShakeAmount * OrbitShakeOffset);
+        camera_.m3 += camera_.m0 * (OrbitShakeNoise(ShakeTime, OrbitSaltRight) * shake * OrbitShakeOffset);
+        camera_.m3 += camera_.m1 * (OrbitShakeNoise(ShakeTime, OrbitSaltUp) * shake * OrbitShakeOffset);
     }
 
     // Off by default. CameraFOV only reaches the asCamera through UpdateView(), which nothing in
@@ -395,7 +463,7 @@ void OrbitCamCS::Recenter(f32 delta)
     if (Car->Sim.Speed < OrbitRecenterMinSpeed)
         return;
 
-    f32 desired = std::atan2(CarMatrix->m2.x, CarMatrix->m2.z) + ARTS_PI;
+    f32 desired = std::atan2(CarMatrix->m2.x, CarMatrix->m2.z);
     f32 blend = OrbitBlend(OrbitRecenterRate, delta);
 
     TargetYaw = OrbitWrapAngle(TargetYaw + (OrbitWrapAngle(desired - TargetYaw) * blend));

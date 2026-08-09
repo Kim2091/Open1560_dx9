@@ -98,6 +98,10 @@ public:
 
     // --- Shake ---------------------------------------------------------------------------------
 
+    // Overall displacement multiplier. Separate from the weights below because trauma is clamped
+    // to one, so those cannot push the shake past full strength - only this can.
+    f32 ShakeAmplitude {};
+
     // Per-source weights into the combined trauma. Any can be set to zero independently.
     f32 ShakeScale {};
     f32 ShakeRoughScale {};
@@ -105,8 +109,11 @@ public:
     f32 ShakeAccelScale {};
 
     // Phase of the noise, advanced at a rate that rises with trauma, and the current amplitude.
-    // Both are held still while paused so the shake freezes rather than idling in place.
+    // Both are held still while paused so the shake freezes rather than idling in place. GustTime
+    // runs much slower and drives the amplitude wander; it needs its own accumulator so that its
+    // phase wrap lands on the lattice too.
     f32 ShakeTime {};
+    f32 GustTime {};
     f32 ShakeAmount {};
 
     f32 SpeedTrauma {};
