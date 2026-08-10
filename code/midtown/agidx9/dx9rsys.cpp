@@ -114,21 +114,48 @@ static ARTS_FORCEINLINE Vector3 NormalizeSafe(const Vector3& value, const Vector
     return (mag2 > 1.0e-8f) ? (value / std::sqrt(mag2)) : fallback;
 }
 
+// Sphere-map UVs for a vehicle body, reproducing agiMeshSet::SphereMap.
+//
+// The mapping is not a matter of taste - the game ships authored sphere maps, and reading them at
+// the wrong coordinates gives a reflection that is merely *a* reflection rather than the one the car
+// was built to wear. So this follows the original exactly, decoded from game.asm ~333870:
+//
+//     I  = normalize(pos * ModelView)                 // eye-to-vertex, VIEW space, translation in
+//     N  = normal * ModelView (3x3)                   // VIEW space, deliberately not renormalised
+//     R  = I - 2*(N.I)*N                              // reflect
+//     Rw = R * Camera (3x3)                           // ...then rotate into WORLD space
+//     s  = 0.5 / sqrt(Rw.x^2 + Rw.y^2 + (Rw.z + 1)^2) // constants at flt_62084C/620860/62086C
+//     tu = s*Rw.x + 0.5,  tv = s*Rw.y + 0.5           // s <= 0 falls back to (0.5, 0.5)
+//
+// Three details are easy to get wrong and all three were wrong in the first version of this
+// function, written for the programmable path against the textbook formula rather than against the
+// game:
+//
+//   * The sphere map is indexed by the reflection vector in WORLD space, not camera space. Camera
+//     space is what the textbook says and it is self-consistent, but it spins the reflection with
+//     the camera instead of with the car, so a parked car's chrome slides around as you orbit it.
+//   * V is NOT flipped. The textbook mapping pairs tv = 0.5 - Ry/m with a bottom-up texture origin;
+//     this engine's sphere maps are stored the other way up and the original adds rather than
+//     subtracts. Flipping it mirrors the reflected world top to bottom.
+//   * The eye vector needs ModelView's TRANSLATION. Building it from a 3x3-only product drops the
+//     camera's position, which makes every vertex behave as though the camera were at the world
+//     origin - so the reflection barely changes as the car drives around.
+//
+// The fresnel and sun-glint terms are embellishments the original has no trace of, and they default
+// to off (FresnelBias 1, FresnelScale 0, SpecularBoost 0 in agiNativeMaterialFx) so this path is a
+// reproduction unless someone asks for more.
 static void BuildVehicleReflectionVertices(DX9ReflectVtx* output, agiWorldVtx* input, i32 count, const Matrix34& world,
     const Matrix34& view, const agiNativeMaterialFx& fx)
 {
-    Matrix34 view_zflip = view;
-    view_zflip.m0.z = -view_zflip.m0.z;
-    view_zflip.m1.z = -view_zflip.m1.z;
-    view_zflip.m2.z = -view_zflip.m2.z;
-    view_zflip.m3.z = -view_zflip.m3.z;
+    const agiViewParameters& params = ViewParams();
 
-    Matrix34 world_view;
-    world_view.Dot3x3(world, view_zflip);
+    // ModelView as the original reads it (agiViewport::Active + 0xEC), rebuilt from this draw's own
+    // world matrix rather than read from the viewport: DrawNativeTransform submits several meshes
+    // per instance (a car's four wheels back to back) and the shared ModelView can lag a SetWorld().
+    Matrix34 model_view;
+    model_view.Dot(world, view);
 
-    Vector3 sun_dir_camera;
-    sun_dir_camera.Dot3x3(-agiMeshLighterSun, view_zflip);
-    sun_dir_camera = NormalizeSafe(sun_dir_camera, {0.0f, 0.0f, 1.0f});
+    Vector3 sun_dir_world = NormalizeSafe(-agiMeshLighterSun, {0.0f, 1.0f, 0.0f});
 
     constexpr f32 kHighlightExponent = 28.0f;
 
@@ -136,27 +163,27 @@ static void BuildVehicleReflectionVertices(DX9ReflectVtx* output, agiWorldVtx* i
     {
         output[i].pos = input[i].pos;
 
-        Vector3 view_pos;
-        view_pos.Dot(input[i].pos, world_view);
+        Vector3 eye_dir;
+        eye_dir.Dot(input[i].pos, model_view);
+        eye_dir = NormalizeSafe(eye_dir, {0.0f, 0.0f, 1.0f});
 
         Vector3 normal_view;
-        normal_view.Dot3x3(input[i].normal, world_view);
-        normal_view = NormalizeSafe(normal_view, {0.0f, 0.0f, 1.0f});
+        normal_view.Dot3x3(input[i].normal, model_view);
 
-        Vector3 view_dir = NormalizeSafe(-view_pos, {0.0f, 0.0f, 1.0f});
-        f32 ndotv = Clamp01(normal_view ^ view_dir);
+        Vector3 reflect_view = eye_dir - (normal_view * (2.0f * (normal_view ^ eye_dir)));
 
-        Vector3 reflect_dir = (normal_view * (2.0f * ndotv)) - view_dir;
-        reflect_dir = NormalizeSafe(reflect_dir, {0.0f, 0.0f, 1.0f});
+        Vector3 reflect_world;
+        reflect_world.Dot3x3(reflect_view, params.Camera);
 
-        f32 m = 2.0f *
-            std::sqrt((reflect_dir.x * reflect_dir.x) + (reflect_dir.y * reflect_dir.y) +
-                ((reflect_dir.z + 1.0f) * (reflect_dir.z + 1.0f)));
+        f32 z1 = reflect_world.z + 1.0f;
+        f32 m = std::sqrt((reflect_world.x * reflect_world.x) + (reflect_world.y * reflect_world.y) + (z1 * z1));
 
         if (m > 1.0e-5f)
         {
-            output[i].tu = Clamp01((reflect_dir.x / m) + 0.5f);
-            output[i].tv = Clamp01(0.5f - (reflect_dir.y / m));
+            f32 s = 0.5f / m;
+
+            output[i].tu = (s * reflect_world.x) + 0.5f;
+            output[i].tv = (s * reflect_world.y) + 0.5f;
         }
         else
         {
@@ -164,15 +191,102 @@ static void BuildVehicleReflectionVertices(DX9ReflectVtx* output, agiWorldVtx* i
             output[i].tv = 0.5f;
         }
 
+        // Grazing angles reflect more. With the defaults this collapses to a constant
+        // ReflectionAmount, which is the original's flat SphMapColor behaviour.
+        Vector3 view_dir = -eye_dir;
+        f32 ndotv = Clamp01(NormalizeSafe(normal_view, {0.0f, 0.0f, 1.0f}) ^ view_dir);
         f32 fresnel = fx.FresnelBias + (fx.FresnelScale * std::pow(1.0f - ndotv, 5.0f));
 
-        Vector3 half_vec = NormalizeSafe(sun_dir_camera + view_dir, view_dir);
-        f32 sun_glint = std::pow(Clamp01(normal_view ^ half_vec), kHighlightExponent) * 0.35f * fx.SpecularBoost;
-        f32 intensity = Clamp01((fx.ReflectionAmount * fresnel) + sun_glint);
-        u32 alpha = static_cast<u32>(Clamp01(intensity) * 255.0f);
+        f32 sun_glint = 0.0f;
 
-        output[i].color = 0x00FFFFFF | (alpha << 24);
+        if (fx.SpecularBoost > 0.0f)
+        {
+            Vector3 normal_world;
+            normal_world.Dot3x3(normal_view, params.Camera);
+            normal_world = NormalizeSafe(normal_world, {0.0f, 1.0f, 0.0f});
+
+            Vector3 view_world;
+            view_world.Dot3x3(view_dir, params.Camera);
+            view_world = NormalizeSafe(view_world, {0.0f, 0.0f, 1.0f});
+
+            Vector3 half_vec = NormalizeSafe(sun_dir_world + view_world, view_world);
+            sun_glint = std::pow(Clamp01(normal_world ^ half_vec), kHighlightExponent) * 0.35f * fx.SpecularBoost;
+        }
+
+        f32 intensity = Clamp01((fx.ReflectionAmount * fresnel) + sun_glint);
+
+        output[i].color = 0x00FFFFFF | (static_cast<u32>(intensity * 255.0f) << 24);
     }
+}
+
+// Ground/terrain projected environment map, reproducing agiMeshSet::EnvMap.
+//
+// Decoded from game.asm ~333253. The original opens with
+//     Matrix34::Dot(local, agiViewport::Active + 0xA4, transform)
+// and 0xA4 is agiViewParameters::World, so the matrix it projects through is world * EnvMatrix -
+// model space straight to environment space. Per vertex it then takes
+//     tu = (v * combined).x,  tv = (v * combined).y
+// with no divide and no reflection vector: it is a plain affine planar projection, which is what a
+// baked ground shadow map wants. The vertex colour is the caller's (0xFFFFFFFF from DrawLitEnv).
+static void BuildGroundEnvVertices(
+    DX9ReflectVtx* output, agiWorldVtx* input, i32 count, const Matrix34& world, const Matrix34& env_transform)
+{
+    Matrix34 combined;
+    combined.Dot(world, env_transform);
+
+    for (i32 i = 0; i < count; ++i)
+    {
+        Vector3 projected;
+        projected.Dot(input[i].pos, combined);
+
+        output[i].pos = input[i].pos;
+        output[i].color = 0xFFFFFFFF;
+        output[i].tu = projected.x;
+        output[i].tv = projected.y;
+    }
+}
+
+// Shared submission for both second passes. They differ only in how the UVs were built, which
+// texture is bound and how the result is composited; everything else - unlit, no depth write, two
+// sided, model-space positions against the world matrix the base pass already set - is the same.
+static void DrawMaterialFxPass(IDirect3DDevice9* device, IDirect3DTexture9* texture, DX9ReflectVtx* verts,
+    i32 vertex_count, u16* indices, i32 index_count, DWORD src_blend, DWORD dst_blend, bool alpha_from_diffuse)
+{
+    device->SetRenderState(D3DRS_LIGHTING, FALSE);
+    device->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, src_blend);
+    device->SetRenderState(D3DRS_DESTBLEND, dst_blend);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+
+    device->SetTexture(0, texture);
+    device->SetFVF(kWorldReflectFVF);
+
+    device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAOP, alpha_from_diffuse ? D3DTOP_SELECTARG1 : D3DTOP_MODULATE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG1, alpha_from_diffuse ? D3DTA_DIFFUSE : D3DTA_TEXTURE);
+    device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+    device->DrawIndexedPrimitiveUP(
+        D3DPT_TRIANGLELIST, 0, vertex_count, index_count / 3, indices, D3DFMT_INDEX16, verts, sizeof(DX9ReflectVtx));
+
+    device->SetTexture(0, nullptr);
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+
+    // Restore what agiLastState believes, not an unconditional TRUE. FlushState() only re-issues
+    // D3DRS_ZWRITEENABLE when agiCurState's value *changes*, so forcing it on here left depth
+    // writes enabled behind the cache's back for every following draw that didn't happen to toggle
+    // it - notably the alpha-blended sprite passes (glows, coronas, smoke) that deliberately run
+    // with ZWrite off, which then punched their quads into the depth buffer and occluded geometry
+    // behind them. MeshWorld()'s own restore block does not cover ZWrite, so it has to happen here.
+    device->SetRenderState(D3DRS_ZWRITEENABLE, agiLastState.ZWrite ? TRUE : FALSE);
+
+    agiLastState.Texture = nullptr;
 }
 
 static void DrawVehicleReflectionPass(IDirect3DDevice9* device, agiWorldVtx* vertices, i32 vertex_count, u16* indices,
@@ -189,40 +303,34 @@ static void DrawVehicleReflectionPass(IDirect3DDevice9* device, agiWorldVtx* ver
     DX9ReflectVtx* reflect_verts = ARTS_ALLOCA(DX9ReflectVtx, vertex_count);
     BuildVehicleReflectionVertices(reflect_verts, vertices, vertex_count, world, view, fx);
 
-    device->SetRenderState(D3DRS_LIGHTING, FALSE);
-    device->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
-    device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-    device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    // SRCALPHA/ONE: chrome adds light to the paint underneath rather than replacing it, and the
+    // per-vertex alpha carries the reflection strength. Alpha comes from the diffuse only - the
+    // sphere map's own alpha channel, where it has one, is not a reflectivity mask.
+    DrawMaterialFxPass(device, reflection_texture, reflect_verts, vertex_count, indices, index_count, D3DBLEND_SRCALPHA,
+        D3DBLEND_ONE, /*alpha_from_diffuse=*/true);
+}
 
-    device->SetTexture(0, reflection_texture);
-    device->SetFVF(kWorldReflectFVF);
+static void DrawGroundEnvPass(IDirect3DDevice9* device, agiWorldVtx* vertices, i32 vertex_count, u16* indices,
+    i32 index_count, const Matrix34& world, const agiNativeMaterialFx& fx)
+{
+    if (!fx.EnvTexture || !fx.EnvTransform)
+        return;
 
-    device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
-    device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-    device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-    device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-    device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
-    device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-    device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+    IDirect3DTexture9* env_texture = static_cast<agiDX9TexDef*>(fx.EnvTexture)->GetHandle();
 
-    device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vertex_count, index_count / 3, indices, D3DFMT_INDEX16,
-        reflect_verts, sizeof(DX9ReflectVtx));
+    if (!env_texture)
+        return;
 
-    device->SetTexture(0, nullptr);
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    DX9ReflectVtx* env_verts = ARTS_ALLOCA(DX9ReflectVtx, vertex_count);
+    BuildGroundEnvVertices(env_verts, vertices, vertex_count, world, *fx.EnvTransform);
 
-    // Restore what agiLastState believes, not an unconditional TRUE. FlushState() only re-issues
-    // D3DRS_ZWRITEENABLE when agiCurState's value *changes*, so forcing it on here left depth
-    // writes enabled behind the cache's back for every following draw that didn't happen to toggle
-    // it - notably the alpha-blended sprite passes (glows, coronas, smoke) that deliberately run
-    // with ZWrite off, which then punched their quads into the depth buffer and occluded geometry
-    // behind them. MeshWorld()'s own restore block does not cover ZWrite, so it has to happen here.
-    device->SetRenderState(D3DRS_ZWRITEENABLE, agiLastState.ZWrite ? TRUE : FALSE);
-
-    agiLastState.Texture = nullptr;
+    // SRCALPHA/INVSRCALPHA, with alpha taken from the texture: the ground map is a baked shadow, so
+    // it must be able to darken the road, which an additive blend cannot do. The original reached
+    // the same place by handing the pass to agiTexSorter::GetEnv and letting DoTexture bind blend
+    // state from the texture's own flags; this path bypasses the sorter, so it binds it here - the
+    // same omission already fixed for the texture, blend and fog binds in MeshWorld.
+    DrawMaterialFxPass(device, env_texture, env_verts, vertex_count, indices, index_count, D3DBLEND_SRCALPHA,
+        D3DBLEND_INVSRCALPHA, /*alpha_from_diffuse=*/false);
 }
 
 agiDX9Rasterizer::agiDX9Rasterizer(agiPipeline* pipe)
@@ -1816,9 +1924,10 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         // would reinterpret their XYZRHW vertices as model-space positions.
         shader->Unbind(device);
 
-        if (fx && fx->ReflectionTexture)
+        if (fx && (fx->ReflectionTexture || fx->EnvTexture))
         {
             DrawVehicleReflectionPass(device, vertices, vertex_count, indices, index_count, world, view, *fx);
+            DrawGroundEnvPass(device, vertices, vertex_count, indices, index_count, world, *fx);
             current_texture_ = nullptr;
         }
 
@@ -1924,9 +2033,13 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     device->DrawIndexedPrimitiveUP(
         D3DPT_TRIANGLELIST, 0, vertex_count, primitive_count, indices, D3DFMT_INDEX16, vertices, sizeof(agiWorldVtx));
 
-    if (fx && fx->ReflectionTexture)
+    // Second passes, in the order the original composited them: chrome over the paint, ground map
+    // over the road. Both reuse this draw's vertex positions and world matrix, so they are ordinary
+    // world-space geometry rather than the CPU-pretransformed overlays they replace.
+    if (fx && (fx->ReflectionTexture || fx->EnvTexture))
     {
         DrawVehicleReflectionPass(device, vertices, vertex_count, indices, index_count, world, view, *fx);
+        DrawGroundEnvPass(device, vertices, vertex_count, indices, index_count, world, *fx);
         current_texture_ = nullptr;
     }
 

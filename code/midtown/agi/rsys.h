@@ -25,13 +25,33 @@ class agiMtlDef;
 class agiTexDef;
 class Matrix34;
 class agiViewParameters;
+// Second-pass material effects for the hardware-transform path, replacing the two closed
+// CPU-pretransform routines the native path cannot call: agiMeshSet::SphereMap (vehicle chrome) and
+// agiMeshSet::EnvMap (the ground's projected shadow/environment map). Both of those consume the
+// codes/out/firstFacet scratch the CPU Geometry() pass leaves behind, which DrawNativeTransform
+// never populates, so calling them from the native path crashes.
+//
+// Both replacements are ordinary world-space draws - model-space positions plus the same
+// SetTransform the base pass used - so unlike the routines they replace they are visible to RTX
+// Remix, and they reuse the base pass's vertex positions so Remix sees a second material on a mesh
+// it already knows rather than a new one.
 struct agiNativeMaterialFx
 {
+    // Vehicle sphere map, from agiMeshSet::DrawLitSph.
     agiTexDef* ReflectionTexture {};
-    f32 ReflectionAmount {0.35f};
-    f32 FresnelBias {0.06f};
-    f32 FresnelScale {0.55f};
-    f32 SpecularBoost {1.0f};
+    f32 ReflectionAmount {1.0f};
+
+    // Embellishments, off by default - the original SphereMap pass has neither. See
+    // BuildVehicleReflectionVertices.
+    f32 FresnelBias {1.0f};
+    f32 FresnelScale {0.0f};
+    f32 SpecularBoost {0.0f};
+
+    // Ground/terrain projected environment map, from agiMeshSet::DrawLitEnv. EnvTransform is the
+    // world-to-environment matrix (mmCullCity::EnvMatrix); the pass composes it with the draw's own
+    // world matrix, which is exactly what the original does.
+    agiTexDef* EnvTexture {};
+    const Matrix34* EnvTransform {};
 };
 
 class agiRasterizer : public agiRefreshable

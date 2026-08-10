@@ -1076,9 +1076,11 @@ b32 agiMeshSet::DrawLit(agiMeshLighter lighter, u32 flags, u32* colors)
         // already applies deliberately for the same reason.
         //
         // The overlay is a CPU-pretransformed pass and so invisible to RTX Remix anyway, while the
-        // vehicle body underneath now goes out in world space, which is what Remix needs. Giving it
-        // back means a native replacement - the agiNativeMaterialFx hook in MeshWorld() exists for
-        // it - not resurrecting the CPU pass.
+        // vehicle body underneath goes out in world space, which is what Remix needs. The native
+        // replacement now exists and has run already: DrawNativeTransform assembles an
+        // agiNativeMaterialFx from agiNativeReflectivity/agiNativeReflectionTex and MeshWorld draws
+        // the sphere map as a world-space second pass. So this still suppresses the assembly
+        // overlay - what it suppresses is a duplicate, not the only copy.
         if (native_drawn && agiRQ.SphMap)
             return false;
 
@@ -1134,18 +1136,20 @@ void agiMeshSet::DrawLitSph(agiMeshLighter lighter, agiTexDef* sph_map, u32 flag
     // clipped every native-transform draw regardless of subject, not something specific to
     // vehicles or to the vehicle-select showroom camera.
     //
-    // The sphere-map specular overlay stays off on the native path: SphereMap() is closed
-    // assembly that reads the CPU Geometry() pass's leftover scratch state, which this
-    // path never populates, and calling it there hard-crashes.
+    // SphereMap() itself stays off on the native path: it is closed assembly that reads the CPU
+    // Geometry() pass's leftover scratch state, which this path never populates, and calling it
+    // there hard-crashes.
     //
-    // What replaces it is the environment probe (agidx9/dx9probe.h). This is the one entry point
-    // vehicle bodies come through - the player's car, traffic and opponents all reach it via
-    // aiVehicleInstance::Draw and mmCarModel - so it is where a body is identified as something
-    // that should reflect its surroundings rather than merely be shaded.
+    // What replaces it is a fixed-function world-space second pass - see BuildVehicleReflectionVertices
+    // in agidx9/dx9rsys.cpp, whose UV derivation was decoded from SphereMap's own disassembly rather
+    // than taken from a textbook, because the game ships authored sphere maps and reading them at
+    // the wrong coordinates gives the wrong car. This is the one entry point vehicle bodies come
+    // through - player, traffic and opponents all reach it via aiVehicleInstance::Draw and
+    // mmCarModel - so it is where a body is identified as something that should reflect.
     //
     // agiRQ.SphMap keeps its meaning as "vehicle reflections on", which is what the graphics option
-    // says it is. It just drives a cubemap lookup in the pixel shader now instead of a second CPU
-    // pass that could not run here without aborting.
+    // says it is, and it is the same gate the original applies (SphereMap() opens by testing
+    // agiRQ+8, game.asm ~333874).
     const bool reflective = sph_map && agiRQ.SphMap && Pipe()->SupportsNativeTransform();
 
     agiNativeReflectivity = reflective ? 1.0f : 0.0f;
@@ -1166,22 +1170,43 @@ void agiMeshSet::DrawLitEnv(agiMeshLighter lighter, agiTexDef* env_map, Matrix34
 {
     if (LockIfResident())
     {
-        // Ground/road geometry arrives here, and on a multitexturing device it would otherwise
-        // take MultiTexEnvMap() below - a fully CPU-pretransformed path, invisible to RTX Remix as
-        // 3D geometry. Prefer the hardware-transform path and drop the env-map reflection overlay,
-        // for the same reason the non-multitex branch already does: both EnvMap() and
+        // Ground/road geometry arrives here. On a multitexturing device it would otherwise take
+        // MultiTexEnvMap() below - a fully CPU-pretransformed path, invisible to RTX Remix as 3D
+        // geometry - so the hardware-transform path is preferred. Both EnvMap() and
         // MultiTexEnvMap() are closed assembly routines that consume the codes/out/firstFacet
-        // scratch state the CPU Geometry() pass leaves behind, which DrawNativeTransform() never
-        // populates. Losing the road's shadow/env sheen is a visual downgrade; feeding those
-        // routines stale scratch state crashes ("Bug?").
+        // scratch the CPU Geometry() pass leaves behind, which DrawNativeTransform() never
+        // populates; feeding them stale scratch crashes ("Bug?"), so neither can be called here.
+        //
+        // The env pass itself is no longer dropped. agiNativeMaterialFx::EnvTexture carries it
+        // down to a world-space second pass that reproduces EnvMap()'s projection exactly - see
+        // BuildGroundEnvVertices in agidx9/dx9rsys.cpp, which was decoded from the original rather
+        // than guessed. That restores the road's baked shadow and sheen, and unlike the routine it
+        // replaces it is model-space geometry that RTX Remix can place.
+        //
+        // The Normals gate stays, unchanged. The env projection itself is planar and needs only the
+        // vertex position, so it would work on normal-less terrain too - but removing the gate would
+        // also reroute normal-less ground away from the CPU lighting it currently gets, and those
+        // meshes carry no vertex colours either (mmInstance::InitMeshes asks for neither), so they
+        // would come out flat white. That is a separate change and wants its own evidence.
         if (Pipe()->SupportsNativeTransform() && Normals && CanNativeLight(lighter) &&
             NativePathEnabled(NATIVE_DRAWLITENV))
         {
+            // agiRQ.EnvMap is the same gate the original applies - EnvMap() opens by testing it
+            // (game.asm ~333257, agiRQ+4) - so honouring it here keeps the graphics option working.
+            agiNativeMaterialFx env_fx {};
+
+            if (env_map && agiRQ.EnvMap)
+            {
+                env_fx.EnvTexture = env_map;
+                env_fx.EnvTransform = &transform;
+            }
+
             // `lighter == nullptr` means "do not light this" - the CPU branches below both funnel
             // that case into DrawLit(), which forwards it to Draw() and so to FirstPass() with no
             // lighter. Ask for the same here rather than letting the GPU light road and terrain
             // geometry off the dynamic light list. See the matching note in Draw().
-            DrawNativeTransform(flags, IsStaticCityLighter(lighter), nullptr, nullptr, /*unlit=*/lighter == nullptr);
+            DrawNativeTransform(flags, IsStaticCityLighter(lighter), env_fx.EnvTexture ? &env_fx : nullptr, nullptr,
+                /*unlit=*/lighter == nullptr);
         }
         else if (agiCurState.GetMaxTextures() > 1 && agiRQ.EnvMap)
         {
@@ -1543,6 +1568,31 @@ i32 agiMeshSet::Geometry(u32 flags, Vector3* verts, Vector4* planes)
 // the shallow angles that make up a curved panel.
 static mem::cmd_param PARAM_smooth_normals {"smoothnormals", "Rebuild smooth vertex normals for the hardware path"};
 
+u32 agiMeshNormalDraws = 0;
+u32 agiMeshNormalDrawsFlat = 0;
+u32 agiMeshNormalTris = 0;
+u32 agiMeshNormalTrisFlat = 0;
+
+void agiResetMeshNormalStats()
+{
+    agiMeshNormalDraws = 0;
+    agiMeshNormalDrawsFlat = 0;
+    agiMeshNormalTris = 0;
+    agiMeshNormalTrisFlat = 0;
+}
+
+// Vehicle chrome strength, and the two embellishment terms the original SphereMap pass does not
+// have. cmd_params because chrome is the kind of thing that is judged by eye, and a rebuild of this
+// project is a CI round trip.
+//
+// 0.35 rather than the original's literal full strength: SphereMap composited over a body the CPU
+// had lit, and this path keeps a hardware-lit base pass underneath, so an additive layer at full
+// alpha reads hotter here than it did there. Set -reflectamount 1 for the literal original.
+static mem::cmd_param PARAM_reflect_amount {"reflectamount", "Vehicle sphere-map reflection strength"};
+static mem::cmd_param PARAM_reflect_fresnel_bias {"reflectfresnelbias", "Vehicle reflection fresnel bias"};
+static mem::cmd_param PARAM_reflect_fresnel_scale {"reflectfresnelscale", "Vehicle reflection fresnel scale"};
+static mem::cmd_param PARAM_reflect_specular {"reflectspecular", "Vehicle reflection sun-glint strength"};
+
 static void SmoothAdjunctNormals(Vector3* ARTS_RESTRICT out_normals, const u16* ARTS_RESTRICT vertex_indices,
     const u8* ARTS_RESTRICT normals, u32 adjunct_count, Vector3* ARTS_RESTRICT accum, u32 vertex_count)
 {
@@ -1696,7 +1746,30 @@ b32 agiMeshSet::DrawNativeTransform(
 
     u16* indices = ARTS_ALLOCA(u16, max_indices);
 
+    // Vehicle chrome. DrawLitSph cannot pass an fx down - it reaches here through DrawLit, whose
+    // signature the assembly owns - so it leaves the subject in agiNativeReflectivity /
+    // agiNativeReflectionTex and this assembles the fx. Same reason agiNativeDrawRadius exists.
+    //
+    // Gated on has_normals, and that gate is the whole point rather than defensive coding: the
+    // sphere map is indexed by the reflection of the eye vector about the vertex normal, so a mesh
+    // with no normals would reflect the same texel over its entire surface - a flat wash of one
+    // colour, which looks worse than no chrome at all.
+    agiNativeMaterialFx native_fx {};
+    const agiNativeMaterialFx* effective_fx = fx;
+
+    if (!effective_fx && has_normals && agiNativeReflectionTex && (agiNativeReflectivity > 0.0f))
+    {
+        native_fx.ReflectionTexture = agiNativeReflectionTex;
+        native_fx.ReflectionAmount = agiNativeReflectivity * PARAM_reflect_amount.get_or(0.35f);
+        native_fx.FresnelBias = PARAM_reflect_fresnel_bias.get_or(1.0f);
+        native_fx.FresnelScale = PARAM_reflect_fresnel_scale.get_or(0.0f);
+        native_fx.SpecularBoost = PARAM_reflect_specular.get_or(0.0f);
+
+        effective_fx = &native_fx;
+    }
+
     bool drawn = false;
+    u32 submitted_indices = 0;
 
     for (u32 texture = 0; texture <= TextureCount; ++texture)
     {
@@ -1735,12 +1808,27 @@ b32 agiMeshSet::DrawNativeTransform(
         auto old_texture = agiCurState.SetTexture(tex_def);
 
         if (RAST->MeshWorld(verts, static_cast<i32>(AdjunctCount), indices, static_cast<i32>(index_count),
-                view_params.World, view_params.View, view_params, static_lighting, fx, hardware_lighting))
+                view_params.World, view_params.View, view_params, static_lighting, effective_fx, hardware_lighting))
         {
             drawn = true;
+            submitted_indices += index_count;
         }
 
         agiCurState.SetTexture(old_texture);
+    }
+
+    if (drawn)
+    {
+        const u32 tris = submitted_indices / 3;
+
+        ++agiMeshNormalDraws;
+        agiMeshNormalTris += tris;
+
+        if (!has_normals)
+        {
+            ++agiMeshNormalDrawsFlat;
+            agiMeshNormalTrisFlat += tris;
+        }
     }
 
     return drawn;

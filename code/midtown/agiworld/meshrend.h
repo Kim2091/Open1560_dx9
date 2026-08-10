@@ -40,6 +40,24 @@ ARTS_IMPORT extern f32 ShadowFudge;
 // ?SphMapColor@@3IA
 ARTS_IMPORT extern u32 SphMapColor;
 
+// Normal coverage census, accumulated by agiMeshSet::DrawNativeTransform and reported by the DX9
+// per-frame census. Answers a question that cannot be settled by reading call sites, because the
+// decision is made per instance at load time and most of the instance code is still closed:
+// how much of the frame actually carries per-vertex normals?
+//
+// A mesh loaded without MESH_SET_NORMAL has no normal array at all - mmInstance::InitMeshes only
+// asks for one when the instance is a collider, a mover or an obstacle, and every other instance
+// gets MESH_SET_UV | MESH_SET_NO_BOUND. Those draws go out with a filler normal of (0,1,0) on every
+// vertex and hardware lighting disabled, which is faithful to what the CPU path did with them, but
+// it does mean anything normal-driven - hardware lighting, the sphere map, any future normal
+// mapping - has nothing to work from.
+extern u32 agiMeshNormalDraws;
+extern u32 agiMeshNormalDrawsFlat;
+extern u32 agiMeshNormalTris;
+extern u32 agiMeshNormalTrisFlat;
+
+void agiResetMeshNormalStats();
+
 struct agiMeshCardVertex
 {
     f32 x, y;

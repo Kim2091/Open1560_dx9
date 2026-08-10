@@ -28,6 +28,7 @@
 #include "agirend/zbrender.h"
 #include "agiworld/cardworld.h"
 #include "agiworld/glowlight.h"
+#include "agiworld/meshrend.h"
 #include "data7/utimer.h"
 #include "eventq7/active.h"
 #include "pcwindis/dxinit.h"
@@ -357,14 +358,15 @@ void agiDX9Pipeline::EndFrame()
                      "glowlights=%u live, %u pooled, %u cell slots | "
                      "cards=%u seen (%u no-tex, %u not-glow, %u harvested) | "
                      "worldquads=%u drawn, %u DROPPED | "
+                     "normals=%u/%u draws flat, %u/%u tris flat | "
                      "world share(3D only)=%.1f%% | world share(all)=%.1f%% | tris/call world=%.1f",
                 census_frames, world, agiDX9Census.WorldCalls, agiDX9Census.WorldStaticLitTris,
                 agiDX9Census.WorldUnlitTris, screen, agiDX9Census.ScreenCalls, screen_3d,
                 agiDX9Census.ScreenCallsInScene, agiDX9Census.ScreenLines, agiDX9Census.ScreenLineCalls,
                 agiGlowLightCount, world_shader_.LightCount(), world_shader_.CellFill(), agiGlowCardsSeen,
                 agiGlowCardsNoTexture, agiGlowCardsNotGlow, agiGlowCardsHarvested, agiWorldQuadsDrawn,
-                agiWorldQuadsDropped, total_3d ? (100.0 * world / total_3d) : 0.0,
-                total ? (100.0 * world / total) : 0.0,
+                agiWorldQuadsDropped, agiMeshNormalDrawsFlat, agiMeshNormalDraws, agiMeshNormalTrisFlat,
+                agiMeshNormalTris, total_3d ? (100.0 * world / total_3d) : 0.0, total ? (100.0 * world / total) : 0.0,
                 agiDX9Census.WorldCalls ? (1.0 * world / agiDX9Census.WorldCalls) : 0.0);
 
             // -ghash, on its own line and only when the switch is on. CHURN is the number that
@@ -383,6 +385,7 @@ void agiDX9Pipeline::EndFrame()
 
         agiDX9Census = {};
         agiResetWorldQuadStats();
+        agiResetMeshNormalStats();
         agiDX9GHashNextFrame();
     }
 
