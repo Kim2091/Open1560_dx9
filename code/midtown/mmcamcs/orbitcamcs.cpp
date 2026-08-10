@@ -36,13 +36,17 @@ static mem::cmd_param PARAM_orbitrecenter {
 static mem::cmd_param PARAM_orbitdrift {
     "orbitdrift", "How far the orbital camera follows the direction of travel in a slide; 0 locks it to the tail"};
 
-static mem::cmd_param PARAM_orbitshake {"orbitshake", "Orbital camera speed shake strength; 0 is off"};
+static mem::cmd_param PARAM_orbitshake {"orbitshake", "Orbital camera engine shake strength; 0 is off"};
 static mem::cmd_param PARAM_orbitshakeamp {"orbitshakeamp", "Overall orbital camera shake displacement multiplier"};
 static mem::cmd_param PARAM_orbitshakerough {"orbitshakerough", "Orbital camera road roughness shake strength"};
 static mem::cmd_param PARAM_orbitshakeimpact {"orbitshakeimpact", "Orbital camera collision impact shake strength"};
 static mem::cmd_param PARAM_orbitshakeaccel {"orbitshakeaccel", "Orbital camera acceleration shake strength"};
-static mem::cmd_param PARAM_orbitshakemin {"orbitshakemin", "Speed the shake starts ramping in at, in mph"};
-static mem::cmd_param PARAM_orbitshakemax {"orbitshakemax", "Speed the shake reaches full strength at, in mph"};
+static mem::cmd_param PARAM_orbitshakerpm {
+    "orbitshakerpm", "Fraction of the redline the engine shake starts building from"};
+static mem::cmd_param PARAM_orbitshakegears {
+    "orbitshakegears", "How many of the top gears the engine shake is allowed in"};
+static mem::cmd_param PARAM_orbitshakeshift {
+    "orbitshakeshift", "How far the engine shake dips while a gear change is in progress"};
 static mem::cmd_param PARAM_orbitdistmin {"orbitdistmin", "Speed the camera starts pulling back at, in mph"};
 static mem::cmd_param PARAM_orbitdistmax {"orbitdistmax", "Speed the camera is fully pulled back at, in mph"};
 static mem::cmd_param PARAM_orbitpullback {"orbitpullback", "Metres the camera eases back by at full speed"};
@@ -91,8 +95,9 @@ static constexpr f32 OrbitShakeRoll = 0.024f;
 // Peak positional displacement, in metres, along the camera's own right and up axes.
 static constexpr f32 OrbitShakeOffset = 0.05f;
 
-// Fundamental frequency of the shake, in cycles per second, rising with trauma so the vibration
-// tightens with speed instead of simply growing. The octave multipliers below sit on top of this.
+// Fundamental frequency of the shake, in cycles per second, rising with trauma. Since trauma is
+// mostly engine revs, the vibration tightens as the needle climbs and slackens on every upshift,
+// which is what an engine actually does. The octave multipliers below sit on top of this.
 static constexpr f32 OrbitShakeBaseHz = 13.0f;
 static constexpr f32 OrbitShakeHzRange = 11.0f;
 
@@ -113,6 +118,11 @@ static constexpr i32 OrbitSaltGust = 5;
 // Envelope rates. Attack is quicker than release everywhere: effects should arrive promptly and
 // leave gently, or the camera feels twitchy.
 static constexpr f32 OrbitSpeedEnvelopeRate = 2.5f;
+
+// The engine envelope is much quicker than the framing one: revs move fast, and the whole point of
+// driving the shake from them is that it tracks them closely enough to feel the gear change.
+static constexpr f32 OrbitEngineAttack = 9.0f;
+static constexpr f32 OrbitEngineRelease = 6.0f;
 static constexpr f32 OrbitRoughAttack = 14.0f;
 static constexpr f32 OrbitRoughRelease = 5.0f;
 static constexpr f32 OrbitAccelAttack = 10.0f;
@@ -227,11 +237,12 @@ void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
     ShakeImpactScale = PARAM_orbitshakeimpact.get_or(1.0f);
     ShakeAccelScale = PARAM_orbitshakeaccel.get_or(0.35f);
 
+    ShakeRpmStart = PARAM_orbitshakerpm.get_or(0.55f);
+    ShakeGearSpan = PARAM_orbitshakegears.get_or(2.0f);
+    ShakeShiftDip = PARAM_orbitshakeshift.get_or(0.35f);
+
     // In mph. The framing band runs from a crawl to beyond what anything but a Panoz GTR-1 will
-    // reach, so the fast cars keep opening out after a 140 mph car has run out of road; the shake
-    // band saturates earlier, since past a point more rattle stops reading as more speed.
-    ShakeStartSpeed = PARAM_orbitshakemin.get_or(55.0f);
-    ShakeMaxSpeed = PARAM_orbitshakemax.get_or(175.0f);
+    // reach, so the fast cars keep opening out after a 140 mph car has run out of road.
     FrameStartSpeed = PARAM_orbitdistmin.get_or(5.0f);
     FrameMaxSpeed = PARAM_orbitdistmax.get_or(206.0f);
 
@@ -272,7 +283,7 @@ void OrbitCamCS::MakeActive()
 
     // Start from a clean slate so a crash from the previous stint does not shake the new one, and
     // so the first frame's derivatives are not taken against stale state.
-    SpeedTrauma = 0.0f;
+    EngineTrauma = 0.0f;
     RoughTrauma = 0.0f;
     AccelTrauma = 0.0f;
     ImpactTrauma = 0.0f;
@@ -406,18 +417,44 @@ void OrbitCamCS::UpdateTrauma(f32 delta)
 
     const mmCarSim& sim = Car->Sim;
 
-    // Both bands read mph directly, so the tuning numbers line up with the cars' quoted top
-    // speeds rather than having to be converted.
+    // Framing follows road speed, and reads mph directly so the tuning numbers line up with the
+    // cars' quoted top speeds rather than having to be converted.
     f32 frame_span = FrameMaxSpeed - FrameStartSpeed;
     f32 frame_target =
         (frame_span > 0.0f) ? std::clamp((sim.SpeedMPH - FrameStartSpeed) / frame_span, 0.0f, 1.0f) : 0.0f;
 
-    f32 shake_span = ShakeMaxSpeed - ShakeStartSpeed;
-    f32 shake_target =
-        (shake_span > 0.0f) ? std::clamp((sim.SpeedMPH - ShakeStartSpeed) / shake_span, 0.0f, 1.0f) : 0.0f;
-
     SpeedFactor = OrbitEnvelope(SpeedFactor, frame_target, delta, OrbitSpeedEnvelopeRate, OrbitSpeedEnvelopeRate);
-    SpeedTrauma = OrbitEnvelope(SpeedTrauma, shake_target, delta, OrbitSpeedEnvelopeRate, OrbitSpeedEnvelopeRate);
+
+    // The shake, by contrast, comes off the engine rather than road speed: what shakes a car is
+    // the motor, so it climbs towards the redline and falls away the moment a shift drops the
+    // needle - no gear change has to be scripted, the revs already describe it.
+    const mmEngine& engine = sim.Engine;
+    const mmTransmission& trans = sim.Trans;
+
+    f32 engine_target = 0.0f;
+
+    if (trans.IsForward() && (engine.MaxRPM > 0.0f))
+    {
+        f32 rpm_floor = engine.MaxRPM * ShakeRpmStart;
+        f32 rpm_span = engine.MaxRPM - rpm_floor;
+        f32 revs = (rpm_span > 0.0f) ? std::clamp((engine.RPM - rpm_floor) / rpm_span, 0.0f, 1.0f) : 0.0f;
+
+        // Top gears only, fading in over the last few. The lower gears are short and mostly spent
+        // mid-shift, and shaking through them turns every pull-away into a rattle.
+        i32 gear_count = trans.IsAutomatic ? trans.NumGears : trans.ManualNumGears;
+        f32 span = std::max(ShakeGearSpan, 1.0f);
+        f32 top = static_cast<f32>(gear_count - 1);
+        f32 gear = std::clamp((static_cast<f32>(trans.CurrentGear) - (top - span)) / span, 0.0f, 1.0f);
+
+        engine_target = revs * gear;
+
+        // The revs falling already eases the shake off on their own; this deepens the gap so the
+        // shift lands as a beat rather than a shrug.
+        if (engine.ChangingGear)
+            engine_target *= ShakeShiftDip;
+    }
+
+    EngineTrauma = OrbitEnvelope(EngineTrauma, engine_target, delta, OrbitEngineAttack, OrbitEngineRelease);
 
     // Road roughness, read as how fast the suspension is moving. Only wheels actually on the
     // ground contribute - a wheel dangling in mid-air swings freely and would otherwise register
@@ -477,7 +514,7 @@ void OrbitCamCS::UpdateTrauma(f32 delta)
 
 f32 OrbitCamCS::GetShakeAmount() const
 {
-    f32 trauma = std::clamp((SpeedTrauma * ShakeScale) + (RoughTrauma * ShakeRoughScale) +
+    f32 trauma = std::clamp((EngineTrauma * ShakeScale) + (RoughTrauma * ShakeRoughScale) +
             (AccelTrauma * ShakeAccelScale) + (ImpactTrauma * ShakeImpactScale),
         0.0f, 1.0f);
 

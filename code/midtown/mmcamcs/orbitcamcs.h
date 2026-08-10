@@ -26,9 +26,9 @@
 // exponential filter, so the view is smooth and behaves the same at 30 and 300 fps. After a short
 // idle the target eases back behind the car, the way a driving game's chase camera does.
 //
-// On top of that sits a trauma-driven shake. Four sources - speed, road roughness, longitudinal
-// acceleration and impacts - each contribute to a single normalised trauma value, and the shake
-// amplitude is its square, so low trauma stays imperceptible instead of becoming a constant buzz.
+// On top of that sits a trauma-driven shake. Four sources - engine revs, road roughness,
+// longitudinal acceleration and impacts - each contribute to a single normalised trauma value, and
+// the shake amplitude is its square, so low trauma stays imperceptible rather than a constant buzz.
 // The displacement itself is layered sine noise at incommensurate frequencies rather than
 // per-frame randomness, which is what makes it read as vibration instead of jitter.
 //
@@ -88,14 +88,17 @@ public:
     // Smoothed 0..1 position within the framing speed band, driving distance, height and FOV.
     f32 SpeedFactor {};
 
-    // Speed bands, in mph, to match how the cars are actually specified. Framing and shake get
-    // their own: framing opens from a standstill and keeps climbing to the fastest car in the
-    // game, so a Panoz GTR-1 at 206 is visibly further back and wider than a 140 car flat out,
-    // while the shake saturates sooner because past a point more rattle just reads as noise.
+    // Framing band, in mph, to match how the cars are actually specified. It opens from a
+    // standstill and keeps climbing to the fastest car in the game, so a Panoz GTR-1 at 206 is
+    // visibly further back and wider than a 140 car flat out.
     f32 FrameStartSpeed {};
     f32 FrameMaxSpeed {};
-    f32 ShakeStartSpeed {};
-    f32 ShakeMaxSpeed {};
+
+    // Fraction of the redline the engine shake starts building from, how many of the top gears it
+    // is allowed in at all, and how far it dips while a shift is in progress.
+    f32 ShakeRpmStart {};
+    f32 ShakeGearSpan {};
+    f32 ShakeShiftDip {};
 
     // Added to Distance/Height across the framing band; the camera eases back and drops slightly.
     f32 SpeedDistance {};
@@ -125,7 +128,7 @@ public:
     f32 GustTime {};
     f32 ShakeAmount {};
 
-    f32 SpeedTrauma {};
+    f32 EngineTrauma {};
     f32 RoughTrauma {};
     f32 AccelTrauma {};
     f32 ImpactTrauma {};
