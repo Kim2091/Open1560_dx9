@@ -26,6 +26,7 @@
 #include "agirend/lighter.h"
 #include "agirend/rdlp.h"
 #include "agirend/zbrender.h"
+#include "agiworld/cardworld.h"
 #include "agiworld/glowlight.h"
 #include "data7/utimer.h"
 #include "eventq7/active.h"
@@ -260,6 +261,13 @@ void agiDX9Pipeline::EndScene()
 {
     ARTS_UTIMED(agiEndScene);
 
+    // Last chance for world-space billboards and lines, before in_scene_ drops and the viewport is
+    // reset below. agiTexSorter::Cull() flushes them in the normal case and this finds nothing to
+    // do; it exists for the passes that never reach a Cull(alpha) - the showroom and the menus -
+    // where a quad left queued would otherwise be drawn under the next pass's view, or counted as
+    // HUD, or drawn against the full backbuffer instead of its own rectangle.
+    agiFlushWorldQuads();
+
     rasterizer_->EndGroup();
 
     in_scene_ = false;
@@ -348,13 +356,15 @@ void agiDX9Pipeline::EndFrame()
                      "calls, of which IN-SCENE(3D)=%u tris in %u calls | lines=%u in %u calls | "
                      "glowlights=%u live, %u pooled, %u cell slots | "
                      "cards=%u seen (%u no-tex, %u not-glow, %u harvested) | "
+                     "worldquads=%u drawn, %u DROPPED | "
                      "world share(3D only)=%.1f%% | world share(all)=%.1f%% | tris/call world=%.1f",
                 census_frames, world, agiDX9Census.WorldCalls, agiDX9Census.WorldStaticLitTris,
                 agiDX9Census.WorldUnlitTris, screen, agiDX9Census.ScreenCalls, screen_3d,
                 agiDX9Census.ScreenCallsInScene, agiDX9Census.ScreenLines, agiDX9Census.ScreenLineCalls,
                 agiGlowLightCount, world_shader_.LightCount(), world_shader_.CellFill(), agiGlowCardsSeen,
-                agiGlowCardsNoTexture, agiGlowCardsNotGlow, agiGlowCardsHarvested,
-                total_3d ? (100.0 * world / total_3d) : 0.0, total ? (100.0 * world / total) : 0.0,
+                agiGlowCardsNoTexture, agiGlowCardsNotGlow, agiGlowCardsHarvested, agiWorldQuadsDrawn,
+                agiWorldQuadsDropped, total_3d ? (100.0 * world / total_3d) : 0.0,
+                total ? (100.0 * world / total) : 0.0,
                 agiDX9Census.WorldCalls ? (1.0 * world / agiDX9Census.WorldCalls) : 0.0);
 
             // -ghash, on its own line and only when the switch is on. CHURN is the number that
@@ -372,6 +382,7 @@ void agiDX9Pipeline::EndFrame()
         }
 
         agiDX9Census = {};
+        agiResetWorldQuadStats();
         agiDX9GHashNextFrame();
     }
 

@@ -25,6 +25,7 @@ define_dummy_symbol(agiworld_texsort);
 #include "agi/texdef.h"
 #include "agi/texlib.h"
 #include "arts7/bank.h"
+#include "cardworld.h"
 #include "getmesh.h"
 #include "quality.h"
 #include "texsheet.h"
@@ -138,6 +139,15 @@ void agiTexSorter::Cull(b32 alpha)
         }
 
         AlphaSetCount = 0;
+
+        // World-space billboards and lines, drawn last among the transparents.
+        //
+        // This is the point they have to flush at. Their CPU-pretransformed predecessors were
+        // ordinary alpha poly sets and went out in the loop above, so flushing here reproduces the
+        // ordering the engine was built around - after every opaque surface in the pass, so nothing
+        // opaque can paint over a quad that deliberately did not write depth. See
+        // agiworld/cardworld.h.
+        agiFlushWorldQuads();
     }
 }
 

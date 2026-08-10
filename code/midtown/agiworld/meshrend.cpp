@@ -25,6 +25,7 @@ define_dummy_symbol(agiworld_meshrend);
 #include "agi/texdef.h"
 #include "agi/viewport.h"
 #include "agisw/swrend.h"
+#include "agiworld/cardworld.h"
 #include "agiworld/glowlight.h"
 #include "agiworld/meshlight.h"
 #include "agiworld/packnorm.h"
@@ -833,8 +834,11 @@ void agiMeshSet::InitViewport(agiViewParameters& params)
 #define NATIVE_DRAWLIT 0x2u
 #define NATIVE_DRAWLITENV 0x4u
 #define NATIVE_DRAWCOLOR 0x8u
+#define NATIVE_DRAWCARD 0x20u
+#define NATIVE_DRAWLINES 0x40u
 
-// Default rises to 0x1F with the model path (pedestrians, agiworld/meshmodel.cpp) added.
+// Default rises to 0x7F with the model path (pedestrians, agiworld/meshmodel.cpp) at 0x10 and the
+// billboard and line paths (agiworld/cardworld.h) at 0x20 and 0x40.
 bool agiNativePathEnabled(u32 which);
 
 static bool NativePathEnabled(u32 which)
@@ -853,10 +857,13 @@ bool agiNativePathEnabled(u32 which)
         const char* value = std::getenv("OPEN1560_NATIVE_MASK");
 #pragma warning(pop)
 
-        // 0x1F, i.e. including NATIVE_DRAWMODEL (0x10) for pedestrians - verified in game: peds are
-        // submitted through DrawNativeTransform and light per-pixel off the clustered point lights,
-        // where before they were CPU-pretransformed and reacted to nothing.
-        u32 parsed = value ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0x1Fu;
+        // 0x7F. 0x1F was the previous default: the four agiMeshSet entry points plus
+        // NATIVE_DRAWMODEL (0x10) for pedestrians, which are submitted through DrawNativeTransform
+        // where before they were CPU-pretransformed and reacted to nothing. 0x20 and 0x40 add the
+        // billboard and line paths, which are the whole effects layer - smoke, spray, debris,
+        // coronas, headlight and tail-light flares, collision sparks. Those were the last 3D
+        // content still going out pretransformed, i.e. the last thing missing from a Remix capture.
+        u32 parsed = value ? static_cast<u32>(std::strtoul(value, nullptr, 0)) : 0x7Fu;
         Displayf("DX9 NATIVE_MASK = 0x%X (%s)", parsed, value ? "from environment" : "default");
         return parsed;
     }();
@@ -2391,6 +2398,37 @@ void agiMeshSet::DrawCard(Vector3& position, f32 scale, u32 rotation, u32 color,
     f32 vert_z = z * inv_w * DepthScale + DepthOffset;
     Vector2* tex_coords = &CurrentMeshCard.Frames[4 * frame];
 
+    // World-space billboard. Everything above this point still runs: the depth reject, the
+    // screen-size gate and the clip_all test are all cheap scalar work on four corners, and keeping
+    // them means this path culls exactly what the CPU path culled. What is skipped is the part that
+    // destroys the world-space information - the perspective divide, the HalfWidth/OffsX viewport
+    // map and ClampToScreen - along with the partial-clip branch below, because the GPU clips.
+    //
+    // The quad's corner offsets go out as the vertices, unmodified, and the card's position, size
+    // and orientation go into the world matrix. See agiworld/cardworld.h for why that split is the
+    // point of the exercise rather than an implementation detail.
+    //
+    // Camera.m0/m1 are the camera's X and Y axes in world space (View is Camera's inverse), so a
+    // card-space offset along them lands on view-space X and Y - which is exactly where the CPU
+    // path put it, adding `scale * rotations[i]` to the ModelView-transformed position.
+    //
+    // `position` is MODEL space. This is the trap documented above and it is invisible for half the
+    // callers, because asParticles::Cull() sets SetWorld(IDENTITY) before its cards while
+    // mmBangerInstance::DrawGlow() sets the banger's own transform. Transforming by
+    // ViewParams().World is correct for both and collapses to a no-op for the first.
+    if (NativePathEnabled(NATIVE_DRAWCARD) && agiWorldQuadsSupported())
+    {
+        Vector3 world_pos;
+        world_pos.Dot(position, view_params.World);
+
+        const Matrix34& camera = view_params.Camera;
+
+        Matrix34 card_world {camera.m0 * scale, camera.m1 * scale, camera.m2, world_pos};
+
+        agiQueueWorldQuad(agiCurState.GetTexture(), card_world, rotations, tex_coords, vert_count, color, w);
+        return;
+    }
+
     if (clip_any & ClipMask)
     {
         for (i32 i = 0; i < vert_count - 2; ++i)
@@ -2489,9 +2527,32 @@ void agiMeshSet::DrawCard(Vector3& position, f32 scale, u32 rotation, u32 color,
     }
 }
 
+// Half-width, in world units, of a line submitted through the world-space path, and the fraction of
+// its view depth added to that so a distant spark does not shrink below a pixel and disappear.
+//
+// A world-space line has to have a real thickness, where the screen-space one it replaces was always
+// exactly one pixel however far away it was. Both numbers are cmd_params rather than constants
+// because this is precisely the kind of thing that wants tuning against a running game, and a
+// rebuild of this project is a CI round trip.
+static mem::cmd_param PARAM_worldlinewidth {"worldlinewidth", "World-space half-width of spark and debug lines"};
+static mem::cmd_param PARAM_worldlinegrow {"worldlinegrow", "Extra line half-width per unit of view depth"};
+
+// Canonical line quad in "line space": x runs 0..1 along the segment, y is +/-0.5 across it, so the
+// matrix carries the endpoints, the length, the thickness and the orientation. Every line in the
+// game therefore submits the same four vertices and collapses to a single geometry hash, which is
+// the same trick the billboards use - see agiworld/cardworld.h.
+static const Vector2 kLineQuadCorners[4] {{0.0f, -0.5f}, {1.0f, -0.5f}, {1.0f, 0.5f}, {0.0f, 0.5f}};
+static const Vector2 kLineQuadUVs[4] {{0.0f, 0.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}, {0.0f, 1.0f}};
+
 void agiMeshSet::DrawLines(Vector3* starts, Vector3* ends, u32* colors, i32 count)
 {
     agiMeshSet::Init(false);
+
+    const bool world_path = NativePathEnabled(NATIVE_DRAWLINES) && agiWorldQuadsSupported();
+    const agiViewParameters& view_params = ViewParams();
+
+    const f32 line_width = PARAM_worldlinewidth.get_or(0.02f);
+    const f32 line_grow = PARAM_worldlinegrow.get_or(0.0015f);
 
     agiScreenVtx* ARTS_RESTRICT verts = ARTS_ALLOCA(agiScreenVtx, count * 2);
     u32 stored = 0;
@@ -2525,6 +2586,43 @@ void agiMeshSet::DrawLines(Vector3* starts, Vector3* ends, u32* colors, i32 coun
 
         if (-end_w > end_x || end_x > end_w || -end_w > end_y || end_y > end_w)
             continue;
+
+        // World-space line, as a camera-facing quad. Same rejects above, same colour, but the
+        // segment keeps its world position instead of being flattened onto the screen.
+        //
+        // `starts`/`ends` are model space - the rejects above run them through M, which is
+        // model-to-view - so they go through ViewParams().World for the same reason DrawCard's
+        // position does.
+        if (world_path)
+        {
+            Vector3 world_start;
+            Vector3 world_end;
+            world_start.Dot(start, view_params.World);
+            world_end.Dot(end, view_params.World);
+
+            Vector3 along = world_end - world_start;
+
+            if (along.Mag2() < 1e-8f)
+                continue;
+
+            // Across the segment and facing the camera. Camera.m2 is the camera's Z axis in world
+            // space; a segment pointing straight down it has no well-defined across direction, so
+            // fall back to the camera's own X axis.
+            Vector3 across;
+            across.Cross(along, view_params.Camera.m2);
+
+            if (f32 across_mag2 = across.Mag2(); across_mag2 > 1e-12f)
+                across = across * (1.0f / std::sqrt(across_mag2));
+            else
+                across = view_params.Camera.m0;
+
+            const f32 width = 2.0f * (line_width + line_grow * start_w);
+
+            Matrix34 line_world {along, across * width, view_params.Camera.m2, world_start};
+
+            agiQueueWorldQuad(nullptr, line_world, kLineQuadCorners, kLineQuadUVs, 4, color, start_w);
+            continue;
+        }
 
         f32 start_rhw = 1.0f / start_w;
         f32 end_rhw = 1.0f / end_w;
