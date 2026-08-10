@@ -76,6 +76,10 @@ public:
     f32 RecenterDelay {};
     f32 IdleTime {};
 
+    // How far the camera follows the direction of travel rather than the way the car points.
+    // 0 locks it to the tail, 1 sits fully behind the velocity and shows the most of a slide.
+    f32 DriftBias {};
+
     i32 PrevMouseX {};
     i32 PrevMouseY {};
 

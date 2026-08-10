@@ -33,6 +33,8 @@ static mem::cmd_param PARAM_orbitinverty {"orbitinverty", "Invert the orbital ca
 static mem::cmd_param PARAM_orbitsmooth {"orbitsmooth", "Orbital camera smoothing rate; higher is snappier, 0 is off"};
 static mem::cmd_param PARAM_orbitrecenter {
     "orbitrecenter", "Seconds of mouse idle before the orbital camera eases back behind the car; 0 is off"};
+static mem::cmd_param PARAM_orbitdrift {
+    "orbitdrift", "How far the orbital camera follows the direction of travel in a slide; 0 locks it to the tail"};
 
 static mem::cmd_param PARAM_orbitshake {"orbitshake", "Orbital camera speed shake strength; 0 is off"};
 static mem::cmd_param PARAM_orbitshakeamp {"orbitshakeamp", "Overall orbital camera shake displacement multiplier"};
@@ -51,11 +53,24 @@ static mem::cmd_param PARAM_orbitfov {"orbitfov", "Degrees of FOV widening at fu
 static constexpr f32 OrbitPitchMin = -0.35f;
 static constexpr f32 OrbitPitchMax = 1.35f;
 
-static constexpr f32 OrbitPitchStart = 0.25f;
+// Resting pitch. Low: most of the downward angle already comes from Height being above the point
+// the camera orbits, so a large value here on top of that ends up staring down at the roof.
+static constexpr f32 OrbitPitchStart = 0.08f;
 
-// How fast the recentre eases in. Deliberately far slower than the input filter, so it reads as the
-// camera drifting home rather than being yanked.
-static constexpr f32 OrbitRecenterRate = 2.0f;
+// How fast the recentre eases in. Slower than the input filter, so it reads as the camera settling
+// back rather than being yanked, but quick enough that it feels tied to the car.
+static constexpr f32 OrbitRecenterRate = 3.5f;
+
+// Ground speed, in m/s, below which the direction of travel is too noisy to steer the camera by.
+static constexpr f32 OrbitDriftMinSpeed = 4.0f;
+
+// Furthest the camera will swing towards the direction of travel, in radians. Enough to put the
+// side of the car on screen in a slide without ever losing the car's tail.
+static constexpr f32 OrbitDriftMaxSlip = 0.70f;
+
+// Past this slip angle the car is reversing or spinning rather than drifting, and following the
+// direction of travel would whip the camera round the front. Fall back to the way it is pointing.
+static constexpr f32 OrbitDriftIgnore = 2.0f;
 
 // Below this speed the car is parked or crawling, and pulling the camera round behind it fights the
 // player rather than helping. In mph, like the speed bands.
@@ -192,12 +207,14 @@ void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
     CarMatrix = &Car->Sim.LCS.World;
     SetName(Car->Sim.GetNodeName());
 
-    // Sits in tight on the car at a standstill and opens out with speed, so the framing itself
-    // carries the sense of pace rather than the shake having to do all of it.
-    Distance = PARAM_orbitdist.get_or(5.5f);
-    Height = PARAM_orbitheight.get_or(1.5f);
+    // Sits in tight and low on the car at a standstill and opens out with speed, so the framing
+    // itself carries the sense of pace rather than the shake having to do all of it. Height is
+    // what sets most of the downward angle at these distances, so it stays modest.
+    Distance = PARAM_orbitdist.get_or(6.0f);
+    Height = PARAM_orbitheight.get_or(1.15f);
     SmoothRate = PARAM_orbitsmooth.get_or(14.0f);
-    RecenterDelay = PARAM_orbitrecenter.get_or(1.5f);
+    RecenterDelay = PARAM_orbitrecenter.get_or(0.6f);
+    DriftBias = PARAM_orbitdrift.get_or(0.85f);
 
     f32 sensitivity = PARAM_orbitsens.get_or(0.0045f);
 
@@ -218,7 +235,7 @@ void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
     FrameStartSpeed = PARAM_orbitdistmin.get_or(5.0f);
     FrameMaxSpeed = PARAM_orbitdistmax.get_or(206.0f);
 
-    SpeedDistance = PARAM_orbitpullback.get_or(9.0f);
+    SpeedDistance = PARAM_orbitpullback.get_or(6.0f);
     SpeedHeight = PARAM_orbitpulldown.get_or(-0.25f);
     SpeedFov = PARAM_orbitfov.get_or(18.0f);
 
@@ -478,7 +495,24 @@ void OrbitCamCS::Recenter(f32 delta)
     if (Car->Sim.SpeedMPH < OrbitRecenterMinSpeed)
         return;
 
-    f32 desired = std::atan2(CarMatrix->m2.x, CarMatrix->m2.z);
+    f32 heading = std::atan2(CarMatrix->m2.x, CarMatrix->m2.z);
+    f32 desired = heading;
+
+    // Settle behind where the car is *going* rather than where it is pointing. Sliding separates
+    // the two, which swings the camera round far enough to put the car's side on screen; coming
+    // straight again closes the gap on its own. Nothing here has to detect a drift as an event -
+    // the slip angle already is one.
+    const Vector3& velocity = Car->Sim.ICS.LinearVelocity;
+    f32 ground_speed2 = (velocity.x * velocity.x) + (velocity.z * velocity.z);
+
+    if (ground_speed2 > (OrbitDriftMinSpeed * OrbitDriftMinSpeed))
+    {
+        f32 slip = OrbitWrapAngle(std::atan2(velocity.x, velocity.z) - heading);
+
+        if (std::fabs(slip) < OrbitDriftIgnore)
+            desired = heading + (std::clamp(slip, -OrbitDriftMaxSlip, OrbitDriftMaxSlip) * DriftBias);
+    }
+
     f32 blend = OrbitBlend(OrbitRecenterRate, delta);
 
     TargetYaw = OrbitWrapAngle(TargetYaw + (OrbitWrapAngle(desired - TargetYaw) * blend));
