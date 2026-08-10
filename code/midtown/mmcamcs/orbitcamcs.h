@@ -81,18 +81,23 @@ public:
 
     // --- Speed response ------------------------------------------------------------------------
 
-    // Smoothed 0..1 position within the shake speed band, reused for the framing changes.
+    // Smoothed 0..1 position within the framing speed band, driving distance, height and FOV.
     f32 SpeedFactor {};
 
+    // Speed bands, in mph, to match how the cars are actually specified. Framing and shake get
+    // their own: framing opens from a standstill and keeps climbing to the fastest car in the
+    // game, so a Panoz GTR-1 at 206 is visibly further back and wider than a 140 car flat out,
+    // while the shake saturates sooner because past a point more rattle just reads as noise.
+    f32 FrameStartSpeed {};
+    f32 FrameMaxSpeed {};
     f32 ShakeStartSpeed {};
     f32 ShakeMaxSpeed {};
 
-    // Added to Distance/Height at full speed; the camera eases back and drops slightly.
+    // Added to Distance/Height across the framing band; the camera eases back and drops slightly.
     f32 SpeedDistance {};
     f32 SpeedHeight {};
 
-    // Degrees added to the FOV at full speed. Off by default - it changes the projection matrix,
-    // which the Remix work depends on. BaseFov remembers the value to widen from.
+    // Degrees added to the FOV across the framing band. BaseFov remembers the value to widen from.
     f32 SpeedFov {};
     f32 BaseFov {};
 

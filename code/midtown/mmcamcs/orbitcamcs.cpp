@@ -39,12 +39,13 @@ static mem::cmd_param PARAM_orbitshakeamp {"orbitshakeamp", "Overall orbital cam
 static mem::cmd_param PARAM_orbitshakerough {"orbitshakerough", "Orbital camera road roughness shake strength"};
 static mem::cmd_param PARAM_orbitshakeimpact {"orbitshakeimpact", "Orbital camera collision impact shake strength"};
 static mem::cmd_param PARAM_orbitshakeaccel {"orbitshakeaccel", "Orbital camera acceleration shake strength"};
-static mem::cmd_param PARAM_orbitshakemin {"orbitshakemin", "Speed the shake starts ramping in at, in m/s"};
-static mem::cmd_param PARAM_orbitshakemax {"orbitshakemax", "Speed the shake reaches full strength at, in m/s"};
+static mem::cmd_param PARAM_orbitshakemin {"orbitshakemin", "Speed the shake starts ramping in at, in mph"};
+static mem::cmd_param PARAM_orbitshakemax {"orbitshakemax", "Speed the shake reaches full strength at, in mph"};
+static mem::cmd_param PARAM_orbitdistmin {"orbitdistmin", "Speed the camera starts pulling back at, in mph"};
+static mem::cmd_param PARAM_orbitdistmax {"orbitdistmax", "Speed the camera is fully pulled back at, in mph"};
 static mem::cmd_param PARAM_orbitpullback {"orbitpullback", "Metres the camera eases back by at full speed"};
 static mem::cmd_param PARAM_orbitpulldown {"orbitpulldown", "Metres the camera drops by at full speed"};
-static mem::cmd_param PARAM_orbitfov {
-    "orbitfov", "Degrees of FOV widening at full speed; 0 is off. Changes the projection matrix"};
+static mem::cmd_param PARAM_orbitfov {"orbitfov", "Degrees of FOV widening at full speed; 0 is off"};
 
 // Kept clear of +/- PI/2 so the view never degenerates looking straight down or up.
 static constexpr f32 OrbitPitchMin = -0.35f;
@@ -57,8 +58,8 @@ static constexpr f32 OrbitPitchStart = 0.25f;
 static constexpr f32 OrbitRecenterRate = 2.0f;
 
 // Below this speed the car is parked or crawling, and pulling the camera round behind it fights the
-// player rather than helping. Metres per second.
-static constexpr f32 OrbitRecenterMinSpeed = 2.5f;
+// player rather than helping. In mph, like the speed bands.
+static constexpr f32 OrbitRecenterMinSpeed = 6.0f;
 
 // Largest mouse movement honoured in a single frame. Bounds a flick that arrives as one enormous
 // delta - the mouse leaving the window, or a stretch of frames where input was suppressed.
@@ -191,7 +192,9 @@ void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
     CarMatrix = &Car->Sim.LCS.World;
     SetName(Car->Sim.GetNodeName());
 
-    Distance = PARAM_orbitdist.get_or(12.0f);
+    // Sits in tight on the car at a standstill and opens out with speed, so the framing itself
+    // carries the sense of pace rather than the shake having to do all of it.
+    Distance = PARAM_orbitdist.get_or(5.5f);
     Height = PARAM_orbitheight.get_or(1.5f);
     SmoothRate = PARAM_orbitsmooth.get_or(14.0f);
     RecenterDelay = PARAM_orbitrecenter.get_or(1.5f);
@@ -207,12 +210,17 @@ void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
     ShakeImpactScale = PARAM_orbitshakeimpact.get_or(1.0f);
     ShakeAccelScale = PARAM_orbitshakeaccel.get_or(0.35f);
 
-    ShakeStartSpeed = PARAM_orbitshakemin.get_or(24.0f);
-    ShakeMaxSpeed = PARAM_orbitshakemax.get_or(62.0f);
+    // In mph. The framing band runs from a crawl to beyond what anything but a Panoz GTR-1 will
+    // reach, so the fast cars keep opening out after a 140 mph car has run out of road; the shake
+    // band saturates earlier, since past a point more rattle stops reading as more speed.
+    ShakeStartSpeed = PARAM_orbitshakemin.get_or(55.0f);
+    ShakeMaxSpeed = PARAM_orbitshakemax.get_or(175.0f);
+    FrameStartSpeed = PARAM_orbitdistmin.get_or(5.0f);
+    FrameMaxSpeed = PARAM_orbitdistmax.get_or(206.0f);
 
-    SpeedDistance = PARAM_orbitpullback.get_or(2.5f);
-    SpeedHeight = PARAM_orbitpulldown.get_or(-0.35f);
-    SpeedFov = PARAM_orbitfov.get_or(0.0f);
+    SpeedDistance = PARAM_orbitpullback.get_or(9.0f);
+    SpeedHeight = PARAM_orbitpulldown.get_or(-0.25f);
+    SpeedFov = PARAM_orbitfov.get_or(18.0f);
 
     // BaseCamCS defaults this to 3.0, which clips the car when orbiting in close.
     CameraNear = 0.5f;
@@ -381,11 +389,18 @@ void OrbitCamCS::UpdateTrauma(f32 delta)
 
     const mmCarSim& sim = Car->Sim;
 
-    f32 span = ShakeMaxSpeed - ShakeStartSpeed;
-    f32 speed_target = (span > 0.0f) ? std::clamp((sim.Speed - ShakeStartSpeed) / span, 0.0f, 1.0f) : 0.0f;
+    // Both bands read mph directly, so the tuning numbers line up with the cars' quoted top
+    // speeds rather than having to be converted.
+    f32 frame_span = FrameMaxSpeed - FrameStartSpeed;
+    f32 frame_target =
+        (frame_span > 0.0f) ? std::clamp((sim.SpeedMPH - FrameStartSpeed) / frame_span, 0.0f, 1.0f) : 0.0f;
 
-    SpeedFactor = OrbitEnvelope(SpeedFactor, speed_target, delta, OrbitSpeedEnvelopeRate, OrbitSpeedEnvelopeRate);
-    SpeedTrauma = SpeedFactor;
+    f32 shake_span = ShakeMaxSpeed - ShakeStartSpeed;
+    f32 shake_target =
+        (shake_span > 0.0f) ? std::clamp((sim.SpeedMPH - ShakeStartSpeed) / shake_span, 0.0f, 1.0f) : 0.0f;
+
+    SpeedFactor = OrbitEnvelope(SpeedFactor, frame_target, delta, OrbitSpeedEnvelopeRate, OrbitSpeedEnvelopeRate);
+    SpeedTrauma = OrbitEnvelope(SpeedTrauma, shake_target, delta, OrbitSpeedEnvelopeRate, OrbitSpeedEnvelopeRate);
 
     // Road roughness, read as how fast the suspension is moving. Only wheels actually on the
     // ground contribute - a wheel dangling in mid-air swings freely and would otherwise register
@@ -460,7 +475,7 @@ void OrbitCamCS::Recenter(f32 delta)
         return;
 
     // Leave a parked car's camera where the player put it.
-    if (Car->Sim.Speed < OrbitRecenterMinSpeed)
+    if (Car->Sim.SpeedMPH < OrbitRecenterMinSpeed)
         return;
 
     f32 desired = std::atan2(CarMatrix->m2.x, CarMatrix->m2.z);
