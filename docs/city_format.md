@@ -20,10 +20,13 @@ A city is **not** one file. `mmCullCity::Init` (`mmcity/cullcity.cpp`) pulls in 
 | Collision | `<name>_hitid`, `BOUND%02d` | bound templates | `LoadHitId`, `LoadRoomBounds` | **yes** (calls closed loader) |
 | Props | `city/<name>.bng` | binary | `mmCullCity::LoadBangers` | no — decoded below |
 | Facades | `city/<name>.fcd` | binary | `mmCullCity::LoadFacades` | no — decoded below |
-| AI / roads | `city/<name>/<name>.bai` (or `.map`), `.road` | binary | `aiMap::Init` | no |
+| AI / roads | `city/<name>/<name>.map` + `<street>.road` | **text (MetaClass)** | `aiMap::Init` | no — decoded below |
+| AI cache | `city/<name>/<name>.bai` | binary, **generated** | `aiMap::ReadBinary` | no |
 
-The visibility structure — the part that sounds hardest — is the most open. The AI road network is
-the part with no open loader at all, and it is what traffic, police and opponents navigate.
+Two things are worth knowing up front, because both invert how hard this looks. The visibility
+structure — the part that sounds hardest — is the most open: `.cells` is plain text and `.ptl` has a
+working writer. And the AI road network, which has no open loader, does not need one: `.bai` is a
+**cache compiled from text sources**, and the game rebuilds it itself when it is stale (§7.1).
 
 ---
 
@@ -275,22 +278,138 @@ FindFile(MapName, city_folder, ".map", ...) || FindFile(MapName, city_folder, ".
 AIMAP.Init(RaceDir, aimap_file, city_folder, &Player->Car);
 ```
 
-So the AI data lives in a **per-city subfolder** `city/<name>/`, unlike the flat files above, and
-`.map` is tried before `.bai`.
+The AI data lives in a **per-city subfolder** `city/<name>/`, unlike the flat files above.
 
-`aiMap::Init` is closed (`game.asm` ~57176). Its string references show what it pulls in:
+### 7.1 `.bai` is a build artifact, not a source file
 
-* `.bai` — the binary AI map
-* `.road` — road segments (memory section "AI ROAD SEGS")
-* race data selected by mode: `race%d`, `roam`, `circuit%d`, `blitz%d` ("AI RACE DATA")
-* memory sections "AI MAP", "AI APP ROAD MAP", "AI Total"
+This is the thing worth knowing before anything else. Decoded from `aiMap::Init`
+(`game.asm` ~57176):
 
-The surrounding types are in `mmai` (`aiMap`, `aiIntersection`, `aiPath`, `aiRailSet`) and
-`mmcityinfo/roadsect.h` (`mmRoadSect`, `mmRoadSide` — intersection types, per-lane normals, sidewalk
-vertices, stop-light names). `aiMap` exposes `NumIntersections` and `NumOpponents` as `i16`.
+1. The `.map` path is copied and `strrchr(path, '.')` locates its extension, which is overwritten
+   with `.bai`. The two names share a stem — `.bai` is derived from `.map`, not independent.
+2. `OutOfDate(bai_path, map_path)` compares timestamps.
+3. **In `DevelopmentMode`, if the `.bai` is stale the whole network is rebuilt from text**, and then
+   `aiMap::SaveBinary` writes a fresh `.bai`.
+4. Otherwise `aiMap::ReadBinary` loads the cache and none of the text is touched.
 
-**This is the real gap for a generated city.** Nothing here has an open loader, and without it the
-city loads and drives but has no traffic, no police, no opponents and no pedestrians.
+So a new city never needs a hand-authored `.bai`. Ship `.map` and `.road`, run once in development
+mode, and the game compiles the binary itself. That removes what looked like the hard blocker.
+
+### 7.2 The text sources are MetaClass files
+
+`mmMapData` and `mmRoadSect` both derive from `mmInfoBase`, whose `Load`/`Save` are open C++
+(`mmcityinfo/infobase.cpp`) and run through `StreamMiniParser` plus the engine's reflection system:
+
+```cpp
+GetClass()->Load(&parser, this);   // and Save(), symmetric
+```
+
+The schema is therefore whatever `DeclareFields` declares, the files are text, and **they
+round-trip: the same code that reads them can write them.**
+
+**`<name>.map` — `mmMapData`** (size `0x90`), two fields:
+
+| Field | Meaning |
+|---|---|
+| `NumStreets` | count |
+| `Street` | array of street names, `NumStreets` entries |
+
+`aiMap::Init` walks it with `GetNumItems()` / `GetItem(i)` and, for each name, calls
+`FindFile(street, city_folder, ".road", …)`.
+
+**`<street>.road` — `mmRoadSect`** (size `0x6CC`). Field names and offsets read out of
+`mmRoadSect::DeclareFields` (`game.asm` ~264366):
+
+| Offset | Field | Notes |
+|---|---|---|
+| 0x650 | `NumVertexs` | also the element count for `Normals` and `RoomIds` |
+| 0x654 | `NumLanes[0]` | lanes in direction 0 |
+| 0x658 | `NumLanes[1]` | lanes in direction 1 |
+| 0x65C | `NumSidewalks[0]` | |
+| 0x660 | `NumSidewalks[1]` | |
+| 0x664 | `TotalVertexs` | element count for `Vertexs` |
+| 0x668 | `Vertexs` | array, `TotalVertexs` entries |
+| 0x66C | `Normals` | array, `NumVertexs` entries |
+| 0x670 | `RoomIds` | array, `NumVertexs` entries — ties road vertices to cells |
+| 0x674 | `IntersectionType[0]` | see `GetIntersectionType()` |
+| 0x678 | `IntersectionType[1]` | |
+| 0x67C | `StopLightPos[0]` | `Vector3` |
+| 0x688 | `StopLightPos[1]` | `Vector3` |
+| 0x694 | `StopLightPos[2]` | `Vector3` |
+| 0x6A0 | `StopLightPos[3]` | `Vector3` |
+| 0x6AC | `Blocked[0]` | see `IsBlocked()` |
+| 0x6B0 | `Blocked[1]` | |
+| 0x6B4 | `PedBlocked[0]` | see `IsPedBlocked()` |
+| 0x6B8 | `PedBlocked[1]` | |
+| 0x6BC | `StopLightName` | see `GetStopLightName()` |
+| 0x6C4 | `Divided` | see `IsDivided()` |
+| 0x6C8 | `Alley` | see `IsAlley()` |
+
+The four `StopLightPos` entries are 12 bytes apart, confirming `Vector3` — one per approach to an
+intersection. Almost everything is a per-direction pair, which is what makes a street two-way.
+
+`Vertexs`, `Normals` and `RoomIds` are declared with a separate count-offset argument, which is why
+they take more pushes in the disassembly than the scalar fields do.
+
+`RoomIds` is the link back to §1: road vertices carry the cell they belong to, so the AI network and
+the visibility partition share a coordinate system.
+
+### 7.3 Roadside props are data too
+
+`mmRoadSide` (size `0x2E0`) declares six fields, each an `mmPropInfo`:
+
+```
+Sidewalk   Curb   Bldgs   Signs   Trees   Posts
+```
+
+and `mmPropInfo` (size `0x94`) declares:
+
+| Field | Meaning |
+|---|---|
+| `Spacing` | distance between placements |
+| `NumThings` | count |
+| `Things` | array of object names |
+
+So street dressing is **procedurally distributed along the road from a spacing plus a name list**,
+not hand-positioned the way `.bng` bangers are. That is a generator-friendly format: supply a
+palette and a spacing and the engine does the placement.
+
+### 7.4 How the graph is built
+
+Per street, `aiMap::Init` does:
+
+```
+AddAIPath(roadsect, 0, n)          // one directed path per side
+AddAIPath(roadsect, 1, n)
+GetVertex(...) at each end   ->    AddIntersection(Vector3*)
+AddSourcePath / AddSinkPath        on both intersections
+CalcCenterVerts(roadsect, dir)     per path
+```
+
+So **a street becomes two directed paths, and each endpoint becomes or joins an intersection that
+records its source and sink paths.** That is a directed road graph — the same shape an OSM extract
+already has, which is what makes generating one plausible.
+
+Both `AddAIPath` calls receive the same third argument, read from offset `0x654` (`NumLanes[0]`),
+rather than the per-direction lane count one might expect. Observed, not explained; treat that
+parameter's meaning as open.
+
+After all streets are processed, `CreateAmbAppRoadMap` and `CreatePedAppRoadMap` build the ambient
+and pedestrian approach-road tables (memory section "AI APP ROAD MAP"), and only then does
+`SaveBinary` run — so those tables are part of the cache, not recomputed at load.
+
+### 7.5 Race data
+
+Selected by game mode from the strings in `aiMap::Init`: `race%d`, `roam`, `circuit%d`, `blitz%d`
+(memory section "AI RACE DATA"), loaded relative to `RaceDir`. This sets opponent counts and routes;
+`aiMap::NumOpponents` is an `i16` and `mmgame` asserts it is at most 8.
+
+### 7.6 What is still unread
+
+`aiMap::ReadBinary` (`game.asm` 59281..59876) and `aiMap::SaveBinary` have not been decoded field by
+field — and largely do not need to be, since the text sources are authorable and the binary
+regenerates from them. Anyone who does want that layout should start there, and can check the work by
+round-tripping a known city and diffing the result.
 
 ---
 
@@ -325,7 +444,10 @@ simple enough to emit from the layouts above.
   per-cell collision.
 * Each game mode expects its own banger overlay file.
 
-**Still missing.** The AI network. A city can be built and driven without it, but it will be empty.
+**The AI network is authorable after all.** `.map` and `.road` are text driven by declared fields
+(§7.2), and running once in development mode compiles the `.bai` for you. Roadside props come free
+from a spacing and a name list (§7.3). This was the blocker in an earlier draft of this document; it
+is not one.
 
 **Natural mapping from open data.** The engine's own partition is a road graph — segments and
 intersections — so OSM ways become cells, junctions become intersection cells, and the portal
