@@ -156,7 +156,9 @@ i32 agiDX9Pipeline::BeginGfx()
     // nothing could use more.
     if (per_pixel_.IsValid())
     {
-        agiCurState.SetMaxTextures(std::min<i32>(static_cast<i32>(dx9_context_->GetMaxSimultaneousTextures()), 2));
+        // agiRendStateStruct::MaxTextures is an i8, so the narrowing is explicit - the value is 1 or
+        // 2 and cannot overflow, but /W4 /WX rejects the implicit conversion.
+        agiCurState.SetMaxTextures(static_cast<i8>(std::min<u32>(dx9_context_->GetMaxSimultaneousTextures(), 2u)));
     }
 
     InitScaling();
