@@ -1646,6 +1646,13 @@ static mem::cmd_param PARAM_smooth_normals {"smoothnormals", "Rebuild smooth ver
 // -flatnormals. See the long note at its use in DrawNativeTransform.
 static mem::cmd_param PARAM_flat_normals {"flatnormals", "Shade from facet geometry, ignoring stored vertex normals"};
 
+// -nativecpucull. Restores the camera-dependent CPU backface cull that DrawNativeTransform used to
+// apply. Off by default, because it is the single largest source of RTX Remix geometry-hash churn -
+// see the long note at the facet-order build in DrawNativeTransform for what it was doing and why
+// dropping it costs nothing. Kept as a switch so the two can still be compared directly.
+static mem::cmd_param PARAM_native_cpu_cull {
+    "nativecpucull", "Cull backfacing facets on the CPU in the world path (breaks RTX Remix hash stability)"};
+
 // Flat shading emits up to four unshared vertices per facet instead of one per adjunct, and those
 // live on the stack alongside everything else DrawNativeTransform allocates there. 8192 vertices is
 // ~288 KB, which is affordable against the 1 MB stack; a mesh dense enough to exceed it keeps its
@@ -1722,29 +1729,95 @@ b32 agiMeshSet::DrawNativeTransform(
     // So the renderer can tell which glow lights can reach this mesh - see agiworld/glowlight.h.
     agiNativeDrawRadius = Radius;
 
-    fill_bytes(firstFacet, TextureCount + 1, 0xFF);
-
-    // Backface culling uses the shared IsBackfacing()/agiMeshSet::EyePos, exactly like the CPU
-    // Geometry() path above, so both paths make identical per-facet decisions.
+    // Facet order for this submission, in canonical form: every facet, grouped by texture, in
+    // ascending facet index. This is what makes the geometry hash RTX Remix computes from the
+    // submitted index bytes a property of the MESH rather than of the moment it was drawn, and two
+    // separate things about the code it replaces made that false.
     //
-    // Earlier revisions here distrusted EyePos and substituted hand-rolled eye positions (first
-    // the raw world-space ViewParams().Camera.m3 - a genuine coordinate-space mismatch, since
-    // Planes[] are local/object-space plane equations - then Camera.m3 transformed by
-    // World.FastInverse()). Neither was necessary: disassembling the closed producer
-    // (agiMeshSet::InitMtx, game.asm) shows EyePos is computed from agiViewParameters::ModelView
-    // (= View * World) as the camera's position expressed in *model* space - precisely the
-    // local-space eye this test wants - and Init() above re-runs InitMtx() whenever
-    // agiViewParameters::MtxSerial has moved, which SetWorld() bumps on every call. So EyePos is
-    // both correct and already fresh for this draw. Verified against logged runtime values: for an
-    // instance at world (-185.3, 5.0, 854.0) with the camera at (-234.7, 4.2, 981.9), EyePos came
-    // out as (120.6, -0.8, -65.3), whose magnitude matches the true camera-to-object distance.
+    // 1. It was CAMERA DEPENDENT. Facets were filtered through IsBackfacing(), which is
+    //    plane . EyePos + plane.w tested against MirrorMode, with EyePos the camera expressed in
+    //    model space and refreshed by the Init() above on every SetWorld(). Remix keys a
+    //    replacement on the bytes of the draw, indices included, so a building emitted a different
+    //    index array - and therefore took on a different identity - for every position the camera
+    //    moved to. Replacements never stick and a capture fills with thousands of one-frame meshes.
+    //
+    //    The filter also switched on and off underneath this path, which produced whole additional
+    //    families of hashes for one mesh: AllowEyeBackfacing is raised only by InitMtx, and only
+    //    when Planes && SurfaceCount > 1, MirrorMode is clear, and the transform passes InitMtx's
+    //    scale tolerance (game.asm ~324504) - it is cleared on every other path (~324569) - so the
+    //    same mesh alternated between "every facet" and "some facets", and the rear-view mirror,
+    //    which sets MirrorMode and so inverts the comparison, contributed the complementary set on
+    //    top of that.
+    //
+    //    Dropping the test costs nothing, because the GPU already culls these facets by winding:
+    //    MeshWorld() programs D3DRS_CULLMODE from agiCurState through ToD3DCullFlipped(). Nor was
+    //    the CPU test ever load-bearing here - for every draw where AllowEyeBackfacing is false,
+    //    which is most of them, it culled nothing at all and the winding cull was doing the whole
+    //    job unaided. It is a saving rather than a cost: one plane dot product per facet per draw
+    //    goes away, and a path tracer wants closed geometry regardless, because a back face it
+    //    never receives is a hole light leaks through.
+    //
+    // 2. It was built in the SHARED static firstFacet/nextFacet scratch. Those are process-wide
+    //    arrays (the assembly exports them), and this function is reached on more than one thread -
+    //    the same fact documented for the vertex buffers in the ARTS_ALLOCA note below. Two
+    //    concurrent draws therefore interleaved their chains, and the index array that came out was
+    //    not a function of either mesh. That is unhashable no matter what happens to the cull, so
+    //    the order is built in local storage instead.
+    //
+    //    Nothing downstream loses anything by that. The closed routines that do consume that
+    //    scratch - SphereMap(), EnvMap(), MultiTexEnvMap() - only ever run after Geometry(), which
+    //    builds its own chains, and are never reached from this path (see DrawLitEnv).
+    //
+    // What is left is a pure function of SurfaceIndices and TextureIndices, both immutable mesh
+    // data, so a given mesh submits byte-identical indices for the life of the process. There is
+    // deliberately no cross-frame cache of the result: agiMeshSet's layout is fixed by
+    // check_size(agiMeshSet, 0x64) so the arrays cannot live on the mesh, and a side table keyed on
+    // the mesh pointer would have to outguess a lifetime the assembly partly owns - for a saving of
+    // one linear pass. When the dynamic vertex/index buffers of dx9_rendering_pathways.md §1.2
+    // land, they are the right owner for it: device buffers with a BeginGfx/EndGfx lifetime.
+    //
+    // The facet index is emitted as u16 because the engine's own facet storage is i16 (nextFacet is
+    // i16[16384]), so a mesh above that has never been submittable by any path here.
+    if (SurfaceCount > 0x7FFFu)
+        return false;
+
+    const bool cpu_cull = (Planes != nullptr) && PARAM_native_cpu_cull.get_or(false);
+
+    const u32 batch_count = TextureCount + 1u;
+
+    u32* batch_start = ARTS_ALLOCA(u32, batch_count + 1);
+    u16* facet_order = ARTS_ALLOCA(u16, SurfaceCount);
+
+    for (u32 i = 0; i <= batch_count; ++i)
+        batch_start[i] = 0;
+
     for (u32 i = 0; i < SurfaceCount; ++i)
     {
-        if (!Planes || !IsBackfacing(Planes[i]))
+        if (cpu_cull && IsBackfacing(Planes[i]))
+            continue;
+
+        ++batch_start[TextureIndices[i] + 1u];
+    }
+
+    for (u32 i = 0; i < batch_count; ++i)
+        batch_start[i + 1] += batch_start[i];
+
+    {
+        // Counting sort rather than the old prepend-to-a-linked-list, so facets come out in
+        // ascending index order within their batch instead of reversed. Either is deterministic;
+        // ascending matches the order they appear in SurfaceIndices, which is the order a capture
+        // and any tooling built on it will read them in.
+        u32* cursor = ARTS_ALLOCA(u32, batch_count);
+
+        for (u32 i = 0; i < batch_count; ++i)
+            cursor[i] = batch_start[i];
+
+        for (u32 i = 0; i < SurfaceCount; ++i)
         {
-            u8 texture = TextureIndices[i];
-            nextFacet[i] = firstFacet[texture];
-            firstFacet[texture] = static_cast<i16>(i);
+            if (cpu_cull && IsBackfacing(Planes[i]))
+                continue;
+
+            facet_order[cursor[TextureIndices[i]]++] = static_cast<u16>(i);
         }
     }
 
@@ -1829,59 +1902,60 @@ b32 agiMeshSet::DrawNativeTransform(
     {
         facet_base = ARTS_ALLOCA(u16, SurfaceCount);
 
-        // Walks the same firstFacet/nextFacet chains the index loop below walks, so a facet the
-        // backface pass rejected costs nothing here either.
-        for (u32 texture = 0; texture <= TextureCount; ++texture)
+        // Walks facet_order, exactly as the index loop below does, so corner k of a facet is always
+        // at facet_base[facet] + k. Sharing that one order is what keeps this path hashable too:
+        // flat shading emits unshared vertices, so the vertex array is built here rather than from
+        // the adjunct list, and it would inherit any instability in the order it walks.
+        for (u32 slot = 0; slot < batch_start[batch_count]; ++slot)
         {
-            for (i16 facet = firstFacet[texture]; facet != -1; facet = nextFacet[facet])
+            const u16 facet = facet_order[slot];
+
+            const u16* ARTS_RESTRICT surface = &SurfaceIndices[facet * 4];
+            const u32 corners = surface[3] ? 4u : 3u;
+
+            facet_base[facet] = static_cast<u16>(flat_vertex_count);
+
+            Vector3 reference {};
+
+            for (u32 k = 0; k < corners; ++k)
+                reference = reference + UnpackNormal[Normals[surface[k]]];
+
+            const Vector3& p0 = Vertices[VertexIndices[surface[0]]];
+            const Vector3& p1 = Vertices[VertexIndices[surface[1]]];
+            const Vector3& p2 = Vertices[VertexIndices[surface[2]]];
+
+            Vector3 face_normal;
+            face_normal.Cross(p1 - p0, p2 - p0);
+
+            if (f32 mag2 = face_normal.Mag2(); mag2 > 1.0e-12f)
             {
-                const u16* ARTS_RESTRICT surface = &SurfaceIndices[facet * 4];
-                const u32 corners = surface[3] ? 4u : 3u;
+                face_normal = face_normal * (1.0f / std::sqrt(mag2));
 
-                facet_base[facet] = static_cast<u16>(flat_vertex_count);
+                if ((face_normal ^ reference) < 0.0f)
+                    face_normal = -face_normal;
+            }
+            else if (f32 ref_mag2 = reference.Mag2(); ref_mag2 > 1.0e-12f)
+            {
+                // Degenerate facet - zero area, so it has no plane of its own. It will not
+                // rasterise anything either, but it still needs a finite normal.
+                face_normal = reference * (1.0f / std::sqrt(ref_mag2));
+            }
+            else
+            {
+                face_normal = filler_normal;
+            }
 
-                Vector3 reference {};
+            for (u32 k = 0; k < corners; ++k)
+            {
+                const u16 a = surface[k];
 
-                for (u32 k = 0; k < corners; ++k)
-                    reference = reference + UnpackNormal[Normals[surface[k]]];
+                agiWorldVtx& vertex = verts[flat_vertex_count++];
 
-                const Vector3& p0 = Vertices[VertexIndices[surface[0]]];
-                const Vector3& p1 = Vertices[VertexIndices[surface[1]]];
-                const Vector3& p2 = Vertices[VertexIndices[surface[2]]];
-
-                Vector3 face_normal;
-                face_normal.Cross(p1 - p0, p2 - p0);
-
-                if (f32 mag2 = face_normal.Mag2(); mag2 > 1.0e-12f)
-                {
-                    face_normal = face_normal * (1.0f / std::sqrt(mag2));
-
-                    if ((face_normal ^ reference) < 0.0f)
-                        face_normal = -face_normal;
-                }
-                else if (f32 ref_mag2 = reference.Mag2(); ref_mag2 > 1.0e-12f)
-                {
-                    // Degenerate facet - zero area, so it has no plane of its own. It will not
-                    // rasterise anything either, but it still needs a finite normal.
-                    face_normal = reference * (1.0f / std::sqrt(ref_mag2));
-                }
-                else
-                {
-                    face_normal = filler_normal;
-                }
-
-                for (u32 k = 0; k < corners; ++k)
-                {
-                    const u16 a = surface[k];
-
-                    agiWorldVtx& vertex = verts[flat_vertex_count++];
-
-                    vertex.pos = Vertices[VertexIndices[a]];
-                    vertex.normal = face_normal;
-                    vertex.color = src_colors ? src_colors[a] : 0xFFFFFFFF;
-                    vertex.tu = TexCoords ? TexCoords[a].x : 0.0f;
-                    vertex.tv = TexCoords ? TexCoords[a].y : 0.0f;
-                }
+                vertex.pos = Vertices[VertexIndices[a]];
+                vertex.normal = face_normal;
+                vertex.color = src_colors ? src_colors[a] : 0xFFFFFFFF;
+                vertex.tu = TexCoords ? TexCoords[a].x : 0.0f;
+                vertex.tv = TexCoords ? TexCoords[a].y : 0.0f;
             }
         }
     }
@@ -1949,15 +2023,19 @@ b32 agiMeshSet::DrawNativeTransform(
     bool drawn = false;
     u32 submitted_indices = 0;
 
-    for (u32 texture = 0; texture <= TextureCount; ++texture)
+    for (u32 texture = 0; texture < batch_count; ++texture)
     {
-        if (firstFacet[texture] == -1)
+        const u32 batch_end = batch_start[texture + 1];
+
+        if (batch_start[texture] == batch_end)
             continue;
 
         u32 index_count = 0;
 
-        for (i16 facet = firstFacet[texture]; facet != -1; facet = nextFacet[facet])
+        for (u32 slot = batch_start[texture]; slot < batch_end; ++slot)
         {
+            const u16 facet = facet_order[slot];
+
             const u16* ARTS_RESTRICT surface = &SurfaceIndices[facet * 4];
 
             // Flat mode emitted this facet's corners as its own unshared run of vertices, in

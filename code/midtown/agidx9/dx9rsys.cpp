@@ -75,12 +75,34 @@ static mem::cmd_param PARAM_d3d9_depthbias {"d3d9depthbias", "Depth bias for har
 // touches the vertex bytes. If churn does NOT settle, something is rewriting vertex data per frame
 // and that is a real Remix blocker worth finding. Either way this answers it with a number instead
 // of a guess, which is the whole point.
+//
+// That expectation was too narrow, and this measured the failure it missed. The vertex bytes were
+// never the problem; the INDEX bytes were. agiMeshSet::DrawNativeTransform built its index array by
+// filtering facets through a camera-dependent backface test, so churn tracked camera MOTION rather
+// than settling with the view - a still camera looked clean and a moving one rehashed the whole
+// city. See the facet-order note in agiworld/meshrend.cpp for the full account. Churn should now be
+// zero for anything that is not genuinely animated on the CPU (pedestrians, damaged bodywork).
 static mem::cmd_param PARAM_ghash {"ghash", "Report RTX Remix geometry hash stability for world draws"};
 
 // The visual half: Remix's Debug View -> Geometry Hash, reproduced on the fixed-function path.
 // Tints every world draw flat with a colour derived from its geometry hash. Stable geometry holds
 // its colour; anything rehashed per frame strobes. See agiDX9GHashColor.
 static mem::cmd_param PARAM_ghashcolor {"ghashcolor", "Tint world draws by RTX Remix geometry hash (debug view)"};
+
+// -d3d9nofx: drop the chrome and ground-env second passes.
+//
+// Both resubmit the base pass's positions and indices under a different vertex layout, with UVs
+// recomputed from the camera every frame - BuildVehicleReflectionVertices indexes a sphere map by
+// the reflection vector, BuildGroundEnvVertices by a planar projection through the env transform.
+// Positions and indices are the base pass's, so under a hash rule of positions + indices +
+// geometry descriptor these pick up their own stable identity; under any rule that includes
+// texcoords they are a brand new mesh every frame. Either way they push a second copy of every car
+// body and every stretch of road into a renderer that does reflections properly by itself.
+//
+// Off by default - this costs real visuals (see A3 in docs/dx9_rendering_pathways.md) and only
+// earns its keep when capturing for Remix.
+static mem::cmd_param PARAM_d3d9_nofx {
+    "d3d9nofx", "Skip the reflection and ground-env second passes (they duplicate geometry for RTX Remix)"};
 
 // Escape hatch for the projection reset in RestoreStateAfterWorldDraw - see the long note there.
 // Off by default: resetting it is what stops RTX Remix path tracing the moment the frame's first
@@ -1970,6 +1992,10 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // and sampler state that a pixel shader does not replace. Only the transform-and-light half of
     // the pipeline differs, so that is all that forks here.
     // ---------------------------------------------------------------------------------------------
+
+    // -d3d9nofx. Resolved once so both branches below agree.
+    const bool material_fx = fx && (fx->ReflectionTexture || fx->EnvTexture) && !PARAM_d3d9_nofx.get_or(false);
+
     agiDX9WorldShader* shader = Pipe()->WorldShader();
 
     if (shader)
@@ -1992,7 +2018,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         // would reinterpret their XYZRHW vertices as model-space positions.
         shader->Unbind(device);
 
-        if (fx && (fx->ReflectionTexture || fx->EnvTexture))
+        if (material_fx)
         {
             DrawVehicleReflectionPass(
                 device, vertices, vertex_count, indices, index_count, world, view, view_zflip, *fx, Pipe()->PerPixel());
@@ -2122,7 +2148,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // Second passes, in the order the original composited them: chrome over the paint, ground map
     // over the road. Both reuse this draw's vertex positions and world matrix, so they are ordinary
     // world-space geometry rather than the CPU-pretransformed overlays they replace.
-    if (fx && (fx->ReflectionTexture || fx->EnvTexture))
+    if (material_fx)
     {
         DrawVehicleReflectionPass(
             device, vertices, vertex_count, indices, index_count, world, view, view_zflip, *fx, Pipe()->PerPixel());
