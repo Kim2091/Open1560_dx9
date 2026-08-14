@@ -49,6 +49,10 @@ struct agiDX9SubmitCensus
     u32 ScreenLineCalls;
     u32 ScreenLines;
 
+    // -ffperpixel. Additive per-fragment sun passes submitted this frame; two per lit world draw
+    // when the specular pass is on, one when it is not, zero when the path is off.
+    u32 PerPixelPasses;
+
     // -ghash. Zero unless the switch is on. See agiDX9GHashRecord in dx9rsys.cpp for what is
     // hashed and why the churn number is the one that matters.
     u32 GHashDraws;

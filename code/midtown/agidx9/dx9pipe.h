@@ -20,6 +20,7 @@
 
 #include "agisdl/sdlpipe.h"
 
+#include "dx9ffshade.h"
 #include "dx9shader.h"
 #include "dx9target.h"
 
@@ -95,8 +96,17 @@ public:
         return scene_target_.IsValid() ? &scene_target_ : nullptr;
     }
 
+    // Fixed-function per-pixel Blinn-Phong. Null unless -ffperpixel is set and the device can do
+    // DOT3 with per-stage constants. Nothing to do with Pathway B - this is the texture-blending
+    // unit, not a shader - but like Pathway B it is off by default and not for use with Remix.
+    agiDX9FFPerPixel* PerPixel()
+    {
+        return per_pixel_.IsValid() ? &per_pixel_ : nullptr;
+    }
+
 private:
     agiDX9WorldShader world_shader_ {};
+    agiDX9FFPerPixel per_pixel_ {};
     agiDX9RenderTarget scene_target_ {};
     bool scene_target_bound_ {};
 

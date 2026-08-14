@@ -142,6 +142,23 @@ i32 agiDX9Pipeline::BeginGfx()
         scene_target_.Init(dx9_context_->GetDevice(), static_cast<u32>(horz_res_), static_cast<u32>(vert_res_));
     }
 
+    // Fixed-function per-pixel Blinn-Phong (-ffperpixel). Not a shader path - it lights through the
+    // texture-blending unit, which is the only part of fixed function that runs per fragment. Off by
+    // default: it costs additive passes and, like anything that improves the raster image, it is
+    // wasted under RTX Remix, which path-traces and discards the game's shading. See dx9ffshade.h.
+    if (agiDX9PerPixelEnabled() || agiDX9PerPixelReflectEnabled())
+    {
+        per_pixel_.Init(dx9_context_->GetDevice());
+    }
+
+    // The per-pixel passes and the env/sphere-map second passes both bind a second texture, and
+    // agiTexSorter gates its own multi-texture path on this too. Pinned to 1 historically because
+    // nothing could use more.
+    if (per_pixel_.IsValid())
+    {
+        agiCurState.SetMaxTextures(std::min<i32>(static_cast<i32>(dx9_context_->GetMaxSimultaneousTextures()), 2));
+    }
+
     InitScaling();
 
     gfx_started_ = true;
@@ -161,6 +178,7 @@ void agiDX9Pipeline::EndGfx()
 
     // Before the context: these are device objects and must not outlive the device.
     world_shader_.Shutdown();
+    per_pixel_.Shutdown();
     scene_target_.Shutdown();
 
     // Drop both light registries. Neither is owned by this pipeline, and both hold pointers that
@@ -363,7 +381,7 @@ void agiDX9Pipeline::EndFrame()
                      "cards=%u seen (%u no-tex, %u not-glow, %u harvested) | "
                      "worldquads=%u drawn, %u DROPPED | "
                      "normals=%u/%u draws flat, %u/%u tris flat | "
-                     "reflect=%u drawn, %u no-normals, citysph=%s | "
+                     "reflect=%u drawn, %u no-normals, citysph=%s | perpixel=%u passes | "
                      "world share(3D only)=%.1f%% | world share(all)=%.1f%% | tris/call world=%.1f",
                 census_frames, world, agiDX9Census.WorldCalls, agiDX9Census.WorldStaticLitTris,
                 agiDX9Census.WorldUnlitTris, screen, agiDX9Census.ScreenCalls, screen_3d,
@@ -372,7 +390,8 @@ void agiDX9Pipeline::EndFrame()
                 agiGlowCardsNoTexture, agiGlowCardsNotGlow, agiGlowCardsHarvested, agiWorldQuadsDrawn,
                 agiWorldQuadsDropped, agiMeshNormalDrawsFlat, agiMeshNormalDraws, agiMeshNormalTrisFlat,
                 agiMeshNormalTris, agiReflectDraws, agiReflectSkipNoNormals, agiNativeCitySphereMap ? "yes" : "NULL",
-                total_3d ? (100.0 * world / total_3d) : 0.0, total ? (100.0 * world / total) : 0.0,
+                agiDX9Census.PerPixelPasses, total_3d ? (100.0 * world / total_3d) : 0.0,
+                total ? (100.0 * world / total) : 0.0,
                 agiDX9Census.WorldCalls ? (1.0 * world / agiDX9Census.WorldCalls) : 0.0);
 
             // -ghash, on its own line and only when the switch is on. CHURN is the number that

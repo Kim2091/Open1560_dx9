@@ -15,6 +15,8 @@ arts_component "agidx9"
         "dx9rsys.h",
         "dx9config.cpp",
         "dx9config.h",
+        "dx9ffshade.cpp",
+        "dx9ffshade.h",
         "dx9shader.cpp",
         "dx9shader.h",
         "dx9target.cpp",

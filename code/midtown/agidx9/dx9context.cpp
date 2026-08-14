@@ -301,6 +301,9 @@ void agiDX9Context::QueryCaps()
     max_texture_width_ = caps.MaxTextureWidth;
     max_texture_height_ = caps.MaxTextureHeight;
     max_anisotropy_ = caps.MaxAnisotropy;
+    max_simultaneous_textures_ = caps.MaxSimultaneousTextures;
+    max_texture_blend_stages_ = caps.MaxTextureBlendStages;
+    supports_dot3_ = (caps.TextureOpCaps & D3DTEXOPCAPS_DOTPRODUCT3) != 0;
 
     D3DDISPLAYMODE display_mode {};
     d3d_->GetAdapterDisplayMode(D3DADAPTER_DEFAULT, &display_mode);

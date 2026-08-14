@@ -76,6 +76,29 @@ public:
         return hardware_tl_;
     }
 
+    // How many textures one draw may sample, and how many blend stages may be chained. They are
+    // different numbers and the per-pixel path needs both: its diffuse pass samples two textures
+    // across three stages, and its specular pass samples one texture across up to six, because each
+    // squaring of N.H costs a stage and buys a doubling of the Blinn exponent.
+    u32 GetMaxSimultaneousTextures() const
+    {
+        return max_simultaneous_textures_;
+    }
+
+    u32 GetMaxTextureBlendStages() const
+    {
+        return max_texture_blend_stages_;
+    }
+
+    // D3DTOP_DOTPRODUCT3. This is the whole basis of fixed-function per-pixel lighting - it is the
+    // only texture-stage op that produces a dot product per fragment - so the path is gated on it
+    // rather than assumed. Universally present on anything that runs D3D9, checked anyway because
+    // the failure mode without it is a silently black scene.
+    bool SupportsDot3() const
+    {
+        return supports_dot3_;
+    }
+
     static void CheckErrors(const char* what, long hr);
 
 private:
@@ -98,6 +121,9 @@ private:
     u32 max_texture_width_ {};
     u32 max_texture_height_ {};
     u32 max_anisotropy_ {};
+    u32 max_simultaneous_textures_ {};
+    u32 max_texture_blend_stages_ {};
+    bool supports_dot3_ {};
     bool hardware_tl_ {};
 
     // D3DFORMAT - stored as a plain u32 so this header doesn't need the D3D9 headers (see

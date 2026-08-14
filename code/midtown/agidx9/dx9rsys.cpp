@@ -36,6 +36,7 @@
 #include "vector7/matrix34.h"
 
 #include "dx9context.h"
+#include "dx9ffshade.h"
 #include "dx9shader.h"
 #include "dx9texdef.h"
 
@@ -289,8 +290,13 @@ static void DrawMaterialFxPass(IDirect3DDevice9* device, IDirect3DTexture9* text
     agiLastState.Texture = nullptr;
 }
 
+// `view` is the engine's own view matrix, which BuildVehicleReflectionVertices needs because it
+// rebuilds ModelView from it exactly as the original SphereMap does. `device_view` is the Z-flipped
+// one MeshWorld actually put on the device, which is the space D3D's texgen works in. They are not
+// interchangeable and using one for the other mirrors the reflection through Z.
 static void DrawVehicleReflectionPass(IDirect3DDevice9* device, agiWorldVtx* vertices, i32 vertex_count, u16* indices,
-    i32 index_count, const Matrix34& world, const Matrix34& view, const agiNativeMaterialFx& fx)
+    i32 index_count, const Matrix34& world, const Matrix34& view, const Matrix34& device_view,
+    const agiNativeMaterialFx& fx, agiDX9FFPerPixel* per_pixel)
 {
     if (!fx.ReflectionTexture)
         return;
@@ -299,6 +305,60 @@ static void DrawVehicleReflectionPass(IDirect3DDevice9* device, agiWorldVtx* ver
 
     if (!reflection_texture)
         return;
+
+    // -ffperpixelreflect: let the hardware generate the reflection coordinates per fragment instead
+    // of computing them per vertex below.
+    //
+    // The CPU form is exact - it reproduces SphereMap's projection term for term - but it samples
+    // the reflection at VERTICES and the rasteriser then interpolates the resulting UVs. On MM1's
+    // low-poly bodywork that means a whole door panel's reflection is a bilinear blend of four
+    // corner reflections, which swims as the car moves. Texgen trades the exact projection for a
+    // per-fragment one. See agiDX9FFPerPixel::SetupReflectionStage.
+    if (per_pixel && agiDX9PerPixelReflectEnabled())
+    {
+        {
+            device->SetRenderState(D3DRS_LIGHTING, FALSE);
+            device->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
+            device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+            device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+            device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+            device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+
+            per_pixel->SetupReflectionStage(device, 0, reflection_texture, device_view);
+
+            // Reflection strength rides in the texture factor rather than in per-vertex alpha,
+            // because there are no per-vertex values on this path any more - the base pass's own
+            // vertices are reused untouched, which is also what keeps the geometry Remix sees
+            // identical to the base draw.
+            const u32 alpha = static_cast<u32>(std::clamp(fx.ReflectionAmount, 0.0f, 1.0f) * 255.0f);
+
+            device->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_ARGB(alpha, 255, 255, 255));
+
+            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
+            device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+            device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+            device->SetFVF(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+
+            device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vertex_count, index_count / 3, indices,
+                D3DFMT_INDEX16, vertices, sizeof(agiWorldVtx));
+
+            // Texgen and the stage-0 texture transform must not leak into the next draw - they would
+            // silently replace its UVs with reflection vectors.
+            device->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+            device->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+            device->SetTexture(0, nullptr);
+            device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+            device->SetRenderState(D3DRS_ZWRITEENABLE, agiLastState.ZWrite ? TRUE : FALSE);
+
+            agiLastState.Texture = nullptr;
+            return;
+        }
+    }
 
     DX9ReflectVtx* reflect_verts = ARTS_ALLOCA(DX9ReflectVtx, vertex_count);
     BuildVehicleReflectionVertices(reflect_verts, vertices, vertex_count, world, view, fx);
@@ -1259,7 +1319,7 @@ bool agiDX9WantsStaticSpecular()
 // the light's color, summed with a flat ambient term, then multiplied into the vertex color -
 // D3D9's own directional lights plus a D3DMCS_COLOR1 diffuse source compute exactly this once the
 // directions/colors/ambient below are set to match.
-static void SetupD3D9StaticLights(IDirect3DDevice9* device)
+static void SetupD3D9StaticLights(IDirect3DDevice9* device, bool sun_per_pixel)
 {
     auto set_directional = [device](DWORD index, const Vector3& direction_to_light, const Vector3& color) {
         D3DLIGHT9 light {};
@@ -1279,7 +1339,15 @@ static void SetupD3D9StaticLights(IDirect3DDevice9* device)
         device->LightEnable(index, TRUE);
     };
 
-    set_directional(0, agiMeshLighterSun, agiMeshLighterSunColor);
+    // With -ffperpixel the sun is evaluated per fragment in its own additive pass, so it must NOT
+    // also be summed here - leaving it on would light the surface twice, once smeared across the
+    // triangle and once correctly. The two fills stay on the lighting unit; see dx9ffshade.h for why
+    // only the sun is worth the extra passes.
+    if (sun_per_pixel)
+        device->LightEnable(0, FALSE);
+    else
+        set_directional(0, agiMeshLighterSun, agiMeshLighterSunColor);
+
     set_directional(1, agiMeshLighterFill1, agiMeshLighterFill1Color);
     set_directional(2, agiMeshLighterFill2, agiMeshLighterFill2Color);
 
@@ -1926,7 +1994,8 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
 
         if (fx && (fx->ReflectionTexture || fx->EnvTexture))
         {
-            DrawVehicleReflectionPass(device, vertices, vertex_count, indices, index_count, world, view, *fx);
+            DrawVehicleReflectionPass(
+                device, vertices, vertex_count, indices, index_count, world, view, view_zflip, *fx, Pipe()->PerPixel());
             DrawGroundEnvPass(device, vertices, vertex_count, indices, index_count, world, *fx);
             current_texture_ = nullptr;
         }
@@ -1984,6 +2053,13 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         device->SetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, D3DMCS_MATERIAL);
     }
 
+    // Fixed-function per-pixel Blinn-Phong for the sun. Only for the static city rig: the dynamic
+    // rig (SetupD3D9Lights) is a list of up to eight arbitrary point and spot lights, and promoting
+    // those would be one additive pass each. The sun is a single directional light shared by the
+    // whole scene, which is what makes one extra pass per mesh a reasonable trade.
+    agiDX9FFPerPixel* per_pixel =
+        (hardware_lighting && static_lighting && agiDX9PerPixelEnabled()) ? Pipe()->PerPixel() : nullptr;
+
     if (!hardware_lighting)
     {
         // No light/material setup at all - nothing consumes it with lighting disabled.
@@ -1993,7 +2069,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         const Vector3& ambient = agiMeshLighterAmbient;
         device->SetRenderState(D3DRS_AMBIENT, D3DCOLOR_COLORVALUE(ambient.x, ambient.y, ambient.z, 1.0f));
 
-        SetupD3D9StaticLights(device);
+        SetupD3D9StaticLights(device, per_pixel != nullptr);
         SetupD3D9StaticMaterial(device);
     }
     else
@@ -2033,12 +2109,23 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     device->DrawIndexedPrimitiveUP(
         D3DPT_TRIANGLELIST, 0, vertex_count, primitive_count, indices, D3DFMT_INDEX16, vertices, sizeof(agiWorldVtx));
 
+    // Per-fragment sun, added on top of the base pass's ambient + fills. Before the material second
+    // passes, because chrome and the ground map composite over lit paint and lit road.
+    if (per_pixel)
+    {
+        agiDX9Census.PerPixelPasses += per_pixel->DrawSunPasses(
+            device, vertices, vertex_count, indices, index_count, sizeof(agiWorldVtx), native_handle, view_zflip);
+
+        current_texture_ = nullptr;
+    }
+
     // Second passes, in the order the original composited them: chrome over the paint, ground map
     // over the road. Both reuse this draw's vertex positions and world matrix, so they are ordinary
     // world-space geometry rather than the CPU-pretransformed overlays they replace.
     if (fx && (fx->ReflectionTexture || fx->EnvTexture))
     {
-        DrawVehicleReflectionPass(device, vertices, vertex_count, indices, index_count, world, view, *fx);
+        DrawVehicleReflectionPass(
+            device, vertices, vertex_count, indices, index_count, world, view, view_zflip, *fx, Pipe()->PerPixel());
         DrawGroundEnvPass(device, vertices, vertex_count, indices, index_count, world, *fx);
         current_texture_ = nullptr;
     }
