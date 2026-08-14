@@ -58,6 +58,20 @@ extern u32 agiMeshNormalTrisFlat;
 
 void agiResetMeshNormalStats();
 
+// The city's shared vehicle sphere map, pushed down by mmCullCity::Cull() once per frame. Null
+// before a city is loaded, and null in the menus. See its definition for why mmcity pushes rather
+// than agiworld pulling.
+class agiTexDef;
+extern agiTexDef* agiNativeCitySphereMap;
+
+// Reflection census. "Offered" draws are those that reached the hardware path with a sphere map
+// selected; the skip count says how many of those were refused for having no vertex normals. Both
+// zero means nothing is asking for chrome, which is a different problem from chrome being refused.
+extern u32 agiReflectDraws;
+extern u32 agiReflectSkipNoNormals;
+
+void agiResetReflectStats();
+
 struct agiMeshCardVertex
 {
     f32 x, y;

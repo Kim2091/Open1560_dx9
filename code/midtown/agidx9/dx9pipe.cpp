@@ -179,6 +179,10 @@ void agiDX9Pipeline::EndGfx()
     // Both describe a city that no longer exists, so clearing them loses nothing.
     agiResetGlowLights();
 
+    // Same hazard, same reason: this borrows mmCullCity's sphere map, and the arena reset frees the
+    // whole city underneath it. mmCullCity::Cull() republishes it for the next city.
+    agiNativeCitySphereMap = nullptr;
+
     agiLighter::Current = 0;
 
     for (i32 i = 0; i < agiLighter::MAX_LIGHTS; ++i)
@@ -359,6 +363,7 @@ void agiDX9Pipeline::EndFrame()
                      "cards=%u seen (%u no-tex, %u not-glow, %u harvested) | "
                      "worldquads=%u drawn, %u DROPPED | "
                      "normals=%u/%u draws flat, %u/%u tris flat | "
+                     "reflect=%u drawn, %u no-normals, citysph=%s | "
                      "world share(3D only)=%.1f%% | world share(all)=%.1f%% | tris/call world=%.1f",
                 census_frames, world, agiDX9Census.WorldCalls, agiDX9Census.WorldStaticLitTris,
                 agiDX9Census.WorldUnlitTris, screen, agiDX9Census.ScreenCalls, screen_3d,
@@ -366,7 +371,8 @@ void agiDX9Pipeline::EndFrame()
                 agiGlowLightCount, world_shader_.LightCount(), world_shader_.CellFill(), agiGlowCardsSeen,
                 agiGlowCardsNoTexture, agiGlowCardsNotGlow, agiGlowCardsHarvested, agiWorldQuadsDrawn,
                 agiWorldQuadsDropped, agiMeshNormalDrawsFlat, agiMeshNormalDraws, agiMeshNormalTrisFlat,
-                agiMeshNormalTris, total_3d ? (100.0 * world / total_3d) : 0.0, total ? (100.0 * world / total) : 0.0,
+                agiMeshNormalTris, agiReflectDraws, agiReflectSkipNoNormals, agiNativeCitySphereMap ? "yes" : "NULL",
+                total_3d ? (100.0 * world / total_3d) : 0.0, total ? (100.0 * world / total) : 0.0,
                 agiDX9Census.WorldCalls ? (1.0 * world / agiDX9Census.WorldCalls) : 0.0);
 
             // -ghash, on its own line and only when the switch is on. CHURN is the number that
@@ -386,6 +392,7 @@ void agiDX9Pipeline::EndFrame()
         agiDX9Census = {};
         agiResetWorldQuadStats();
         agiResetMeshNormalStats();
+        agiResetReflectStats();
         agiDX9GHashNextFrame();
     }
 

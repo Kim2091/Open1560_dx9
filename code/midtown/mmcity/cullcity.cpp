@@ -28,6 +28,7 @@ define_dummy_symbol(mmcity_cullcity);
 #include "agisw/swrend.h"
 #include "agiworld/getmesh.h"
 #include "agiworld/meshlight.h"
+#include "agiworld/meshrend.h"
 #include "agiworld/meshset.h"
 #include "agiworld/quality.h"
 #include "sky.h"
@@ -118,6 +119,15 @@ i32 mmSky::IsFlashing()
 
 void mmCullCity::Cull()
 {
+    // Publish the city's vehicle sphere map for the hardware-transform path.
+    //
+    // Both vehicle draw paths read this same texture out of mmCullCity, but only one of them
+    // (mmCarModel::Draw, via DrawLitSph) hands it to agiworld. aiVehicleInstance::Draw passes it
+    // straight to the closed SphereMap(), which the native path cannot call - so traffic had no way
+    // to name its own reflection texture. agiworld deliberately does not depend on mmcity, so it is
+    // pushed down here rather than reached up for. See agiworld/meshrend.h.
+    agiNativeCitySphereMap = SphereMap;
+
     // The lightning latch stood here and is unwired along with the rest of Pathway B
     // (agidx9/dx9pipe.cpp, BeginGfx) - agiLightningFlash had no other reader, so it now stays 0.
     //

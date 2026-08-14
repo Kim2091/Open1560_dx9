@@ -1007,6 +1007,39 @@ static inline bool CanNativeLight(agiMeshLighter lighter)
     return lighter != agiConeLighter;
 }
 
+// Vehicle chrome strength, and the two embellishment terms the original SphereMap pass does not
+// have. cmd_params because chrome is the kind of thing that is judged by eye, and a rebuild of this
+// project is a CI round trip.
+//
+// 0.35 rather than the original's literal full strength: SphereMap composited over a body the CPU
+// had lit, and this path keeps a hardware-lit base pass underneath, so an additive layer at full
+// alpha reads hotter here than it did there. Set -reflectamount 1 for the literal original.
+static mem::cmd_param PARAM_reflect_amount {"reflectamount", "Vehicle sphere-map reflection strength"};
+static mem::cmd_param PARAM_reflect_fresnel_bias {"reflectfresnelbias", "Vehicle reflection fresnel bias"};
+static mem::cmd_param PARAM_reflect_fresnel_scale {"reflectfresnelscale", "Vehicle reflection fresnel scale"};
+static mem::cmd_param PARAM_reflect_specular {"reflectspecular", "Vehicle reflection sun-glint strength"};
+
+// See the note in DrawLit. Traffic and opponent cars never reach DrawLitSph, so without this they
+// get no chrome at all; the cost of covering them is that anything else dynamically lit and drawn
+// through DrawLit picks it up too. -trafficrefl 0 turns it off.
+static mem::cmd_param PARAM_traffic_reflect {"trafficrefl", "Sphere-map reflections on AI and traffic vehicles"};
+
+// The city's shared vehicle sphere map, published once per frame by mmCullCity::Cull().
+//
+// Both vehicle draw paths read the same texture out of mmCullCity - mmCarModel::Draw passes it to
+// DrawLitSph, aiVehicleInstance::Draw passes it to SphereMap - but agiworld deliberately does not
+// depend on mmcity, so mmcity pushes it down here instead of this reaching up for it.
+agiTexDef* agiNativeCitySphereMap = nullptr;
+
+u32 agiReflectDraws = 0;
+u32 agiReflectSkipNoNormals = 0;
+
+void agiResetReflectStats()
+{
+    agiReflectDraws = 0;
+    agiReflectSkipNoNormals = 0;
+}
+
 b32 agiMeshSet::DrawLit(agiMeshLighter lighter, u32 flags, u32* colors)
 {
     if (!lighter)
@@ -1041,6 +1074,31 @@ b32 agiMeshSet::DrawLit(agiMeshLighter lighter, u32 flags, u32* colors)
         // no-op that never asks for the data and so never becomes drawable.
         bool native_drawn = false;
 
+        // Chrome for the vehicles that never reach DrawLitSph.
+        //
+        // There are two vehicle draw paths and they do not agree. mmCarModel::Draw (the player, and
+        // the showroom via mmVehicleForm::Cull) calls DrawLitSph, which sets the two globals below
+        // for us. aiVehicleInstance::Draw - traffic, opponents, police, every other car in the city
+        // - does not: it calls DrawLit and then SphereMap directly (game.asm:98860), and we suppress
+        // that SphereMap call just below. So wiring the replacement to DrawLitSph alone covered the
+        // player's car and left every other car on the road matte.
+        //
+        // The condition here is as close to the assembly's as this layer can see. It cannot check
+        // the assembly's `lod == 3` guard, so distant LODs get chrome too, which is harmless and
+        // arguably better. What it cannot rule out is a non-vehicle mesh that is dynamically lit and
+        // drawn through DrawLit picking it up as well - hence the switch.
+        const bool traffic_reflect = PARAM_traffic_reflect.get_or(true) && !IsStaticCityLighter(lighter) &&
+            agiRQ.SphMap && !agiNativeReflectionTex && agiNativeCitySphereMap;
+
+        const f32 saved_reflectivity = agiNativeReflectivity;
+        agiTexDef* const saved_reflection_tex = agiNativeReflectionTex;
+
+        if (traffic_reflect)
+        {
+            agiNativeReflectivity = 1.0f;
+            agiNativeReflectionTex = agiNativeCitySphereMap;
+        }
+
         if (LockIfResident())
         {
             native_drawn = DrawNativeTransform(flags, IsStaticCityLighter(lighter), nullptr, colors);
@@ -1051,6 +1109,9 @@ b32 agiMeshSet::DrawLit(agiMeshLighter lighter, u32 flags, u32* colors)
         {
             PageIn();
         }
+
+        agiNativeReflectivity = saved_reflectivity;
+        agiNativeReflectionTex = saved_reflection_tex;
 
         // DrawLit() carries an implicit contract with closed ARTS_IMPORT callers that run a second
         // pass over the same mesh afterwards: it leaves the CPU Geometry() scratch state
@@ -1076,11 +1137,10 @@ b32 agiMeshSet::DrawLit(agiMeshLighter lighter, u32 flags, u32* colors)
         // already applies deliberately for the same reason.
         //
         // The overlay is a CPU-pretransformed pass and so invisible to RTX Remix anyway, while the
-        // vehicle body underneath goes out in world space, which is what Remix needs. The native
-        // replacement now exists and has run already: DrawNativeTransform assembles an
-        // agiNativeMaterialFx from agiNativeReflectivity/agiNativeReflectionTex and MeshWorld draws
-        // the sphere map as a world-space second pass. So this still suppresses the assembly
-        // overlay - what it suppresses is a duplicate, not the only copy.
+        // vehicle body underneath goes out in world space, which is what Remix needs. With
+        // traffic_reflect above, the replacement has already run as part of the draw - so what this
+        // suppresses is a duplicate rather than the only copy. With -trafficrefl 0 it is once again
+        // dropping the overlay outright, which is the older, matte behaviour.
         if (native_drawn && agiRQ.SphMap)
             return false;
 
@@ -1568,6 +1628,15 @@ i32 agiMeshSet::Geometry(u32 flags, Vector3* verts, Vector4* planes)
 // the shallow angles that make up a curved panel.
 static mem::cmd_param PARAM_smooth_normals {"smoothnormals", "Rebuild smooth vertex normals for the hardware path"};
 
+// -flatnormals. See the long note at its use in DrawNativeTransform.
+static mem::cmd_param PARAM_flat_normals {"flatnormals", "Shade from facet geometry, ignoring stored vertex normals"};
+
+// Flat shading emits up to four unshared vertices per facet instead of one per adjunct, and those
+// live on the stack alongside everything else DrawNativeTransform allocates there. 8192 vertices is
+// ~288 KB, which is affordable against the 1 MB stack; a mesh dense enough to exceed it keeps its
+// stored normals rather than risking an overflow deep in the draw chain.
+inline constexpr u32 kFlatVertexCap = 8192;
+
 u32 agiMeshNormalDraws = 0;
 u32 agiMeshNormalDrawsFlat = 0;
 u32 agiMeshNormalTris = 0;
@@ -1580,18 +1649,6 @@ void agiResetMeshNormalStats()
     agiMeshNormalTris = 0;
     agiMeshNormalTrisFlat = 0;
 }
-
-// Vehicle chrome strength, and the two embellishment terms the original SphereMap pass does not
-// have. cmd_params because chrome is the kind of thing that is judged by eye, and a rebuild of this
-// project is a CI round trip.
-//
-// 0.35 rather than the original's literal full strength: SphereMap composited over a body the CPU
-// had lit, and this path keeps a hardware-lit base pass underneath, so an additive layer at full
-// alpha reads hotter here than it did there. Set -reflectamount 1 for the literal original.
-static mem::cmd_param PARAM_reflect_amount {"reflectamount", "Vehicle sphere-map reflection strength"};
-static mem::cmd_param PARAM_reflect_fresnel_bias {"reflectfresnelbias", "Vehicle reflection fresnel bias"};
-static mem::cmd_param PARAM_reflect_fresnel_scale {"reflectfresnelscale", "Vehicle reflection fresnel scale"};
-static mem::cmd_param PARAM_reflect_specular {"reflectspecular", "Vehicle reflection sun-glint strength"};
 
 static void SmoothAdjunctNormals(Vector3* ARTS_RESTRICT out_normals, const u16* ARTS_RESTRICT vertex_indices,
     const u8* ARTS_RESTRICT normals, u32 adjunct_count, Vector3* ARTS_RESTRICT accum, u32 vertex_count)
@@ -1705,10 +1762,6 @@ b32 agiMeshSet::DrawNativeTransform(
     // module-level array sized once for the worst case, or the dynamic D3D9 vertex/index buffers
     // proposed in docs/dx9_rendering_pathways.md - not std::vector.
     //
-    // One vertex per adjunct (SurfaceIndices entries are adjunct indices, so they index this
-    // array directly - no remapping needed).
-    agiWorldVtx* verts = ARTS_ALLOCA(agiWorldVtx, AdjunctCount);
-
     const agiViewParameters& view_params = ViewParams();
 
     // Meshes loaded without MESH_SET_NORMAL have no normals at all (mmInstance::InitMeshes only
@@ -1722,26 +1775,125 @@ b32 agiMeshSet::DrawNativeTransform(
 
     const u32* src_colors = base_colors ? base_colors : Colors;
 
-    // Smoothed normals, when the mesh has any and is small enough to do it on the stack. See
-    // SmoothAdjunctNormals - this is what stops low-poly bodywork looking flat-shaded regardless of
-    // how the lighting is evaluated.
-    Vector3* smooth_normals = nullptr;
+    // -flatnormals. Throw away the mesh's per-vertex normals and shade from the geometry instead.
+    //
+    // The stored normals are the least trustworthy thing in a .bms. They are 8-bit indices into a
+    // 198-entry table (agiworld/packnorm.h), so they are coarse to begin with, and they are stored
+    // per ADJUNCT while the positions are per VERTEX - so a model with coincident or otherwise
+    // stray vertices can carry a normal that points nowhere near the surface it is attached to.
+    // SmoothAdjunctNormals makes that worse rather than better where it fires, because it averages
+    // across every adjunct sharing a vertex position: two surfaces that merely happen to touch get
+    // blended into each other, which is the "wrongly shaded in some areas" look on city geometry.
+    //
+    // Flat mode sidesteps the stored normals entirely. Each facet gets the true normal of its own
+    // plane, computed from its own corner positions, and its corners are emitted as UNSHARED
+    // vertices so no facet can contaminate its neighbour. Nothing about the result depends on the
+    // vertex data being sane - only on the triangle having area.
+    //
+    // The sign still comes from the stored normals, deliberately: a cross product only defines the
+    // plane, not which side is outward, and the winding convention here is not something to bet on
+    // (see the long note in agidx9's MeshWorld about exactly that). Agreeing with the average of the
+    // facet's own stored normals keeps the artist's intended facing while replacing the direction,
+    // and a stray normal cannot flip the result because the vote is over the whole facet.
+    //
+    // Off by default. It is a real change in look - genuinely faceted, no smooth shading anywhere -
+    // and on well-formed meshes the stored normals are better.
+    const u32 flat_capacity = SurfaceCount * 4;
 
-    if (has_normals && PARAM_smooth_normals.get_or(true) && (VertexCount <= 4096) && (AdjunctCount <= 4096))
+    const bool flat_shading = has_normals && hardware_lighting && PARAM_flat_normals.get_or(false) &&
+        (flat_capacity <= kFlatVertexCap) && (SurfaceCount > 0);
+
+    // Flat mode needs one vertex per facet corner rather than one per adjunct, and both bounds are
+    // stack allocations for the reason documented above.
+    agiWorldVtx* verts = ARTS_ALLOCA(agiWorldVtx, flat_shading ? flat_capacity : AdjunctCount);
+
+    u16* facet_base = nullptr;
+    u32 flat_vertex_count = 0;
+
+    if (flat_shading)
     {
-        smooth_normals = ARTS_ALLOCA(Vector3, AdjunctCount);
-        Vector3* accum = ARTS_ALLOCA(Vector3, VertexCount);
+        facet_base = ARTS_ALLOCA(u16, SurfaceCount);
 
-        SmoothAdjunctNormals(smooth_normals, VertexIndices, Normals, AdjunctCount, accum, VertexCount);
+        // Walks the same firstFacet/nextFacet chains the index loop below walks, so a facet the
+        // backface pass rejected costs nothing here either.
+        for (u32 texture = 0; texture <= TextureCount; ++texture)
+        {
+            for (i16 facet = firstFacet[texture]; facet != -1; facet = nextFacet[facet])
+            {
+                const u16* ARTS_RESTRICT surface = &SurfaceIndices[facet * 4];
+                const u32 corners = surface[3] ? 4u : 3u;
+
+                facet_base[facet] = static_cast<u16>(flat_vertex_count);
+
+                Vector3 reference {};
+
+                for (u32 k = 0; k < corners; ++k)
+                    reference = reference + UnpackNormal[Normals[surface[k]]];
+
+                const Vector3& p0 = Vertices[VertexIndices[surface[0]]];
+                const Vector3& p1 = Vertices[VertexIndices[surface[1]]];
+                const Vector3& p2 = Vertices[VertexIndices[surface[2]]];
+
+                Vector3 face_normal;
+                face_normal.Cross(p1 - p0, p2 - p0);
+
+                if (f32 mag2 = face_normal.Mag2(); mag2 > 1.0e-12f)
+                {
+                    face_normal = face_normal * (1.0f / std::sqrt(mag2));
+
+                    if ((face_normal ^ reference) < 0.0f)
+                        face_normal = -face_normal;
+                }
+                else if (f32 ref_mag2 = reference.Mag2(); ref_mag2 > 1.0e-12f)
+                {
+                    // Degenerate facet - zero area, so it has no plane of its own. It will not
+                    // rasterise anything either, but it still needs a finite normal.
+                    face_normal = reference * (1.0f / std::sqrt(ref_mag2));
+                }
+                else
+                {
+                    face_normal = filler_normal;
+                }
+
+                for (u32 k = 0; k < corners; ++k)
+                {
+                    const u16 a = surface[k];
+
+                    agiWorldVtx& vertex = verts[flat_vertex_count++];
+
+                    vertex.pos = Vertices[VertexIndices[a]];
+                    vertex.normal = face_normal;
+                    vertex.color = src_colors ? src_colors[a] : 0xFFFFFFFF;
+                    vertex.tu = TexCoords ? TexCoords[a].x : 0.0f;
+                    vertex.tv = TexCoords ? TexCoords[a].y : 0.0f;
+                }
+            }
+        }
     }
-
-    for (u32 a = 0; a < AdjunctCount; ++a)
+    else
     {
-        verts[a].pos = Vertices[VertexIndices[a]];
-        verts[a].normal = has_normals ? (smooth_normals ? smooth_normals[a] : UnpackNormal[Normals[a]]) : filler_normal;
-        verts[a].color = src_colors ? src_colors[a] : 0xFFFFFFFF;
-        verts[a].tu = TexCoords ? TexCoords[a].x : 0.0f;
-        verts[a].tv = TexCoords ? TexCoords[a].y : 0.0f;
+        // Smoothed normals, when the mesh has any and is small enough to do it on the stack. See
+        // SmoothAdjunctNormals - this is what stops low-poly bodywork looking flat-shaded regardless
+        // of how the lighting is evaluated.
+        Vector3* smooth_normals = nullptr;
+
+        if (has_normals && PARAM_smooth_normals.get_or(true) && (VertexCount <= 4096) && (AdjunctCount <= 4096))
+        {
+            smooth_normals = ARTS_ALLOCA(Vector3, AdjunctCount);
+            Vector3* accum = ARTS_ALLOCA(Vector3, VertexCount);
+
+            SmoothAdjunctNormals(smooth_normals, VertexIndices, Normals, AdjunctCount, accum, VertexCount);
+        }
+
+        for (u32 a = 0; a < AdjunctCount; ++a)
+        {
+            verts[a].pos = Vertices[VertexIndices[a]];
+            verts[a].normal =
+                has_normals ? (smooth_normals ? smooth_normals[a] : UnpackNormal[Normals[a]]) : filler_normal;
+            verts[a].color = src_colors ? src_colors[a] : 0xFFFFFFFF;
+            verts[a].tu = TexCoords ? TexCoords[a].x : 0.0f;
+            verts[a].tv = TexCoords ? TexCoords[a].y : 0.0f;
+        }
     }
 
     u16* indices = ARTS_ALLOCA(u16, max_indices);
@@ -1757,8 +1909,19 @@ b32 agiMeshSet::DrawNativeTransform(
     agiNativeMaterialFx native_fx {};
     const agiNativeMaterialFx* effective_fx = fx;
 
-    if (!effective_fx && has_normals && agiNativeReflectionTex && (agiNativeReflectivity > 0.0f))
+    // Diagnostics. "Offered" counts draws that arrived with a sphere map selected, so
+    // offered == 0 means no caller is asking for chrome at all and the problem is upstream of here;
+    // offered > 0 with drawn == 0 means it is being asked for and refused, and the reason is the
+    // missing-normals count next to it.
+    const bool reflect_offered = !effective_fx && agiNativeReflectionTex && (agiNativeReflectivity > 0.0f);
+
+    if (reflect_offered && !has_normals)
+        ++agiReflectSkipNoNormals;
+
+    if (reflect_offered && has_normals)
     {
+        ++agiReflectDraws;
+
         native_fx.ReflectionTexture = agiNativeReflectionTex;
         native_fx.ReflectionAmount = agiNativeReflectivity * PARAM_reflect_amount.get_or(0.35f);
         native_fx.FresnelBias = PARAM_reflect_fresnel_bias.get_or(1.0f);
@@ -1782,21 +1945,32 @@ b32 agiMeshSet::DrawNativeTransform(
         {
             const u16* ARTS_RESTRICT surface = &SurfaceIndices[facet * 4];
 
+            // Flat mode emitted this facet's corners as its own unshared run of vertices, in
+            // corner order, so corner k is at facet_base[facet] + k. Otherwise the adjunct index
+            // in SurfaceIndices is already the vertex index.
+            const u16 base = flat_shading ? facet_base[facet] : u16 {0};
+
+            const u16 c0 = flat_shading ? static_cast<u16>(base + 0) : surface[0];
+            const u16 c1 = flat_shading ? static_cast<u16>(base + 1) : surface[1];
+            const u16 c2 = flat_shading ? static_cast<u16>(base + 2) : surface[2];
+
             if (surface[3])
             {
+                const u16 c3 = flat_shading ? static_cast<u16>(base + 3) : surface[3];
+
                 // Matches the diagonal split ClipTri uses for quads elsewhere in this file.
-                indices[index_count++] = surface[1];
-                indices[index_count++] = surface[2];
-                indices[index_count++] = surface[3];
-                indices[index_count++] = surface[1];
-                indices[index_count++] = surface[3];
-                indices[index_count++] = surface[0];
+                indices[index_count++] = c1;
+                indices[index_count++] = c2;
+                indices[index_count++] = c3;
+                indices[index_count++] = c1;
+                indices[index_count++] = c3;
+                indices[index_count++] = c0;
             }
             else
             {
-                indices[index_count++] = surface[0];
-                indices[index_count++] = surface[1];
-                indices[index_count++] = surface[2];
+                indices[index_count++] = c0;
+                indices[index_count++] = c1;
+                indices[index_count++] = c2;
             }
         }
 
@@ -1807,7 +1981,9 @@ b32 agiMeshSet::DrawNativeTransform(
 
         auto old_texture = agiCurState.SetTexture(tex_def);
 
-        if (RAST->MeshWorld(verts, static_cast<i32>(AdjunctCount), indices, static_cast<i32>(index_count),
+        const u32 vertex_count = flat_shading ? flat_vertex_count : AdjunctCount;
+
+        if (RAST->MeshWorld(verts, static_cast<i32>(vertex_count), indices, static_cast<i32>(index_count),
                 view_params.World, view_params.View, view_params, static_lighting, effective_fx, hardware_lighting))
         {
             drawn = true;
