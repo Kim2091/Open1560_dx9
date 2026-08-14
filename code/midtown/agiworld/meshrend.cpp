@@ -1020,8 +1020,8 @@ static mem::cmd_param PARAM_reflect_fresnel_scale {"reflectfresnelscale", "Vehic
 static mem::cmd_param PARAM_reflect_specular {"reflectspecular", "Vehicle reflection sun-glint strength"};
 
 // See the note in DrawLit. Traffic and opponent cars never reach DrawLitSph, so without this they
-// get no chrome at all; the cost of covering them is that anything else dynamically lit and drawn
-// through DrawLit picks it up too. -trafficrefl 0 turns it off.
+// get no chrome at all - but this layer cannot tell a car from a building, so switching it on
+// chromes both. Opt-in until there is a hook that can see the caller.
 static mem::cmd_param PARAM_traffic_reflect {"trafficrefl", "Sphere-map reflections on AI and traffic vehicles"};
 
 // The city's shared vehicle sphere map, published once per frame by mmCullCity::Cull().
@@ -1083,12 +1083,27 @@ b32 agiMeshSet::DrawLit(agiMeshLighter lighter, u32 flags, u32* colors)
         // that SphereMap call just below. So wiring the replacement to DrawLitSph alone covered the
         // player's car and left every other car on the road matte.
         //
-        // The condition here is as close to the assembly's as this layer can see. It cannot check
-        // the assembly's `lod == 3` guard, so distant LODs get chrome too, which is harmless and
-        // arguably better. What it cannot rule out is a non-vehicle mesh that is dynamically lit and
-        // drawn through DrawLit picking it up as well - hence the switch.
-        const bool traffic_reflect = PARAM_traffic_reflect.get_or(true) && !IsStaticCityLighter(lighter) &&
-            agiRQ.SphMap && !agiNativeReflectionTex && agiNativeCitySphereMap;
+        // DEFAULT OFF, and the reason is a correction to an earlier attempt at this.
+        //
+        // That attempt gated on `!IsStaticCityLighter(lighter)`, reasoning that vehicles are lit by
+        // the dynamic rig and city geometry by the static one. They are not different rigs.
+        // fix_lighting (mmcity/cullcity.cpp) assigns mmInstance::StaticLighter AND
+        // mmInstance::DynamicLighter from the same pair of functions - both are agiMeshLighterTriple
+        // or agiMeshLighterQuarter at every light quality - so IsStaticCityLighter() is true for a
+        // car body exactly as it is for a building facade. The gate could never pass, and the
+        // traffic chrome it was supposed to enable never ran once.
+        //
+        // With that condition gone there is nothing left at this layer that separates a vehicle from
+        // any other lit mesh drawn through DrawLit: the assembly distinguishes them by the `lod == 3`
+        // test at its own call site (game.asm:98860), which is not visible from here. So turning
+        // this on puts sphere-map chrome on building facades too. That is why it is opt-in now
+        // rather than on by default - a wrong default here is a whole-city visual regression.
+        //
+        // Doing this properly needs a hook that can see the caller, not a better guess at this
+        // layer. Reimplementing agiMeshSet::SphereMap is the obvious candidate: the assembly calls
+        // it with the right mesh at the right moment, and it is the one place that knows.
+        const bool traffic_reflect =
+            PARAM_traffic_reflect.get_or(false) && agiRQ.SphMap && !agiNativeReflectionTex && agiNativeCitySphereMap;
 
         const f32 saved_reflectivity = agiNativeReflectivity;
         agiTexDef* const saved_reflection_tex = agiNativeReflectionTex;

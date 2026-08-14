@@ -151,15 +151,21 @@ i32 agiDX9Pipeline::BeginGfx()
         per_pixel_.Init(dx9_context_->GetDevice());
     }
 
-    // The per-pixel passes and the env/sphere-map second passes both bind a second texture, and
-    // agiTexSorter gates its own multi-texture path on this too. Pinned to 1 historically because
-    // nothing could use more.
-    if (per_pixel_.IsValid())
-    {
-        // agiRendStateStruct::MaxTextures is an i8, so the narrowing is explicit - the value is 1 or
-        // 2 and cannot overflow, but /W4 /WX rejects the implicit conversion.
-        agiCurState.SetMaxTextures(static_cast<i8>(std::min<u32>(dx9_context_->GetMaxSimultaneousTextures(), 2u)));
-    }
+    // MaxTextures STAYS AT 1, even though the per-pixel passes bind two textures.
+    //
+    // Raising it looks harmless and is not: agiCurState::MaxTextures is not a statement about what
+    // this backend can bind, it is a switch that changes the engine's own vertex layout. At > 1
+    // agiPolySet::Init (agiworld/texsort.cpp) allocates agiScreenVtx2, which is 0x28 bytes against
+    // agiScreenVtx's 0x20, while agiDX9Rasterizer::DrawMesh still submits with sizeof(agiScreenVtx)
+    // as the stride - so every vertex after the first is read at the wrong offset and the whole
+    // screen path renders progressively skewed. It also makes DrawLitEnv's MultiTexEnvMap branch
+    // reachable for the first time, routing ground and road geometry into a CPU pretransform path
+    // that had been dead code.
+    //
+    // Nothing here needs it. The per-pixel passes and the sphere/env second passes call SetTexture
+    // and program their stage ops directly, and never consult GetMaxTextures(). Raising it is
+    // A3's problem (the fixed-function env/sphere texgen described in the design doc), and A3 will
+    // have to deal with agiScreenVtx2 before it can.
 
     InitScaling();
 
