@@ -1646,6 +1646,36 @@ static mem::cmd_param PARAM_smooth_normals {"smoothnormals", "Rebuild smooth ver
 // -flatnormals. See the long note at its use in DrawNativeTransform.
 static mem::cmd_param PARAM_flat_normals {"flatnormals", "Shade from facet geometry, ignoring stored vertex normals"};
 
+// -nocull. Every form of culling this codebase can reach, off at once.
+//
+// For an RTX Remix capture the useful frame is the one containing the most geometry, not the one
+// that renders fastest: anything culled is absent from the capture and cannot be replaced, and a
+// path tracer wants closed shells and far geometry that a rasteriser is happy to throw away. This
+// switch is deliberately expensive and is not a play setting.
+//
+// What it reaches, and what it does not:
+//   * backface culling      - D3DCULL_NONE on both submission paths (agidx9/dx9rsys.cpp)
+//   * LOD switching         - mmInstance::LodTable and StaticTerrainLodTable pushed out of range,
+//                             so everything draws at its highest detail level
+//   * distance culling      - ObjectMaxDist, BuildingMaxDist, LightDistances, agiRQ.FarClip
+//   * portal/cell visibility - NOT reachable. asRenderWeb::Cull and mmCellRenderer::Cull are both
+//                             ARTS_IMPORT (closed assembly), so the room-to-room traversal that
+//                             decides which cells are considered at all cannot be disabled from
+//                             here. Everything the traversal does hand down is now drawn.
+//
+// Queried through a function rather than the parameter directly because mmcity and agidx9 both need
+// it and neither may own it - a second cmd_param with the same name would register twice.
+static mem::cmd_param PARAM_no_cull {"nocull", "Disable backface, LOD and distance culling (for RTX Remix captures)"};
+
+bool agiNoCullEnabled()
+{
+    // Resolved once. cmd_param::init() has walked argv long before any draw, and re-reading it per
+    // facet would put a string lookup in the inner loop.
+    static const bool enabled = PARAM_no_cull.get_or(false);
+
+    return enabled;
+}
+
 // -nativecpucull. Restores the camera-dependent CPU backface cull that DrawNativeTransform used to
 // apply. Off by default, because it is the single largest source of RTX Remix geometry-hash churn -
 // see the long note at the facet-order build in DrawNativeTransform for what it was doing and why
@@ -1998,11 +2028,25 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
             SmoothAdjunctNormals(smooth_normals, VertexIndices, Normals, AdjunctCount, accum, VertexCount);
         }
 
+        // See agiNativeRigidGroup::NormalUnpose. Hoisted out of the loop because it is null for
+        // every caller but the skinned-model one.
+        const Matrix34* unpose = rigid ? rigid->NormalUnpose : nullptr;
+
         for (u32 a = 0; a < AdjunctCount; ++a)
         {
             verts[a].pos = Vertices[VertexIndices[a]];
-            verts[a].normal =
+
+            Vector3 normal =
                 has_normals ? (smooth_normals ? smooth_normals[a] : UnpackNormal[Normals[a]]) : filler_normal;
+
+            if (unpose)
+            {
+                Vector3 unposed;
+                unposed.Dot3x3(normal, *unpose);
+                normal = unposed;
+            }
+
+            verts[a].normal = normal;
             verts[a].color = src_colors ? src_colors[a] : 0xFFFFFFFF;
             verts[a].tu = TexCoords ? TexCoords[a].x : 0.0f;
             verts[a].tv = TexCoords ? TexCoords[a].y : 0.0f;

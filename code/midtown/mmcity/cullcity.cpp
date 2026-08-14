@@ -20,6 +20,8 @@ define_dummy_symbol(mmcity_cullcity);
 
 #include "cullcity.h"
 
+#include "cellrend.h"
+
 #include "agi/dlptmpl.h"
 #include "agi/getdlp.h"
 #include "agi/pipeline.h"
@@ -187,6 +189,10 @@ static agiMeshCardVertex RainMeshCard[4] {
 
 void mmCullCity::Init(char* name, asCamera* camera)
 {
+    // -nocull. Here rather than earlier because AutoDetect (mmui/graphics.cpp) writes agiRQ.FarClip
+    // when the renderer is chosen, so anything set before this point is overwritten.
+    mmApplyNoCullDistances();
+
     IsSnowing = MMSTATE.Weather == mmWeather::Snow;
     CityName = name;
 

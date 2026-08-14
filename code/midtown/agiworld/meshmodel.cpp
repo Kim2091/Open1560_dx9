@@ -199,17 +199,19 @@ i32 agiMeshModel::ModelDrawLit(agiMeshLighter lighter, u32 flags, agiLitAnimatio
     // in every frame and every pose. That is the whole difference between a pedestrian Remix can
     // replace and one it sees as a new mesh sixty times a second.
     //
-    // Normals come from the mesh's own bind-pose set, deliberately, not from the animation's
-    // per-frame set. anim->Frames[frame] holds normals already posed for this frame; feeding those
-    // to a draw whose world matrix also carries the bone would rotate them twice. Fixed-function
-    // D3D9 transforms normals by the world matrix, so a bind-pose normal comes out posed for free -
-    // and D3DRS_NORMALIZENORMALS is already on for world draws (see MeshWorld).
+    // The first version of this required the mesh's own bind-pose Normals to be present and used
+    // them directly. That was wrong twice over, and it is why the first attempt changed nothing that
+    // could be seen: mmInstance::InitMeshes only asks for MESH_SET_NORMAL on COLLIDER and MOVER
+    // instances, so a pedestrian generally arrives with Normals NULL - which is the whole reason
+    // agiLitAnimation carries a per-frame normal set in the first place. The guard therefore failed
+    // for every pedestrian in the game and the rigid path was never entered once. Silent, and
+    // indistinguishable from the fix not working.
     //
-    // Requires those bind-pose normals to exist. When they do not, the animation's set is the only
-    // normal data there is and it only makes sense on CPU-skinned geometry, so that case takes the
-    // skinning path below.
-    if (Pipe()->SupportsNativeTransform() && CanSkinModel(this) && agiNativePathEnabled(NATIVE_DRAWMODEL) && Normals &&
-        !PARAM_ped_skin.get_or(false) && ModelFacetsAreGroupCoherent(this))
+    // The animation's normals are used instead, with the bone's rotation divided back out of them
+    // (see agiNativeRigidGroup::NormalUnpose). They are stored already posed for the frame, and the
+    // world matrix here carries the same bone, so submitting them untouched would rotate them twice.
+    if (Pipe()->SupportsNativeTransform() && CanSkinModel(this) && agiNativePathEnabled(NATIVE_DRAWMODEL) &&
+        frame_normals && !PARAM_ped_skin.get_or(false) && ModelFacetsAreGroupCoherent(this))
     {
         Skeleton.Pose(animation->Poses[frame]);
         Skeleton.Transform(nullptr);
@@ -217,6 +219,11 @@ i32 agiMeshModel::ModelDrawLit(agiMeshLighter lighter, u32 flags, agiLitAnimatio
         const agiViewParameters& view_params = ViewParams();
         const Matrix34* bones = Skeleton.BoneMatrices;
         const u8* run_lengths = SkinGroupVerts;
+
+        // The animation's per-frame set, for the duration - restored below exactly as the skinned
+        // path does. Without this the mesh reports no normals at all and every pedestrian submits
+        // unlit.
+        Normals = frame_normals;
 
         u32 first_vertex = 0;
         b32 any_drawn = false;
@@ -230,7 +237,17 @@ i32 agiMeshModel::ModelDrawLit(agiMeshLighter lighter, u32 flags, agiLitAnimatio
             Matrix34 group_world;
             group_world.Dot(bones[group], view_params.World);
 
+            // Transpose of the bone's 3x3, which for a rigid transform is its inverse rotation.
+            // Applied to the animation's already-posed normals so the world matrix's own copy of
+            // the bone does not rotate them a second time.
+            Matrix34 normal_unpose;
+            normal_unpose.m0 = {bones[group].m0.x, bones[group].m1.x, bones[group].m2.x};
+            normal_unpose.m1 = {bones[group].m0.y, bones[group].m1.y, bones[group].m2.y};
+            normal_unpose.m2 = {bones[group].m0.z, bones[group].m1.z, bones[group].m2.z};
+            normal_unpose.m3 = {0.0f, 0.0f, 0.0f};
+
             rigid.World = &group_world;
+            rigid.NormalUnpose = &normal_unpose;
             rigid.FirstVertex = first_vertex;
             rigid.EndVertex = first_vertex + run_lengths[group];
 
@@ -241,6 +258,8 @@ i32 agiMeshModel::ModelDrawLit(agiMeshLighter lighter, u32 flags, agiLitAnimatio
             any_drawn |= DrawNativeTransform(flags, /*static_lighting=*/false, nullptr, base_colors,
                 /*unlit=*/false, &rigid);
         }
+
+        Normals = saved_normals;
 
         if (any_drawn)
             return 1;

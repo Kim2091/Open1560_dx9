@@ -71,6 +71,11 @@ ARTS_IMPORT extern i32 CellTypeCount[3];
 // ?EnableSlide@@3HA
 ARTS_IMPORT extern b32 EnableSlide;
 
+// -nocull: push every LOD and distance threshold out of reach so nothing is dropped or simplified
+// by range. No-op unless the switch is set. Called once from mmCullCity::Init, after AutoDetect has
+// had its say about FarClip - doing it earlier would just be overwritten.
+void mmApplyNoCullDistances();
+
 // ?ObjectMaxDist@@3MA
 ARTS_EXPORT extern f32 ObjectMaxDist;
 

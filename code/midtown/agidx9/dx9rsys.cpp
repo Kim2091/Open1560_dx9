@@ -22,12 +22,14 @@
 #include "agi/light.h"
 #include "agi/mtldef.h"
 #include "agi/pipeline.h"
+#include "agi/rsys.h"
 #include "agi/texdef.h"
 #include "agi/viewport.h"
 #include "agirend/lighter.h"
 #include "agiworld/glowlight.h"
 #include "agiworld/meshlight.h"
 #include "agiworld/meshset.h"
+#include "agiworld/quality.h"
 #include "agiworld/texsheet.h" // agiTexProp::AlphaGlow
 #include "data7/utimer.h"
 #include "eventq7/active.h"
@@ -105,6 +107,25 @@ static mem::cmd_param PARAM_ghashcolor {"ghashcolor", "Tint world draws by RTX R
 // earns its keep when capturing for Remix.
 static mem::cmd_param PARAM_d3d9_nofx {
     "d3d9nofx", "Skip the reflection and ground-env second passes (they duplicate geometry for RTX Remix)"};
+
+// -aniso: anisotropic texture filtering.
+//
+// MM1 is a game viewed almost entirely at grazing angles - the road surface fills the lower half of
+// every frame and runs to the horizon - which is precisely the case trilinear filtering handles
+// worst. Mip selection there is driven by the larger of the two screen-space derivatives, so a
+// surface compressed hard along one axis and barely at all along the other gets a mip chosen for the
+// compressed axis and blurs away detail the other axis still had. That is the smeared, low-contrast
+// asphalt this engine has always had at distance, and it is a filtering artifact rather than a
+// texture-resolution one.
+//
+// Default 16, clamped to what the device reports. This is free on any GPU that can run the Remix
+// bridge, and there is no version of this project's target hardware where it is not.
+//
+// Off with -aniso 1. The level is resolved once at BeginGfx rather than per bind, because
+// D3DCAPS9::MaxAnisotropy needs a device and the answer cannot change while one exists.
+static mem::cmd_param PARAM_aniso {"aniso", "Anisotropic filtering level (1 = off, default 16, clamped to device max)"};
+
+static DWORD g_MaxAnisotropy = 1;
 
 // Escape hatch for the projection reset in RestoreStateAfterWorldDraw - see the long note there.
 // Off by default: resetting it is what stops RTX Remix path tracing the moment the frame's first
@@ -433,6 +454,36 @@ i32 agiDX9Rasterizer::BeginGfx()
     device->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
     device->SetRenderState(D3DRS_DITHERENABLE, TRUE);
 
+    // Anisotropy. Programmed once here rather than at every texture bind: D3DSAMP_MAXANISOTROPY is
+    // sampler state, not texture state, and the value never changes for the life of the device -
+    // only whether a given bind SELECTS D3DTEXF_ANISOTROPIC does, and that is ApplyTexFilters' job.
+    g_MaxAnisotropy = 1;
+
+    D3DCAPS9 caps {};
+
+    if (SUCCEEDED(device->GetDeviceCaps(&caps)))
+    {
+        // Both halves are required and they are separate caps bits. A device can report a
+        // MaxAnisotropy above 1 and still not support the minification filter that uses it, and
+        // asking for a filter the device does not have makes the draw fail rather than degrade.
+        const bool supported = (caps.TextureFilterCaps & D3DPTFILTERCAPS_MINFANISOTROPIC) != 0;
+
+        if (supported && (caps.MaxAnisotropy > 1))
+        {
+            const DWORD wanted = static_cast<DWORD>(std::max(1, PARAM_aniso.get_or(16)));
+
+            g_MaxAnisotropy = std::min(wanted, caps.MaxAnisotropy);
+        }
+    }
+
+    if (g_MaxAnisotropy > 1)
+    {
+        for (DWORD stage = 0; stage < 8; ++stage)
+            device->SetSamplerState(stage, D3DSAMP_MAXANISOTROPY, g_MaxAnisotropy);
+
+        Displayf("DX9: anisotropic filtering %ux (device max %u)", g_MaxAnisotropy, caps.MaxAnisotropy);
+    }
+
     current_texture_ = nullptr;
     tex_env_ = agiTexEnv::Disable;
 
@@ -604,6 +655,13 @@ static void ApplyTexFilters(agiDX9TexDef* texture, agiTexFilter tex_filter)
             mip_filter = D3DTEXF_POINT;
             break;
     }
+
+    // Anisotropy replaces the MINIFICATION filter only, which is the whole point: magnification is
+    // a surface closer than one texel per pixel, where there is no anisotropy to resolve and the
+    // extra taps buy nothing. Point-filtered textures are left alone entirely - that mode exists to
+    // be exact, and this engine uses it for content that is meant to look like it did in 1999.
+    if ((g_MaxAnisotropy > 1) && (min_filter == D3DTEXF_LINEAR))
+        min_filter = D3DTEXF_ANISOTROPIC;
 
     texture->SetFilters(min_filter, mag_filter, mip_filter);
 }
@@ -856,7 +914,7 @@ void agiDX9Rasterizer::FlushState()
         // Our vertices are already in D3D9 screen space (D3DFVF_XYZRHW), so no winding
         // flip is needed here (unlike the OpenGL backend, which has to compensate for
         // OpenGL's opposite screen-space Y axis).
-        device->SetRenderState(D3DRS_CULLMODE, ToD3DCull(cull_mode));
+        device->SetRenderState(D3DRS_CULLMODE, agiNoCullEnabled() ? D3DCULL_NONE : ToD3DCull(cull_mode));
         ++STATS.StateChangeCalls;
     }
 
@@ -1285,8 +1343,35 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
 
     i32 primitive_count = (prim_type == D3DPT_LINELIST) ? (index_count / 2) : (index_count / 3);
 
+    // -ghashcolor marks in-scene CPU-pretransformed geometry FLAT MAGENTA.
+    //
+    // The debug view's whole premise is "a stable mesh holds one colour", and a surface that is
+    // still on this path takes no tint at all - it cannot, because the tint is applied in
+    // MeshWorld() and this geometry never goes there. So it renders with its ordinary texture and
+    // reads, wrongly, as though it were simply not participating. That is the reported "some
+    // building faces show their original textures", and the two states it could mean - stable, or
+    // absent from the world path entirely - look identical on screen while being opposite problems.
+    //
+    // Magenta because nothing in this game is magenta, and because a hash colour would imply this
+    // draw has an identity Remix could key on. It does not: pretransformed vertices carry no
+    // world-space information, so anything painted magenta here is geometry Remix cannot see at all.
+    // Pair it with the IN-SCENE SCREEN DRAWS BY TEXTURE line, which names the same draws.
+    const bool mark_screen = PARAM_ghashcolor.get_or(false) && Pipe()->IsInScene();
+
+    if (mark_screen)
+    {
+        device->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_XRGB(255, 0, 255));
+        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
+    }
+
     device->DrawIndexedPrimitiveUP(static_cast<D3DPRIMITIVETYPE>(prim_type), 0, vertex_count, primitive_count, indices,
         D3DFMT_INDEX16, vertices, sizeof(agiScreenVtx));
+
+    // Put the stage back, or every following screen draw inherits TFACTOR - including the HUD, which
+    // is drawn after EndScene and would go solid magenta with it.
+    if (mark_screen)
+        ApplyTexEnv(device, tex_env_);
 
     // Restore to whatever FlushState() believes it left on the device. It caches fog in
     // agiLastState and only re-issues on a change, so leaving fog off here would silently unfog
@@ -1405,7 +1490,17 @@ static void SetupD3D9Lights(IDirect3DDevice9* device)
     // agiLighter::LIGHTS[0, Current) is instead maintained directly by real, reimplemented C++
     // (DeclareLight(), called from each agiLight's constructor), so it stays valid for the
     // lifetime of the lights it references - use that instead.
-    for (i32 i = 0; i < agiLighter::Current && enabled < kMaxWorldLights; ++i)
+    // Lighting quality caps the dynamic rig too, and here it maps onto something real rather than
+    // onto a shape: these are genuine per-light costs on the fixed-function unit, so fewer active
+    // D3DLIGHT9 slots is exactly what a lower setting should buy. The list is already ordered by
+    // the engine's own declaration order, so the lights that survive are stable frame to frame
+    // rather than flickering as the cap bites.
+    const i32 light_budget = (agiRQ.LightQuality >= AGI_QUALITY_VERY_HIGH) ? kMaxWorldLights
+        : (agiRQ.LightQuality >= AGI_QUALITY_HIGH)                         ? 6
+        : (agiRQ.LightQuality >= AGI_QUALITY_MEDIUM)                       ? 3
+                                                                           : 0;
+
+    for (i32 i = 0; i < agiLighter::Current && enabled < light_budget; ++i)
     {
         agiLight* light = agiLighter::LIGHTS[i];
 
@@ -1525,8 +1620,34 @@ static void SetupD3D9StaticLights(IDirect3DDevice9* device, bool sun_per_pixel)
     else
         set_directional(0, agiMeshLighterSun, agiMeshLighterSunColor);
 
-    set_directional(1, agiMeshLighterFill1, agiMeshLighterFill1Color);
-    set_directional(2, agiMeshLighterFill2, agiMeshLighterFill2Color);
+    // The graphics menu's Lighting option, applied where it can actually be seen.
+    //
+    // agiRQ.LightQuality used to have no effect at all on this backend, and the reason is worth
+    // stating because it is not obvious from either side. The setting's only job in the original is
+    // to pick a CPU lighter function - fix_lighting (mmcity/cullcity.cpp) maps it onto
+    // agiMeshLighterQuarter or agiMeshLighterTriple - and this path does not call lighter functions.
+    // It reads the pointer solely to decide static rig versus dynamic rig (IsStaticCityLighter), and
+    // BOTH candidates answer "static", so MEDIUM, HIGH and VERY HIGH all arrived here as the same
+    // three-light rig and the menu item did nothing but relabel itself. LOW was the sole exception,
+    // and only because it sets the lighter to null, which routes the draw elsewhere entirely.
+    //
+    // The fill lights are what the setting now controls, which is the closest honest analogue of
+    // what it means on the CPU: agiMeshLighterQuarter is the cheaper rig and Triple the full one, so
+    // dropping fills as quality drops reproduces that shape rather than inventing a new meaning.
+    // The sun always survives - a scene with no key light is not a lower quality setting, it is a
+    // different picture.
+    const bool fill1 = agiRQ.LightQuality >= AGI_QUALITY_MEDIUM;
+    const bool fill2 = agiRQ.LightQuality >= AGI_QUALITY_VERY_HIGH;
+
+    if (fill1)
+        set_directional(1, agiMeshLighterFill1, agiMeshLighterFill1Color);
+    else
+        device->LightEnable(1, FALSE);
+
+    if (fill2)
+        set_directional(2, agiMeshLighterFill2, agiMeshLighterFill2Color);
+    else
+        device->LightEnable(2, FALSE);
 
     for (i32 i = 3; i < kMaxWorldLights; ++i)
         device->LightEnable(static_cast<DWORD>(i), FALSE);
@@ -1635,7 +1756,7 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
         device->SetRenderState(D3DRS_ALPHAREF, agiLastState.AlphaRef);
     }
 
-    device->SetRenderState(D3DRS_CULLMODE, ToD3DCull(agiLastState.CullMode));
+    device->SetRenderState(D3DRS_CULLMODE, agiNoCullEnabled() ? D3DCULL_NONE : ToD3DCull(agiLastState.CullMode));
 
     // Depth writes, restored for the same reason as everything else here: the additive-glow branch
     // above may have switched them off, and FlushState() only re-issues D3DRS_ZWRITEENABLE when
@@ -2070,7 +2191,11 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // though BuildProjectionMatrix() negates _11 for it: the CPU path mirrors the same way (by
     // negating InitViewport's HalfWidth) and likewise leaves its cull mode alone, so both paths
     // reverse together and stay in agreement.
-    device->SetRenderState(D3DRS_CULLMODE, ToD3DCullFlipped(agiCurState.GetCullMode()));
+    // -nocull forces both sides through. A path tracer needs closed shells: a back face it never
+    // receives is a hole that light leaks through, and the interior of every building in the city is
+    // exactly that shape.
+    device->SetRenderState(
+        D3DRS_CULLMODE, agiNoCullEnabled() ? D3DCULL_NONE : ToD3DCullFlipped(agiCurState.GetCullMode()));
 
     // D3D9 fixed-function lighting does not renormalise normals after the world/view transform, and
     // agiWorldVtx::normal arrives as a unit vector from UnpackNormal[] in *model* space. Any

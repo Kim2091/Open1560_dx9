@@ -54,6 +54,12 @@ struct agiNativeMaterialFx
     const Matrix34* EnvTransform {};
 };
 
+// -nocull: backface, LOD and distance culling all off, for RTX Remix captures. Defined in
+// agiworld/meshrend.cpp; declared here because agidx9 and mmcity both consult it and a second
+// cmd_param of the same name would register twice. Portal/cell visibility is not covered - that
+// traversal is closed assembly. See the note at the definition.
+bool agiNoCullEnabled();
+
 // One rigid segment of a skinned model, submitted with its bone folded into the world matrix
 // instead of applied to the vertices.
 //
@@ -76,6 +82,19 @@ struct agiNativeRigidGroup
     // one of its corners lands inside the range.
     u32 FirstVertex {};
     u32 EndVertex {};
+
+    // Undoes the bone's rotation on each normal before submission, when set.
+    //
+    // Needed because the only normals a pedestrian has are the animation's, and those are stored
+    // ALREADY POSED for the frame. Handing them to a draw whose world matrix also carries the bone
+    // would rotate them twice, so the surface would light as though it faced somewhere it does not.
+    // Multiplying by the bone's inverse rotation first cancels that exactly - the composition is the
+    // identity - and bone matrices are rigid, so the inverse rotation is just the transpose of the
+    // 3x3 and costs nothing to build.
+    //
+    // Only the normals move. Positions are the mesh's stored bind-pose values and stay untouched,
+    // which is the entire point: they are what gets hashed.
+    const Matrix34* NormalUnpose {};
 };
 
 class agiRasterizer : public agiRefreshable
