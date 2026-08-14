@@ -31,6 +31,10 @@ title: Open1560
 * What is planned for the programmable renderer next?
     * See the [future renderer plan](./future_renderer.md) — sun shadows, area lights, environment
       probes, water and road reflections without screen space, procedural rain puddles, and AO.
+* What files make up a city, and what is in them?
+    * See the [city format reference](./city_format.md) — the cell table, portals, geometry
+      containers, bounds, bangers, facades and the AI road network, field by field, with the closed
+      formats decoded from the disassembly.
 
 # Support
 
