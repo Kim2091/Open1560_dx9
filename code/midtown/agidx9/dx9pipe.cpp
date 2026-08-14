@@ -408,12 +408,18 @@ void agiDX9Pipeline::EndFrame()
             // matrix goes out through SetTransform rather than into the vertex bytes. Churn that
             // never settles means something rewrites geometry every frame, and Remix mesh
             // replacements cannot stick to it.
+            //
+            // Read CHURN together with table=used/capacity and wraps. CHURN alone was ambiguous:
+            // the table used to stop counting once full, so a saturated table and a genuinely
+            // stable scene both reported zero. See the note at the fill check in agiDX9GHashRecord.
             if (agiDX9Census.GHashDraws)
             {
-                Displayf("DX9 GHASH: frame=%u draws=%u distinct=%u stable=%u CHURN(new)=%u", census_frames,
-                    agiDX9Census.GHashDraws, agiDX9Census.GHashDistinct, agiDX9Census.GHashStable,
-                    agiDX9Census.GHashNew);
+                Displayf("DX9 GHASH: frame=%u draws=%u distinct=%u stable=%u CHURN(new)=%u | table=%u/%u wraps=%u",
+                    census_frames, agiDX9Census.GHashDraws, agiDX9Census.GHashDistinct, agiDX9Census.GHashStable,
+                    agiDX9Census.GHashNew, agiDX9GHashTableUsed(), agiDX9GHashTableCapacity(), agiDX9GHashWraps());
             }
+
+            agiDX9DumpAttribution();
         }
 
         agiDX9Census = {};

@@ -54,6 +54,30 @@ struct agiNativeMaterialFx
     const Matrix34* EnvTransform {};
 };
 
+// One rigid segment of a skinned model, submitted with its bone folded into the world matrix
+// instead of applied to the vertices.
+//
+// agiMeshModel's binding is rigid - agiMeshModel::SkinGroupVerts partitions the vertex array into
+// one contiguous run per bone, with no per-vertex weights - so a pedestrian is not a deforming
+// mesh at all. It is a handful of rigid pieces on a skeleton, and skinning it on the CPU threw that
+// structure away: the submitted positions changed every frame, which gave every pedestrian a new
+// RTX Remix geometry hash every frame and made them unreplaceable.
+//
+// Submitting each run separately against `World` = bone * world keeps the vertices at their stored
+// model-space values, so the hash is a property of the mesh again. Normals come from the mesh's own
+// bind-pose set rather than the animation's per-frame set, because the fixed-function pipeline
+// applies the same world matrix to them and so re-poses them for free.
+struct agiNativeRigidGroup
+{
+    // Replaces agiViewParameters::World for this submission.
+    const Matrix34* World {};
+
+    // Half-open vertex range this bone owns. A facet is submitted with the group only when every
+    // one of its corners lands inside the range.
+    u32 FirstVertex {};
+    u32 EndVertex {};
+};
+
 class agiRasterizer : public agiRefreshable
 {
 public:

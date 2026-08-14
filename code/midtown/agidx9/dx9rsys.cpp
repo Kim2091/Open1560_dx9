@@ -44,6 +44,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 
 define_dummy_symbol(agidx9_dx9rsys);
 
@@ -947,6 +949,115 @@ static constexpr u32 kGHashMask = kGHashSlots - 1;
 static agiDX9GHashSlot g_GHashTable[kGHashSlots] {};
 static u32 g_GHashFrame = 0;
 static u32 g_GHashUsed = 0;
+static u32 g_GHashWraps = 0;
+
+// Attribution for the two numbers in the report that say something is wrong without saying WHAT.
+//
+// CHURN(new) and IN-SCENE(3D) are both bare counts, and a count cannot be acted on: "12 in-scene
+// screen calls" does not say which surfaces are still CPU-pretransformed, and "118 new hashes" does
+// not say whether that is pedestrians, water, or a smoke sprite legitimately cycling its animation
+// frames. In both cases the answer is one texture name away, and tallying names is cheap enough to
+// sit in the draw path - the populations being counted are small by construction.
+struct agiDX9NameTally
+{
+    static constexpr u32 kSlots = 24;
+    static constexpr u32 kNameLen = 32;
+
+    char Names[kSlots][kNameLen];
+    u32 Counts[kSlots];
+    u32 Used;
+    u32 Dropped;
+};
+
+static agiDX9NameTally g_GHashChurnBy {};
+static agiDX9NameTally g_ScreenInSceneBy {};
+
+static void agiDX9TallyAdd(agiDX9NameTally& tally, const char* name)
+{
+    if (!name || !*name)
+        name = "(untextured)";
+
+    for (u32 i = 0; i < tally.Used; ++i)
+    {
+        if (std::strcmp(tally.Names[i], name) == 0)
+        {
+            ++tally.Counts[i];
+            return;
+        }
+    }
+
+    if (tally.Used >= agiDX9NameTally::kSlots)
+    {
+        ++tally.Dropped;
+        return;
+    }
+
+    // Copied rather than pointed at. The tally spans 120 frames, and a pipeline teardown inside
+    // that window resets the engine's arena and frees every agiTexDef wholesale - the same lifetime
+    // trap documented for the glow registry in docs/remix_api_data_sources.md §6. Hand-rolled
+    // because strncpy is a /W4 /WX deprecation error under MSVC.
+    char* dst = tally.Names[tally.Used];
+    u32 i = 0;
+
+    for (; (i + 1) < agiDX9NameTally::kNameLen && name[i]; ++i)
+        dst[i] = name[i];
+
+    dst[i] = '\0';
+
+    tally.Counts[tally.Used] = 1;
+    ++tally.Used;
+}
+
+static void agiDX9TallyDump(const char* label, agiDX9NameTally& tally)
+{
+    if (!tally.Used)
+        return;
+
+    char line[512];
+    i32 offset = 0;
+
+    for (u32 i = 0; (i < tally.Used) && (offset >= 0) && (offset < static_cast<i32>(sizeof(line)) - 1); ++i)
+    {
+        const i32 written = std::snprintf(line + offset, sizeof(line) - static_cast<usize>(offset), "%s%s=%u",
+            (i ? ", " : ""), tally.Names[i], tally.Counts[i]);
+
+        if (written < 0)
+            break;
+
+        offset += written;
+    }
+
+    line[sizeof(line) - 1] = '\0';
+
+    Displayf("%s %s%s", label, line, tally.Dropped ? " (+more)" : "");
+}
+
+void agiDX9DumpAttribution()
+{
+    // Named by texture, because that is the handle everything else here is keyed on - it is what
+    // agiTexProp flags hang off, what the Remix material config keys on, and what a person can
+    // actually recognise in a capture.
+    agiDX9TallyDump("DX9 GHASH CHURN BY TEXTURE:", g_GHashChurnBy);
+    agiDX9TallyDump("DX9 IN-SCENE SCREEN DRAWS BY TEXTURE:", g_ScreenInSceneBy);
+
+    g_GHashChurnBy = {};
+    g_ScreenInSceneBy = {};
+}
+
+u32 agiDX9GHashTableUsed()
+{
+    return g_GHashUsed;
+}
+
+u32 agiDX9GHashTableCapacity()
+{
+    return kGHashSlots / 2;
+}
+
+u32 agiDX9GHashWraps()
+{
+    return g_GHashWraps;
+}
 
 // FNV-1a. Not a cryptographic choice and not Remix's own function - what is being measured is
 // whether the same bytes come back frame after frame, and any decent mixer answers that.
@@ -968,7 +1079,8 @@ static u64 agiDX9GHashBytes(const void* data, usize size, u64 hash)
 // Inputs mirror the Remix key: vertex bytes for the drawn range, index bytes, stride, vertex count,
 // primitive type. Explicitly NOT the transforms - a mesh drawn in two places is ONE mesh to Remix,
 // and folding the world matrix in here would invent churn that Remix does not see.
-static u64 agiDX9GHashRecord(const agiWorldVtx* vertices, i32 vertex_count, const u16* indices, i32 index_count)
+static u64 agiDX9GHashRecord(
+    const agiWorldVtx* vertices, i32 vertex_count, const u16* indices, i32 index_count, agiDX9TexDef* texture)
 {
     if (!PARAM_ghash.get_or(false) && !PARAM_ghashcolor.get_or(false))
         return 0;
@@ -1011,16 +1123,50 @@ static u64 agiDX9GHashRecord(const agiWorldVtx* vertices, i32 vertex_count, cons
 
         if (!slot.Used)
         {
+            // Table full.
+            //
+            // This used to `return hash` here, which turned the one number the diagnostic exists to
+            // produce into a lie. With no free slots, every genuinely new hash returned early
+            // WITHOUT being counted, so CHURN(new) read a steady zero however much churn there was
+            // - and a long session reaches that state on its own, because a single CPU-skinned
+            // pedestrian mints a fresh hash every frame. "CHURN=0" twenty minutes into a drive
+            // therefore meant "the table gave up", not "the geometry is stable", and the two are
+            // indistinguishable in the report. Measured: a log full of CHURN=0 alongside visibly
+            // strobing pedestrians and water under -ghashcolor.
+            //
+            // Clearing and starting over keeps it honest. Churn reappears in the very next frame's
+            // count, and the wrap counter in the report says how often it is happening - a scene
+            // with no churn never wraps at all, so wraps>0 is itself the signal. The used/capacity
+            // figure next to it shows how close the table is to the next wrap.
             if (g_GHashUsed >= (kGHashSlots / 2))
-                return hash;
+            {
+                for (u32 i = 0; i < kGHashSlots; ++i)
+                    g_GHashTable[i] = {};
 
-            slot.Used = true;
-            slot.Hash = hash;
-            slot.LastFrame = g_GHashFrame;
+                ++g_GHashWraps;
 
-            ++g_GHashUsed;
+                // The table is empty now, so the first probe position is free by construction.
+                agiDX9GHashSlot& fresh = g_GHashTable[start];
+
+                fresh.Used = true;
+                fresh.Hash = hash;
+                fresh.LastFrame = g_GHashFrame;
+
+                g_GHashUsed = 1;
+            }
+            else
+            {
+                slot.Used = true;
+                slot.Hash = hash;
+                slot.LastFrame = g_GHashFrame;
+
+                ++g_GHashUsed;
+            }
+
             ++agiDX9Census.GHashNew;
             ++agiDX9Census.GHashDistinct;
+
+            agiDX9TallyAdd(g_GHashChurnBy, texture ? texture->Tex.Name : nullptr);
 
             return hash;
         }
@@ -1114,6 +1260,15 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
         {
             ++agiDX9Census.ScreenCallsInScene;
             agiDX9Census.ScreenTrisInScene += index_count / 3;
+
+            // Name them. These are real 3D content going out CPU-pretransformed - invisible to
+            // Remix as geometry, and the reason some surfaces take no tint under -ghashcolor while
+            // everything around them does: the tint is applied in MeshWorld, which these never
+            // reach. The count alone cannot say which surfaces they are, and most of what still
+            // draws is closed assembly, so a source audit cannot either. The texture name can.
+            agiDX9TexDef* screen_tex = static_cast<agiDX9TexDef*>(agiCurState.GetTexture());
+
+            agiDX9TallyAdd(g_ScreenInSceneBy, screen_tex ? screen_tex->Tex.Name : nullptr);
         }
     }
 
@@ -2114,7 +2269,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
 
     // -ghash. Immediately before the draw, which is where Remix would hash it, and on exactly the
     // bytes handed to the device.
-    const u64 geometry_hash = agiDX9GHashRecord(vertices, vertex_count, indices, index_count);
+    const u64 geometry_hash = agiDX9GHashRecord(vertices, vertex_count, indices, index_count, native_tex);
 
     // -ghashcolor. Replace the texture with a flat hash colour for this draw only.
     //

@@ -28,6 +28,7 @@
 struct agiMeshCardInfo;
 struct agiMeshCardVertex;
 struct agiNativeMaterialFx;
+struct agiNativeRigidGroup;
 class agiTexDef;
 class agiViewParameters;
 
@@ -385,8 +386,12 @@ protected:
     // caller-supplied override), matching what FirstPass() would have been handed.
     // unlit: forces hardware lighting off even when the mesh has normals - for draws whose colors
     // are already final (DrawColor). Meshes without normals are always submitted unlit regardless.
+    // rigid: submit only the facets whose corners all lie in one bone's vertex run, against that
+    // bone's world matrix - see agiNativeRigidGroup (agi/rsys.h). Used by agiMeshModel::ModelDrawLit
+    // to submit a pedestrian as rigid segments rather than CPU-skinned geometry. Null for every
+    // other caller, which submits the whole mesh against agiViewParameters::World as before.
     b32 DrawNativeTransform(u32 flags, bool static_lighting = false, const agiNativeMaterialFx* fx = nullptr,
-        const u32* base_colors = nullptr, bool unlit = false);
+        const u32* base_colors = nullptr, bool unlit = false, const agiNativeRigidGroup* rigid = nullptr);
 
     // Back to private immediately. Everything below is either ARTS_IMPORT/EXPORT or a static the
     // assembly references, and MSVC encodes private/protected/public into the mangled name - so

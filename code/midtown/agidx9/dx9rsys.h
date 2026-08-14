@@ -67,6 +67,18 @@ extern agiDX9SubmitCensus agiDX9Census;
 // the census reset, because "was this hash also seen last frame" needs a frame number to compare.
 void agiDX9GHashNextFrame();
 
+// Occupancy of the -ghash table, reported alongside CHURN so a wrap cannot be mistaken for a clean
+// scene. The table clears itself and counts a wrap when it fills; wraps > 0 means something is
+// minting hashes continuously, whatever CHURN happened to read in the frame that got sampled.
+u32 agiDX9GHashTableUsed();
+u32 agiDX9GHashTableCapacity();
+u32 agiDX9GHashWraps();
+
+// Dumps and resets the per-texture attribution for hash churn and for in-scene screen draws - the
+// two places the census reports a number that is only actionable once you know which texture it
+// belongs to. Called from the same 120-frame report block.
+void agiDX9DumpAttribution();
+
 class agiDX9Rasterizer final : public agiRasterizer
 {
 public:

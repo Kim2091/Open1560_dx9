@@ -1703,8 +1703,8 @@ static void SmoothAdjunctNormals(Vector3* ARTS_RESTRICT out_normals, const u16* 
     }
 }
 
-b32 agiMeshSet::DrawNativeTransform(
-    u32 flags, bool static_lighting, const agiNativeMaterialFx* fx, const u32* base_colors, bool unlit)
+b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNativeMaterialFx* fx,
+    const u32* base_colors, bool unlit, const agiNativeRigidGroup* rigid)
 {
     Init((Planes != nullptr) && (SurfaceCount > 1));
 
@@ -1783,6 +1783,30 @@ b32 agiMeshSet::DrawNativeTransform(
 
     const bool cpu_cull = (Planes != nullptr) && PARAM_native_cpu_cull.get_or(false);
 
+    // A rigid group takes only the facets it wholly owns. A facet straddling two bones would tear,
+    // so agiMeshModel::ModelDrawLit checks for that up front and does not use this path when it
+    // finds one - the check here is the same predicate, applied per facet.
+    const auto facet_excluded = [&](u32 facet) {
+        if (cpu_cull && IsBackfacing(Planes[facet]))
+            return true;
+
+        if (!rigid)
+            return false;
+
+        const u16* ARTS_RESTRICT surface = &SurfaceIndices[facet * 4];
+        const u32 corners = surface[3] ? 4u : 3u;
+
+        for (u32 k = 0; k < corners; ++k)
+        {
+            const u32 vertex = VertexIndices[surface[k]];
+
+            if ((vertex < rigid->FirstVertex) || (vertex >= rigid->EndVertex))
+                return true;
+        }
+
+        return false;
+    };
+
     const u32 batch_count = TextureCount + 1u;
 
     u32* batch_start = ARTS_ALLOCA(u32, batch_count + 1);
@@ -1793,7 +1817,7 @@ b32 agiMeshSet::DrawNativeTransform(
 
     for (u32 i = 0; i < SurfaceCount; ++i)
     {
-        if (cpu_cull && IsBackfacing(Planes[i]))
+        if (facet_excluded(i))
             continue;
 
         ++batch_start[TextureIndices[i] + 1u];
@@ -1814,7 +1838,7 @@ b32 agiMeshSet::DrawNativeTransform(
 
         for (u32 i = 0; i < SurfaceCount; ++i)
         {
-            if (cpu_cull && IsBackfacing(Planes[i]))
+            if (facet_excluded(i))
                 continue;
 
             facet_order[cursor[TextureIndices[i]]++] = static_cast<u16>(i);
@@ -2077,7 +2101,8 @@ b32 agiMeshSet::DrawNativeTransform(
         const u32 vertex_count = flat_shading ? flat_vertex_count : AdjunctCount;
 
         if (RAST->MeshWorld(verts, static_cast<i32>(vertex_count), indices, static_cast<i32>(index_count),
-                view_params.World, view_params.View, view_params, static_lighting, effective_fx, hardware_lighting))
+                rigid ? *rigid->World : view_params.World, view_params.View, view_params, static_lighting, effective_fx,
+                hardware_lighting))
         {
             drawn = true;
             submitted_indices += index_count;

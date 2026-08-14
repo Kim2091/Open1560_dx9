@@ -21,6 +21,8 @@ define_dummy_symbol(agiworld_meshmodel);
 #include "meshmodel.h"
 
 #include "agi/pipeline.h"
+#include "agi/rsys.h"
+#include "agi/viewport.h"
 #include "memory/alloca.h"
 #include "skeleton.h"
 #include "vector7/matrix34.h"
@@ -91,6 +93,66 @@ static void SkinModelVertices(agiMeshModel* model, bnAnimation* anim, i32 frame,
     }
 }
 
+// -pedskin. Restores CPU skinning for pedestrians, which is what the world path did before the
+// rigid-group submission below. Off by default: skinned positions change every frame, so every
+// pedestrian took a fresh RTX Remix geometry hash every frame and no replacement could stick to one.
+static mem::cmd_param PARAM_ped_skin {"pedskin", "Skin pedestrians on the CPU (breaks RTX Remix hash stability)"};
+
+// Whether every facet lies wholly inside one bone's vertex run.
+//
+// The rigid path submits one draw per bone and takes only the facets that bone owns outright, so a
+// facet straddling two bones would simply not be drawn - a hole in the pedestrian rather than a
+// visible seam. The models are built from rigid limb segments and in practice do not do this, but
+// "in practice" is not something to bet a missing head on, so it is checked before committing and
+// the CPU path is used unchanged when the check fails.
+//
+// Cheap enough to run per draw: a pedestrian is a few hundred facets, and this is four range tests
+// each against a run table that is already in cache.
+static bool ModelFacetsAreGroupCoherent(agiMeshModel* model)
+{
+    const u8* run_lengths = model->SkinGroupVerts;
+    const i32 groups = model->SkinGroupCount;
+
+    for (u32 facet = 0; facet < model->SurfaceCount; ++facet)
+    {
+        const u16* surface = &model->SurfaceIndices[facet * 4];
+        const u32 corners = surface[3] ? 4u : 3u;
+
+        u32 first = 0;
+        i32 facet_group = -1;
+
+        for (i32 group = 0; group < groups; ++group)
+        {
+            const u32 end = first + run_lengths[group];
+
+            const u32 vertex = model->VertexIndices[surface[0]];
+
+            if ((vertex >= first) && (vertex < end))
+            {
+                facet_group = group;
+                break;
+            }
+
+            first = end;
+        }
+
+        if (facet_group < 0)
+            return false;
+
+        const u32 end = first + run_lengths[facet_group];
+
+        for (u32 k = 1; k < corners; ++k)
+        {
+            const u32 vertex = model->VertexIndices[surface[k]];
+
+            if ((vertex < first) || (vertex >= end))
+                return false;
+        }
+    }
+
+    return true;
+}
+
 // ?ModelDrawLit@agiMeshModel@@QAEHP6AXPAEPAI1PAVagiMeshSet@@@ZIPAVagiLitAnimation@@H@Z
 //
 // Pedestrians. This is the one draw entry point the world-space work never reached, because peds do
@@ -126,6 +188,66 @@ i32 agiMeshModel::ModelDrawLit(agiMeshLighter lighter, u32 flags, agiLitAnimatio
     // The assembly tests +0x9C and only then indexes the +0xA0 table, so keep both: the flag is the
     // predicate, not the pointer.
     u32* base_colors = HasVariantColors ? VariantColors[MESH_DRAW_GET_VARIANT(flags)] : Colors;
+
+    // Rigid-group submission - the hash-stable path, and the default.
+    //
+    // Nothing here is animated in the sense that matters to Remix. The binding is rigid (see
+    // SkinModelVertices), so every vertex belongs to exactly one bone, and posing the model is a
+    // per-bone transform rather than a per-vertex deformation. Handing that transform to
+    // SetTransform(D3DTS_WORLD) instead of applying it to the vertices leaves the submitted
+    // positions at their stored model-space values, so a pedestrian mesh hashes to the same thing
+    // in every frame and every pose. That is the whole difference between a pedestrian Remix can
+    // replace and one it sees as a new mesh sixty times a second.
+    //
+    // Normals come from the mesh's own bind-pose set, deliberately, not from the animation's
+    // per-frame set. anim->Frames[frame] holds normals already posed for this frame; feeding those
+    // to a draw whose world matrix also carries the bone would rotate them twice. Fixed-function
+    // D3D9 transforms normals by the world matrix, so a bind-pose normal comes out posed for free -
+    // and D3DRS_NORMALIZENORMALS is already on for world draws (see MeshWorld).
+    //
+    // Requires those bind-pose normals to exist. When they do not, the animation's set is the only
+    // normal data there is and it only makes sense on CPU-skinned geometry, so that case takes the
+    // skinning path below.
+    if (Pipe()->SupportsNativeTransform() && CanSkinModel(this) && agiNativePathEnabled(NATIVE_DRAWMODEL) && Normals &&
+        !PARAM_ped_skin.get_or(false) && ModelFacetsAreGroupCoherent(this))
+    {
+        Skeleton.Pose(animation->Poses[frame]);
+        Skeleton.Transform(nullptr);
+
+        const agiViewParameters& view_params = ViewParams();
+        const Matrix34* bones = Skeleton.BoneMatrices;
+        const u8* run_lengths = SkinGroupVerts;
+
+        u32 first_vertex = 0;
+        b32 any_drawn = false;
+
+        for (i32 group = 0; group < SkinGroupCount; ++group)
+        {
+            agiNativeRigidGroup rigid {};
+
+            // bone * world, in that order: the CPU path computes vertex * bone and the draw then
+            // applies world, so the composed matrix has to reproduce (v * bone) * world.
+            Matrix34 group_world;
+            group_world.Dot(bones[group], view_params.World);
+
+            rigid.World = &group_world;
+            rigid.FirstVertex = first_vertex;
+            rigid.EndVertex = first_vertex + run_lengths[group];
+
+            first_vertex = rigid.EndVertex;
+
+            // static_lighting = false for the same reason the skinned path gives: a pedestrian is a
+            // mover, lit by the dynamic rig.
+            any_drawn |= DrawNativeTransform(flags, /*static_lighting=*/false, nullptr, base_colors,
+                /*unlit=*/false, &rigid);
+        }
+
+        if (any_drawn)
+            return 1;
+
+        // Every group empty means the mesh could not be expressed this way at all; fall through
+        // rather than dropping the pedestrian, exactly as the skinned path does below.
+    }
 
     if (Pipe()->SupportsNativeTransform() && frame_normals && CanSkinModel(this) &&
         agiNativePathEnabled(NATIVE_DRAWMODEL))
