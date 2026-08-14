@@ -391,6 +391,9 @@ gives `mmBoundTemplate::Load: no group '%s' in '%s'`.
 
 An assert in this function still carries its original source path, `C:\mm\src\mmdyna\bndtmpl2.c`.
 
+**The cache filename is not settled** — see §11.3. The shipped `BOUND24.BND` is the group name plus
+an extension, not the `%s_%s` hash key, so `bnd/%s` is handed something other than the key.
+
 ### 4.3 `.bnd` header and scalar block
 
 Header, in file order:
@@ -427,7 +430,7 @@ The scalar block then reads straight into the object, and every target maps onto
 | 0x04 | 0xA4 | `ZScale` |
 | 0x04 | *static* | `mmBoundTemplate::NumIndexs` — a **static**, not a member |
 | 0x04 | 0x9C | `HeightScale` |
-| 0x04 | *stack* | one more count, consumed locally |
+| 0x04 | *stack* | **unresolved** — reading it as an i32 against real data gives a nonsense value, see §11.3 |
 
 After that, `EnableBinaryFileMapping` decides whether the bulk arrays (`Verts`, `Polygons`,
 `HotVerts`, `EdgeVerts1/2`, `RowOffsets`, `BucketOffsets`, `RowBuckets`, `FixedHeights`) are
@@ -729,3 +732,114 @@ their `asc_` label in the same file.
 Field *meanings*, as opposed to offsets and sizes, generally need the consumer to be read as well —
 `AddInstance` is what proved argument 1 is a cell index, by following it to `mmInstChain::Parent`.
 Anything not established that way is marked inferred above, and should be treated as a hypothesis.
+
+---
+
+## 11. Validation against real data
+
+Everything above was derived from source and disassembly. This section records what was then checked
+against actual shipped files, because a schema that has never met real data is a hypothesis.
+
+`game/1560.ar` was unpacked with `deAR` (`AR tools for unpacking/`). It is Open1560's supplementary
+archive, not the original game data, so it contains no complete city — but it does ship three files
+that exercise three different claims: `CITY/DL24_BND/CHICAGO.PTL`, `BND/BOUND24.BND` and a set of
+`TUNE/*.MMBANGERDATA` / `*.ASBIRTHRULE` MetaClass files.
+
+### 11.1 The MetaClass text format — confirmed
+
+`TUNE/TP_TREE10M.MMBANGERDATA` is exactly the shape §7.2 predicts for `.map` and `.road`:
+
+```
+mmBangerData :05e209a4 {
+    NodeName "tp_tree10m"
+    AudioId 11
+    Size 7 9.88 3e-006
+    CG 0 4.94 -5e-007
+    GlowOffset 0 0 0
+    ...
+    PartNames $0
+    BirthRule asBirthRule :05e20a30 {
+            Position 0 0 0
+            ...
+        }
+}
+```
+
+One declared field per line, values space-separated, nested objects inline with their own class name
+and a hex object id, `$0` for an empty array. So a `.road` file is human-readable and hand-editable,
+with the `mmRoadSect` field names from §7.2 as its keys. This also happens to show `GlowOffset` in
+situ — the field behind the street-lamp lighting bug documented elsewhere in this repo.
+
+### 11.2 `.ptl` — confirmed byte-exact
+
+`CHICAGO.PTL`, 70292 bytes, parsed with the §2 schema:
+
+| Check | Result |
+|---|---|
+| `vec_count` | 0, as asserted |
+| `portal_count` | 1939 |
+| `EdgeCount` values | only 2 (1899) and 3 (40), as asserted |
+| variable-length rule | 40 records took the extra `Vector3` |
+| bytes consumed | **70292 of 70292 — exact** |
+
+Landing exactly on the end of file is the strong result: any wrong field width, or getting the
+`EdgeCount == 3` rule backwards, desynchronises and misses by hundreds of bytes.
+
+Two details confirmed by the values rather than the sizes. `Height` is always positive
+(2.54 .. 177.40), and `Min` and `Max` share a Y within each record — so they really are the two
+*bottom* corners with `Height` lifting the top pair, as §2.1 describes, not an axis-aligned box.
+
+**Scale anchor for anyone generating a city:** Chicago has 1939 portals over 965 distinct cells, with
+indices running to 1751. That is the real size of the shipped city's visibility graph.
+
+### 11.3 `.bnd` — header confirmed, one correction
+
+`BOUND24.BND`, 7213 bytes:
+
+```
+Magic        0x424E4432, bytes on disk literally "2DNB"    (as documented)
+Offset       (0, 0, 0)
+XDim 13   YDim 1   ZDim 13
+Center       (-388.09, 0.15, -1339.82)
+Radius       107.506      RadiusSqr 11557.44
+BBMin        (-481.61, 0.15, -1440.70)
+BBMax        (-294.04, 20.16, -1235.24)
+NumVerts 87   NumPolys 63
+NumHotVerts1 0   NumHotVerts2 0   NumEdges 0
+XScale 0.0693   ZScale 0.0633
+NumIndexs 317   HeightScale 0.0791
+```
+
+Every field lands somewhere sensible, which validates the order in §4.3.
+
+**New:** the grid scales are derived, not arbitrary. `XScale = XDim / (BBMax.x - BBMin.x)` —
+13 / 187.57 = 0.0693 — and `ZScale = ZDim / (BBMax.z - BBMin.z)` = 13 / 205.46 = 0.0633. So
+`XScale`/`ZScale` convert a world coordinate into a grid cell, confirming the `RowOffsets` /
+`BucketOffsets` / `RowBuckets` triple is a uniform spatial index over the polygons. `YDim` is 1 here,
+consistent with its `b32` declaration — the grid is 2D over the ground plane.
+
+**Correction:** §4.3 listed a trailing scalar read as "one more count, consumed locally". Read as an
+`i32` at that position it comes out as 7320, which is larger than the whole file, so that reading is
+wrong. Either it is not an `i32`, or it sits elsewhere in the order. The scalar block is confirmed
+through `HeightScale`; the identity of that last read is **open**.
+
+The array payload does not decompose cleanly either — 7105 bytes remain after a 108-byte header, and
+`Verts` (1044) plus `Polygons` (63 x 0x4C = 4788) plus plausible grid arrays leaves a few hundred
+unaccounted. Consistent with §4.3 leaving the arrays undecoded; not evidence of an error in the parts
+that are decoded.
+
+**Correction:** §4.2 gives the cache path as `bnd/<mesh>_<group>`, reasoning from
+`GetBoundTemplate`'s `"%s_%s"` hash key plus `Load`'s `bnd/%s` format. The shipped file is
+`BND/BOUND24.BND` — group name plus extension, with no mesh prefix. So the `%s` handed to `bnd/%s`
+is not the hash key. Treat the on-disk bound naming as **unresolved**; the hash key and the filename
+are different strings.
+
+### 11.4 What this does and does not establish
+
+Confirmed against shipped data: the `.ptl` layout exactly, the `.bnd` header and scalar order, the
+grid-scale derivation, and the MetaClass text shape.
+
+Still unvalidated, because no file in this archive exercises them: `.cells`, `.cinfo`, `.bng`,
+`.fcd`, `.geo`, `.map` and `.road`. Those need a full city archive from an original install, which
+is the obvious next step for anyone who has one — and the same method applies, parse with the schema
+and check that consumption lands exactly on the end of the file.
