@@ -17,8 +17,9 @@ them pull in nine kinds of data:
 |---|---|---|---|---|
 | Cell table | `city/<name>.cells` | **plain text** | `asRenderWeb::LoadCells` | **yes** |
 | Portals | `city/<name>.ptl` | binary | `asRenderWeb::LoadPortals` | **yes** |
-| Geometry | `<name>city`, `<name>lm` | DLP mesh container | `mmCellRenderer::Init` | no — decoded below |
-| Collision source | `geo/<mesh>.geo` | group container | `mmBoundTemplate::Load` | no — decoded below |
+| Geometry source | `geo/<name>city.geo`, `geo/<name>lm.geo` | **DLP container** | `DLPTemplate::Load` | **yes** |
+| Geometry cache | `bms/<name>_<group>` | binary, **generated** | `agiMeshSet::BinaryLoad` | **yes** |
+| Collision source | `geo/<mesh>.geo` | **DLP container** | `mmBoundTemplate::Load` | no — decoded below |
 | Collision cache | `bnd/<mesh>_<group>` | binary, **generated** | `mmBoundTemplate::Load` | no |
 | Props | `city/<name>.bng` | binary | `mmCullCity::LoadBangers` | no — decoded below |
 | Facades | `city/<name>.fcd` | binary | `mmCullCity::LoadFacades` | no — decoded below |
@@ -153,15 +154,156 @@ name. Any new city gets optimised on every load until you save the result.
 
 ---
 
-## 3. `<name>city` and `<name>lm` — geometry containers
+## 3. `geo/<name>.geo` — the DLP container, and how cells use it
 
-Each cell's geometry is a **group** inside one of these containers, fetched by
-`mmCellRenderer::Init` (`game.asm` ~189366).
+`.geo` is not a city-specific format. It is **the** geometry container for the whole game: city cell
+meshes, bound sources and banger models all come out of one. Three separate loaders open
+`geo/%s.geo` — `GetMeshSet`, `mmBoundTemplate::Load` and
+`mmBangerDataManager::AddBangerDataEntry` — and all of them go through `GetDLPTemplate`.
 
-### 3.1 Eight LOD slots, selected by `cull_flags`
+**And unlike everything else in this document, it did not need decoding from the disassembly.**
+`DLPTemplate::Load`, `DLPGroup::Load`, `DLPPatch::Load` and `DLPVertex::Load` are all reimplemented
+C++ in `agi/dlptmpl.cpp`, with matching `Save` methods. What follows is read straight off them.
 
-`mmCellRenderer` holds `agiMeshSet* Meshes[8]` at offset `0x08`, and `Init` fills them by
-`formatf`-ing a group name per slot and calling
+### 3.1 File layout
+
+```
+u32     Magic          // 'DLP7' == 0x444C5037, so the bytes on disk read "7PLD"
+u32     NumGroups
+u32     NumPatches
+u32     NumVertices
+
+NumGroups   x DLPGroup
+NumPatches  x DLPPatch
+NumVertices x Vector3        // the shared vertex-position pool
+
+agiLib  MLib                 // materials
+agiLib  TLib                 // textures
+agiLib  PLib                 // physics / surface
+```
+
+A wrong magic is fatal: `Not a valid .dlp file, or old version.`
+
+### 3.2 Groups are index lists, not meshes
+
+```
+u8      NameLen              // asserted <= 32
+char    Name[NameLen]
+u32     NumVertices
+u32     NumPatches
+u16     VertexIndices[NumVertices]
+u16     PatchIndices[NumPatches]
+```
+
+This is the architectural point of the whole format. **A group owns no geometry.** It is a pair of
+index lists selecting into the template's shared patch and vertex pools. `CULL01`, `BOUND01`,
+`HITID`, `HOT_VERTS` are all *views* over the same data.
+
+That is what lets one `.geo` hold an entire city: every cell names a group, groups overlap freely,
+and a vertex shared between two cells is stored once. It is also why the bound groups (§4) live in
+the same file as the visual geometry rather than beside it — a collision hull and the wall it
+belongs to are two selections over one pool.
+
+`DLPGroup::NumVertices` is documented in the header as "the set of all vertex indices used by
+enabled patches in this group", so the vertex list is derived from the patch list rather than
+independent.
+
+### 3.3 Patches are parametric grids
+
+```
+u16     SRes
+u16     TRes                 // NumVertices = SRes * TRes
+u16     Flags                // Flags_Enabled is CLEARED on load, see below
+u16     ROpts
+u16     MtlIdx
+u16     TexIdx
+u16     PhysIdx
+        SRes*TRes x DLPVertex
+string  Name                 // Stream::GetString
+```
+
+A patch is an **SRes x TRes grid of vertices**, not a triangle list — which is what the name means
+and why the resolution is stored rather than a vertex count. A flat quad is 2x2.
+
+`Flags_Enabled` (`0x1`) is masked off as the patch loads (`Flags = Get<u16>() & ~Flags_Enabled`), so
+whatever the file says about enablement is discarded and the runtime decides. `ROpts` is the render
+options word, and its bits are named in `agi/dlptmpl.h`:
+
+| Bit | Name | | Bit | Name |
+|---|---|---|---|---|
+| 0x001 | `CPV` | | 0x020 | `ZWrite` |
+| 0x002 | `Emission` | | 0x040 | `ZRead` |
+| 0x004 | `Shade` | | 0x080 | `Shadow` |
+| 0x008 | `Solid` | | 0x100 | `Flat` |
+| 0x010 | `Cull` | | 0x200 | `Antialias` |
+| | | | 0x400 | `Interpenetrate` |
+
+`MtlIdx`, `TexIdx` and `PhysIdx` are **1-based** indices into the three libraries below —
+`agiLib::operator[]` asserts `index > 0 && index <= count`, and index 0 means "none".
+`DLPTemplate::InitRemap` rewrites them through the `MtlIds` / `TexIds` / `PhysIds` remap tables at
+load, binding them to the engine's global libraries rather than the file's local ones.
+
+### 3.4 Vertices
+
+```
+u16     Id                   // index into the template's shared Vector3 pool
+Vector3 Normal
+Vector2 UV
+u32     Color                // A8R8G8B8, expanded to a float Vector4 in memory
+```
+
+26 bytes on disk, `0x28` in memory (`Id` widens to `u32` and the colour to four floats). Note the
+split: **position lives in the shared pool and is referenced by `Id`, while normal, UV and colour
+are per-patch-vertex.** Two patches meeting at an edge share the position but carry their own
+normals and UVs — which is exactly the adjunct/vertex split that reappears in `agiMeshSet`.
+
+### 3.5 The three embedded libraries
+
+Each is an `agiLib` (`agi/agilib.h`), a trivial container:
+
+```
+u32     Count
+Count x <record>
+```
+
+with records:
+
+**MLib — `agiMtlParameters`** (`0x68`): `char Name[32]`, then `Emmisive`, `Ambient`, `Diffuse` and
+`Specular` as `Vector4`, then `f32 Power`.
+
+**TLib — `agiTexParameters`**: `char Name[32]`, then `u8 Flags`, `u8 LOD`, `u8 MaxLOD` and one
+padding byte. Flag bits: `Alpha 0x1`, `WrapU 0x2`, `WrapV 0x4`, `KeepLoaded 0x8`, `NoMipMaps 0x10`,
+`Chromakey 0x40`, `Second 0x80`.
+
+**PLib — `agiPhysParameters`**: `char Name[32]`, then `Friction`, `Elasticity`, `Drag`,
+`BumpHeight`, `BumpWidth`, `BumpDepth`, `SinkDepth` as floats. This is the per-surface driving feel —
+tarmac versus grass versus kerb — carried in the geometry file next to the polygons it applies to.
+
+`agiTexParameters::Load`/`Save` are open C++ (`agi/texdef.cpp`); the material and physics ones are
+still imported, but their member layouts are declared in `agi/mtldef.h` and `agi/physdef.h`.
+
+### 3.6 `.geo` -> `.bms`: the fourth bake
+
+`GetMeshSet` (`game.asm` ~336882) reads a group out of the `.geo` and writes an `agiMeshSet` cache to
+`bms/<name>_<group>`, printing
+
+```
+Meshset %s.%s changed version or offset, recomputing
+```
+
+when the cache is stale. Along the way it welds vertices, remaps textures and builds adjacency — the
+asserts it carries (`vtxrm[i] >= 0 && vtxrm[i] < vtxcount`, `texcount < 256`,
+`NB[vi].Adj[k].PosI == vi`) still name its original source file, `C:\mm\src\agiworld\getmesh.c`.
+
+So the chain is **`.geo` (authoring) -> `.bms` (mesh cache) and `.bnd` (bound cache)**, and both
+caches regenerate. `agiMeshSet::BinaryLoad` and `BinarySave` are open C++ (`agiworld/meshload.cpp`,
+`meshsave.cpp`), so `.bms` can be read and written directly too — which is the shortcut a generator
+would take rather than emitting `.geo`.
+
+### 3.7 Eight LOD slots, selected by `cull_flags`
+
+`mmCellRenderer` holds `agiMeshSet* Meshes[8]` at offset `0x08`, and `Init` (`game.asm` ~189366)
+fills them by `formatf`-ing a group name per slot and calling
 
 ```cpp
 GetMeshSet(container, group, /*offset*/ nullptr, /*flags*/ 7);
@@ -171,8 +313,7 @@ GetMeshSet(container, group, /*offset*/ nullptr, /*flags*/ 7);
 and vertex colours** — unlike instance meshes, which only get them when
 `mmInstance::InitMeshes` decides they are a collider, mover or obstacle.
 
-Which slots are attempted is decided bit by bit from **`cull_flags`, the second column of
-`.cells`**. This is what that field means:
+Which slots are attempted comes bit by bit from **`cull_flags`, the second column of `.cells`**:
 
 | `cull_flags` bit | Group name | Slot |
 |---|---|---|
@@ -186,30 +327,28 @@ Which slots are attempted is decided bit by bit from **`cull_flags`, the second 
 | 8 (`0x100`) | `CULL%02d_H2` | `Meshes[6]` |
 
 So the array is ordered **[L, M, H, A, L2, M2, H2, A2]** — increasing detail, then the `A` variant,
-then the same four again for the second set. Bit 4 is unused; the low five bits are tested together
-(`and eax, 0x1F`) as "does this cell have any first-set geometry at all".
+then the same four again. Bit 4 is unused; the low five bits are tested together (`and eax, 0x1F`)
+as "does this cell have any first-set geometry at all".
 
-**Bit 3 is special.** When it is set the high LOD is looked up as `CULL%02d_H`; when it is clear the
-*same slot* is filled from the unsuffixed `CULL%02d` instead. A cell therefore either uses the
-suffixed LOD naming or a single unsuffixed group, and bit 3 is the switch. If neither resolves, the
-load aborts with `Group CULL%02d (or _H) is missing from city '%s'`.
+**Bit 3 is a switch, not merely a presence flag.** Set, the high LOD is looked up as `CULL%02d_H`;
+clear, the *same slot* is filled from the unsuffixed `CULL%02d`. A cell either uses suffixed LOD
+naming or a single plain group. If neither resolves, the load aborts with
+`Group CULL%02d (or _H) is missing from city '%s'`.
 
-`Init` then logs what it found —
-`Flags nlod=%d h=%d m=%d l=%d a=%d h2=%d m2=%d l2=%d a2=%d` — runs `GetPolyInfo` over all eight
-slots and appends a `%d,%d,%d,%d,%d,%d,%d,%d,%d` row to the `<name>_static.csv` log (§8), then
-derives `CellCenter` and `CellMagnitude` via `GetBoundInfo`. Those two are what `OptimizePortals`
-uses for its "suspicious portal" distance check (§2.2).
+`Init` then logs `Flags nlod=%d h=%d m=%d l=%d a=%d h2=%d m2=%d l2=%d a2=%d`, runs `GetPolyInfo` over
+all eight slots, appends a `%d,%d,%d,%d,%d,%d,%d,%d,%d` row to `<name>_static.csv` (§8), and derives
+`CellCenter` and `CellMagnitude` via `GetBoundInfo` — the two values `OptimizePortals` uses for its
+suspicious-portal distance check (§2.2).
 
-### 3.2 The rest of `mmCellRenderer`
+### 3.8 The rest of `mmCellRenderer`
 
 `Init(container, index, cull_flags, room_flags, tag_count, tags)` maps one-to-one onto the `.cells`
 columns. Beyond the mesh slots it stores `Index`, `RoomFlags`, `VisitTagCount` and `VisitTags`
-directly; `cull_flags` is the only column not kept, because it has already been consumed to decide
-which groups to load.
+directly; `cull_flags` is the only column not kept, because it has already been consumed.
 
 `asRenderWeb::PassMask` splits drawing into `RENDER_PASS_TERRAIN` (roads, grass, water, bridges),
 `SHADOWS`, `BUILDINGS`, `OBJECTS` and `LIGHTS`. The `…2` slots line up with the second pass, given
-the `MULTIPASS` global next door in `renderweb.h` — consistent, but not proven from the disassembly.
+the `MULTIPASS` global next door in `renderweb.h` — consistent, but not proven.
 
 ---
 
@@ -542,10 +681,15 @@ Ordered by how much of the work is already done for you.
 (`agiworld/meshsave.cpp`), portals via `SavePortals`, and `.cells` is text. `.bng` and `.fcd` are
 simple enough to emit from the layouts above.
 
-**Three formats bake themselves.** `.bai` from `.map`/`.road` (§7.1), `.bnd` from `.geo` (§4.2), and
-an optimised `.ptl` from a rough one (§2.2). All three compare timestamps, regenerate when stale and
-write the result. None of them needs a hand-authored binary — which is most of what once looked like
-the hard part of this format.
+**Four formats bake themselves.** `.bms` from `.geo` (§3.6), `.bnd` from `.geo` (§4.2), `.bai` from
+`.map`/`.road` (§7.1), and an optimised `.ptl` from a rough one (§2.2). All four compare timestamps,
+regenerate when stale and write the result. None needs a hand-authored binary — which is most of
+what once looked like the hard part of this format.
+
+**Everything upstream of those bakes is either text or an open C++ format.** `.geo` is the one
+container the whole game is built out of, and `DLPTemplate::Load`/`Save` are reimplemented, so a
+generator can emit `.geo` and let the engine derive meshes and bounds — or skip a step and write
+`.bms` directly through `agiMeshSet::BinarySave`.
 
 **Constraints a generator must respect.**
 
@@ -569,9 +713,14 @@ match the engine's fidelity closely enough that little is lost.
 
 ---
 
-## 10. How the closed formats above were read
+## 10. How the formats above were read
 
-For anyone extending this document. Each closed loader was located in `code/midtown/game.asm` by its
+Check `code/midtown` before reaching for `game.asm`. The `.geo` container looked like the deepest
+closed format in the game and turned out to be fully reimplemented in `agi/dlptmpl.cpp`, with
+`Save` alongside `Load`; the same is true of `.cells`, `.ptl`, `.bms` and the `mmInfoBase` text
+files. Time spent disassembling any of those would have been wasted.
+
+For the ones that genuinely are closed: each loader was located in `code/midtown/game.asm` by its
 mangled name, then read for three things: the format string handed to `sprintf` (which gives the
 filename pattern), the size passed to `Stream::Read` (which gives the record size), and the argument
 order at the call it forwards to (which gives the field layout). String constants resolve by grepping
