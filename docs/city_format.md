@@ -391,8 +391,9 @@ gives `mmBoundTemplate::Load: no group '%s' in '%s'`.
 
 An assert in this function still carries its original source path, `C:\mm\src\mmdyna\bndtmpl2.c`.
 
-**The cache filename is not settled** — see §11.3. The shipped `BOUND24.BND` is the group name plus
-an extension, not the `%s_%s` hash key, so `bnd/%s` is handed something other than the key.
+**The cache path is a directory per container** — `bnd/<container>/<group>.BND`, e.g.
+`BND/CHICAGOCITY/BOUND1000.BND`. The `"%s_%s"` string is only the in-memory hash key, not the path.
+Confirmed against shipped data in §11.6.
 
 ### 4.3 `.bnd` header and scalar block
 
@@ -430,7 +431,7 @@ The scalar block then reads straight into the object, and every target maps onto
 | 0x04 | 0xA4 | `ZScale` |
 | 0x04 | *static* | `mmBoundTemplate::NumIndexs` — a **static**, not a member |
 | 0x04 | 0x9C | `HeightScale` |
-| 0x04 | *stack* | **unresolved** — reading it as an i32 against real data gives a nonsense value, see §11.3 |
+| 0x04 | *stack* | **unresolved** — reading it as an i32 against real data gives a nonsense value, see §11.5 |
 
 After that, `EnableBinaryFileMapping` decides whether the bulk arrays (`Verts`, `Polygons`,
 `HotVerts`, `EdgeVerts1/2`, `RowOffsets`, `BucketOffsets`, `RowBuckets`, `FixedHeights`) are
@@ -735,111 +736,150 @@ Anything not established that way is marked inferred above, and should be treate
 
 ---
 
-## 11. Validation against real data
+## 11. Validation against shipped data
 
 Everything above was derived from source and disassembly. This section records what was then checked
-against actual shipped files, because a schema that has never met real data is a hypothesis.
+against real files, because a schema that has never met real data is a hypothesis.
 
-`game/1560.ar` was unpacked with `deAR` (`AR tools for unpacking/`). It is Open1560's supplementary
-archive, not the original game data, so it contains no complete city — but it does ship three files
-that exercise three different claims: `CITY/DL24_BND/CHICAGO.PTL`, `BND/BOUND24.BND` and a set of
-`TUNE/*.MMBANGERDATA` / `*.ASBIRTHRULE` MetaClass files.
+Two archives were unpacked with `deAR` (`AR tools for unpacking/`): Open1560's `game/1560.ar`, and
+the original game's `core.ar` from an MM1 install. Between them they exercise every format in this
+document that ships — which is not all of them, see §11.7.
 
-### 11.1 The MetaClass text format — confirmed
+### 11.1 `.cells` — confirmed, and the LOD flags proven
 
-`TUNE/TP_TREE10M.MMBANGERDATA` is exactly the shape §7.2 predicts for `.map` and `.road`:
+`CITY/CHICAGO.CELLS`:
 
 ```
-mmBangerData :05e209a4 {
-    NodeName "tp_tree10m"
-    AudioId 11
-    Size 7 9.88 3e-006
-    CG 0 4.94 -5e-007
-    GlowOffset 0 0 0
-    ...
-    PartNames $0
-    BirthRule asBirthRule :05e20a30 {
-            Position 0 0 0
-            ...
-        }
-}
+978          <- num_cells
+1751         <- max cell index, so MaxCells = 1752
+1,460,0,0
+2,462,0,1,8
+...
+326,15,0,3,302,1013,1004
 ```
 
-One declared field per line, values space-separated, nested objects inline with their own class name
-and a hex object id, `$0` for an empty array. So a `.road` file is human-readable and hand-editable,
-with the `mmRoadSect` field names from §7.2 as its keys. This also happens to show `GlowOffset` in
-situ — the field behind the street-lamp lighting bug documented elsewhere in this repo.
+978 records follow the two header lines — exact. Every record's field count agrees with its own
+`tag_count`. Largest `tag_count` is 13, well inside the assert's limit of 100. Index range 1..1751,
+which independently agrees with the maximum cell index seen in `CHICAGO.PTL`.
 
-### 11.2 `.ptl` — confirmed byte-exact
+**The `cull_flags` decode in §3.7 is confirmed outright.** Across all 978 cells, bit 4 is *never*
+set, and the set of bits ever used is exactly `{0,1,2,3,5,6,7,8}` — the eight this document assigns
+and no others.
 
-`CHICAGO.PTL`, 70292 bytes, parsed with the §2 schema:
+Better than that, the flags were cross-checked against the baked meshes actually present on disk:
 
-| Check | Result |
+| | |
 |---|---|
-| `vec_count` | 0, as asserted |
-| `portal_count` | 1939 |
-| `EdgeCount` values | only 2 (1899) and 3 (40), as asserted |
-| variable-length rule | 40 records took the extra `Vector3` |
-| bytes consumed | **70292 of 70292 — exact** |
+| bit flagged **and** matching `.BMS` present | **3331** |
+| bit flagged but file missing | **0** |
+| file present but bit clear | **0** |
 
-Landing exactly on the end of file is the strong result: any wrong field width, or getting the
-`EdgeCount == 3` rule backwards, desynchronises and misses by hundreds of bytes.
+A perfect match in both directions over 978 cells. The bit-to-LOD-to-slot mapping is not an
+inference any more.
 
-Two details confirmed by the values rather than the sizes. `Height` is always positive
-(2.54 .. 177.40), and `Min` and `Max` share a Y within each record — so they really are the two
-*bottom* corners with `Height` lifting the top pair, as §2.1 describes, not an axis-aligned box.
+The decoded combinations also make sense of the two containers. City cells overwhelmingly use
+`L+M+H` (545 of them) or `A+L+M+H` (147) — one pass. Landmark cells are where the second set turns
+up: `L+M+H+L2+M2+H2` and, for 32 of them, `A2` alone.
 
-**Scale anchor for anyone generating a city:** Chicago has 1939 portals over 965 distinct cells, with
-indices running to 1751. That is the real size of the shipped city's visibility graph.
+### 11.2 `%02d` is literal zero-padding
 
-### 11.3 `.bnd` — header confirmed, one correction
+Worth its own note because it will silently break a generator. Group names really are formatted with
+`%02d`, so a landmark cell is `CULL01_H` and a city cell is `CULL1000_H`. Cells below 10 are
+zero-padded to two digits; cells above 99 simply run longer. Bound groups follow the same rule
+(`BOUND1000`).
 
-`BOUND24.BND`, 7213 bytes:
+### 11.3 `.bng` and `.fcd` — confirmed byte-exact
+
+| File | Records | Bytes consumed | Result |
+|---|---|---|---|
+| `CHICAGO.BNG` | 5941 | 215280 / 215280 | exact |
+| `CHICAGO.FCD` | 3389 | 180865 / 180865 | exact |
+| `CHICAGO_C0.BNG` | 466 | 19110 / 19110 | exact |
+
+These are variable-length records — a fixed struct plus a NUL-terminated name — so landing exactly on
+the end of file confirms both the struct size and the string handling.
+
+The contents confirm the field meanings too. `.fcd` names are `freewaywall02`, `tunnel03` — wall and
+tunnel segments — and every one of its 3389 records sits in a **city** cell (201..1751), never a
+landmark. `.bng` spans 1..1297, both containers. And `CHICAGO_C0.BNG`, the Circuit-0 overlay, is 466
+records of `tp_barricade` all parented to cell 1 — exactly the per-game-mode race dressing §5.1
+describes.
+
+### 11.4 `.ptl` — confirmed byte-exact
+
+`CHICAGO.PTL`, 70292 bytes, 1939 portals, **70292 of 70292 consumed**. `EdgeCount` is only ever 2
+(1899) or 3 (40), and the 40 threes each took the extra trailing `Vector3`. Getting that
+variable-length rule backwards desynchronises by hundreds of bytes, so the exact landing is the
+proof.
+
+`Height` is always positive (2.54 .. 177.40) and `Min`/`Max` share a Y within each record —
+confirming §2.1's reading that they are the two *bottom* corners with `Height` lifting the top pair,
+not an axis-aligned box.
+
+**Scale anchor:** Chicago's visibility graph is 1939 portals over 965 distinct cells.
+
+### 11.5 `.bnd` — header confirmed, plus a derivation
+
+`BOUND24.BND`: magic `0x424E4432` with the bytes literally reading `2DNB`, offset `(0,0,0)`,
+`XDim 13 / YDim 1 / ZDim 13`, then `Center`, `Radius`, `RadiusSqr`, `BBMin`, `BBMax`, `NumVerts 87`,
+`NumPolys 63` and the rest of §4.3's order. Every field lands somewhere sensible.
+
+**New:** the grid scales are derived, not authored. `XScale = XDim / (BBMax.x - BBMin.x)` —
+13 / 187.57 = 0.0693 — and `ZScale = ZDim / (BBMax.z - BBMin.z)` = 13 / 205.46 = 0.0633. So they
+convert a world coordinate into a grid cell, confirming that the
+`RowOffsets` / `BucketOffsets` / `RowBuckets` triple is a uniform spatial index over the polygons.
+`YDim` of 1 matches its `b32` declaration: the grid is 2D over the ground plane.
+
+**Correction to §4.3:** the trailing scalar previously described as "one more count" reads as 7320
+against a 7213-byte file. That reading is wrong; the field's identity is open.
+
+### 11.6 Cache paths — correcting an earlier guess
+
+An earlier draft gave the bound cache path as `bnd/<mesh>_<group>`, reasoning from
+`GetBoundTemplate`'s `"%s_%s"` hash key. That was wrong, and the shipped layout settles it: **the
+caches are a directory per container.**
 
 ```
-Magic        0x424E4432, bytes on disk literally "2DNB"    (as documented)
-Offset       (0, 0, 0)
-XDim 13   YDim 1   ZDim 13
-Center       (-388.09, 0.15, -1339.82)
-Radius       107.506      RadiusSqr 11557.44
-BBMin        (-481.61, 0.15, -1440.70)
-BBMax        (-294.04, 20.16, -1235.24)
-NumVerts 87   NumPolys 63
-NumHotVerts1 0   NumHotVerts2 0   NumEdges 0
-XScale 0.0693   ZScale 0.0633
-NumIndexs 317   HeightScale 0.0791
+BMS/CHICAGOCITY/CULL1000_H.BMS      BND/CHICAGOCITY/BOUND1000.BND
+BMS/CHICAGOLM/CULL01_H.BMS          BND/CHICAGOLM/...
+BMS/CFBLDG01/FACADE_H.BMS           BND/DL24_BND/BOUND24.BND
+                                    BND/CHICAGO_HITID.BND
 ```
 
-Every field lands somewhere sensible, which validates the order in §4.3.
+So `bms/%s` and `bnd/%s` receive `<container>/<group>`, while `"%s_%s"` is only the in-memory hash
+key. Single-group bounds are flat files (`CHICAGO_HITID.BND`, `DP01WINA_BND.BND`).
 
-**New:** the grid scales are derived, not arbitrary. `XScale = XDim / (BBMax.x - BBMin.x)` —
-13 / 187.57 = 0.0693 — and `ZScale = ZDim / (BBMax.z - BBMin.z)` = 13 / 205.46 = 0.0633. So
-`XScale`/`ZScale` convert a world coordinate into a grid cell, confirming the `RowOffsets` /
-`BucketOffsets` / `RowBuckets` triple is a uniform spatial index over the polygons. `YDim` is 1 here,
-consistent with its `b32` declaration — the grid is 2D over the ground plane.
+`BND/DL24_BND/` contains exactly `BOUND24.BND` and `BOUND174.BND` — precisely the two Wrigley cells
+`LoadRoomBounds` redirects to `dl24_bnd`, confirming that special case.
 
-**Correction:** §4.3 listed a trailing scalar read as "one more count, consumed locally". Read as an
-`i32` at that position it comes out as 7320, which is larger than the whole file, so that reading is
-wrong. Either it is not an `i32`, or it sits elsewhere in the order. The scalar block is confirmed
-through `HeightScale`; the identity of that last read is **open**.
+Facade meshes carry their own LOD set under different group names — `FACADE_H`, `FACADE_M`,
+`FACADE_L`, `FACADE_VL`, plus `LEFT` and `RIGHT`. Note `_VL`, a fourth level that has no counterpart
+in the `CULL` scheme.
 
-The array payload does not decompose cleanly either — 7105 bytes remain after a 108-byte header, and
-`Verts` (1044) plus `Polygons` (63 x 0x4C = 4788) plus plausible grid arrays leaves a few hundred
-unaccounted. Consistent with §4.3 leaving the arrays undecoded; not evidence of an error in the parts
-that are decoded.
+### 11.7 What was never shipped
 
-**Correction:** §4.2 gives the cache path as `bnd/<mesh>_<group>`, reasoning from
-`GetBoundTemplate`'s `"%s_%s"` hash key plus `Load`'s `bnd/%s` format. The shipped file is
-`BND/BOUND24.BND` — group name plus extension, with no mesh prefix. So the `%s` handed to `bnd/%s`
-is not the hash key. Treat the on-disk bound naming as **unresolved**; the hash key and the filename
-are different strings.
+`core.ar` contains **no `.geo`, no `.map` and no `.road` anywhere**. The only DLP files are 63
+`DLP/*.DLP` for animated objects — drawbridges, crossing gates, the el train, aircraft.
 
-### 11.4 What this does and does not establish
+That is the source-and-cache split showing through at the shipping boundary: Microsoft shipped the
+baked artifacts (`BMS/`, `BND/`, `CHICAGO.BAI`) and kept the authoring formats in-house. It confirms
+the architecture, and it has a practical consequence — **the `.map` and `.road` schemas in §7.2
+cannot be validated against shipped data, because no shipped data contains them.** Their field names
+come from `DeclareFields` and are reliable; their *value conventions* (what `IntersectionType`
+encodes, how `StopLightPos[4]` maps to approaches) can only be established by generating a city and
+testing it in game.
 
-Confirmed against shipped data: the `.ptl` layout exactly, the `.bnd` header and scalar order, the
-grid-scale derivation, and the MetaClass text shape.
+`.cinfo` is also absent from `core.ar` — it presumably lives in `ui.ar`, which was not unpacked.
 
-Still unvalidated, because no file in this archive exercises them: `.cells`, `.cinfo`, `.bng`,
-`.fcd`, `.geo`, `.map` and `.road`. Those need a full city archive from an original install, which
-is the obvious next step for anyone who has one — and the same method applies, parse with the schema
-and check that consumption lands exactly on the end of the file.
+### 11.8 Summary
+
+| Format | Status |
+|---|---|
+| `.cells` | confirmed exact, incl. the `cull_flags` bit mapping against 3331 files |
+| `.ptl` | confirmed byte-exact |
+| `.bng` / `.fcd` | confirmed byte-exact |
+| `.bnd` | header and scalar order confirmed; arrays undecoded; one field open |
+| MetaClass text | shape confirmed from `.MMBANGERDATA` |
+| `.geo` | read from open C++; **no shipped file to test against** |
+| `.map` / `.road` | field names solid; **value conventions unvalidated** |
+| `.cinfo` | field names from the disassembly; not yet seen on disk |
