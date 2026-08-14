@@ -10,14 +10,16 @@ the closed ones, `code/midtown/game.asm`. Where something is inferred rather tha
 
 ## 0. The short version
 
-A city is **not** one file. `mmCullCity::Init` (`mmcity/cullcity.cpp`) pulls in seven kinds of data:
+A city is **not** one file. `mmCullCity::Init` (`mmcity/cullcity.cpp`) and the AI loader between
+them pull in nine kinds of data:
 
 | Data | File | Format | Loader | Reimplemented? |
 |---|---|---|---|---|
 | Cell table | `city/<name>.cells` | **plain text** | `asRenderWeb::LoadCells` | **yes** |
 | Portals | `city/<name>.ptl` | binary | `asRenderWeb::LoadPortals` | **yes** |
-| Geometry | `<name>city`, `<name>lm` | DLP mesh container | `mmCellRenderer::Init` | no |
-| Collision | `<name>_hitid`, `BOUND%02d` | bound templates | `LoadHitId`, `LoadRoomBounds` | **yes** (calls closed loader) |
+| Geometry | `<name>city`, `<name>lm` | DLP mesh container | `mmCellRenderer::Init` | no — decoded below |
+| Collision source | `geo/<mesh>.geo` | group container | `mmBoundTemplate::Load` | no — decoded below |
+| Collision cache | `bnd/<mesh>_<group>` | binary, **generated** | `mmBoundTemplate::Load` | no |
 | Props | `city/<name>.bng` | binary | `mmCullCity::LoadBangers` | no — decoded below |
 | Facades | `city/<name>.fcd` | binary | `mmCullCity::LoadFacades` | no — decoded below |
 | AI / roads | `city/<name>/<name>.map` + `<street>.road` | **text (MetaClass)** | `aiMap::Init` | no — decoded below |
@@ -44,6 +46,7 @@ Plain text, parsed with `Gets`/`atoi`/`strtok` in `asRenderWeb::LoadCells`
 
 * Line 1 is how many cell records follow. Line 2 is the highest cell index used; the loader
   allocates `MaxCells = that + 1`.
+* `cull_flags` is a **bitmask of which LOD groups this cell has** — fully decoded in §3.1.
 * Everything after `cull_flags` is optional. When absent, `room_flags` and `tag_count` are 0.
 * `tag_count` is asserted below 100 ("Too many visit tags").
 * A cell index outside `1 .. MaxCells-1` is fatal: `Bad cell index CULL%02d`.
@@ -152,45 +155,150 @@ name. Any new city gets optimised on every load until you save the result.
 
 ## 3. `<name>city` and `<name>lm` — geometry containers
 
-These are DLP templates, fetched via `GetDLPTemplate` in development mode and otherwise bound by
-`mmCellRenderer::Init`, which is still assembly (`game.asm` ~189366).
+Each cell's geometry is a **group** inside one of these containers, fetched by
+`mmCellRenderer::Init` (`game.asm` ~189366).
 
-What the disassembly gives us is the **sub-object naming scheme** it looks up:
+### 3.1 Eight LOD slots, selected by `cull_flags`
 
+`mmCellRenderer` holds `agiMeshSet* Meshes[8]` at offset `0x08`, and `Init` fills them by
+`formatf`-ing a group name per slot and calling
+
+```cpp
+GetMeshSet(container, group, /*offset*/ nullptr, /*flags*/ 7);
 ```
-CULL%02d        base
-CULL%02d_H      high LOD          CULL%02d_H2
-CULL%02d_M      medium LOD        CULL%02d_M2
-CULL%02d_L      low LOD           CULL%02d_L2
-CULL%02d_A      (far//additional) CULL%02d_A2
-```
 
-It logs which of these it found as
-`Flags nlod=%d h=%d m=%d l=%d a=%d h2=%d m2=%d l2=%d a2=%d`, and a cell with neither `CULL%02d` nor
-`CULL%02d_H` produces `Group CULL%02d (or _H) is missing from city '%s'`.
+`7` is `MESH_SET_UV | MESH_SET_NORMAL | MESH_SET_CPV`, so **cell geometry always loads with normals
+and vertex colours** — unlike instance meshes, which only get them when
+`mmInstance::InitMeshes` decides they are a collider, mover or obstacle.
 
-So per cell you may supply up to four LODs, each optionally with a second `…2` variant. The purpose
-of the `2` set is **not confirmed**; the most likely reading is the second render pass, given the
-`MULTIPASS` global next door in `renderweb.h`. Treat that as unverified.
+Which slots are attempted is decided bit by bit from **`cull_flags`, the second column of
+`.cells`**. This is what that field means:
+
+| `cull_flags` bit | Group name | Slot |
+|---|---|---|
+| 0 (`0x001`) | `CULL%02d_A` | `Meshes[3]` |
+| 1 (`0x002`) | `CULL%02d_L` | `Meshes[0]` |
+| 2 (`0x004`) | `CULL%02d_M` | `Meshes[1]` |
+| 3 (`0x008`) | `CULL%02d_H` | `Meshes[2]` |
+| 5 (`0x020`) | `CULL%02d_A2` | `Meshes[7]` |
+| 6 (`0x040`) | `CULL%02d_L2` | `Meshes[4]` |
+| 7 (`0x080`) | `CULL%02d_M2` | `Meshes[5]` |
+| 8 (`0x100`) | `CULL%02d_H2` | `Meshes[6]` |
+
+So the array is ordered **[L, M, H, A, L2, M2, H2, A2]** — increasing detail, then the `A` variant,
+then the same four again for the second set. Bit 4 is unused; the low five bits are tested together
+(`and eax, 0x1F`) as "does this cell have any first-set geometry at all".
+
+**Bit 3 is special.** When it is set the high LOD is looked up as `CULL%02d_H`; when it is clear the
+*same slot* is filled from the unsuffixed `CULL%02d` instead. A cell therefore either uses the
+suffixed LOD naming or a single unsuffixed group, and bit 3 is the switch. If neither resolves, the
+load aborts with `Group CULL%02d (or _H) is missing from city '%s'`.
+
+`Init` then logs what it found —
+`Flags nlod=%d h=%d m=%d l=%d a=%d h2=%d m2=%d l2=%d a2=%d` — runs `GetPolyInfo` over all eight
+slots and appends a `%d,%d,%d,%d,%d,%d,%d,%d,%d` row to the `<name>_static.csv` log (§8), then
+derives `CellCenter` and `CellMagnitude` via `GetBoundInfo`. Those two are what `OptimizePortals`
+uses for its "suspicious portal" distance check (§2.2).
+
+### 3.2 The rest of `mmCellRenderer`
+
+`Init(container, index, cull_flags, room_flags, tag_count, tags)` maps one-to-one onto the `.cells`
+columns. Beyond the mesh slots it stores `Index`, `RoomFlags`, `VisitTagCount` and `VisitTags`
+directly; `cull_flags` is the only column not kept, because it has already been consumed to decide
+which groups to load.
 
 `asRenderWeb::PassMask` splits drawing into `RENDER_PASS_TERRAIN` (roads, grass, water, bridges),
-`SHADOWS`, `BUILDINGS`, `OBJECTS` and `LIGHTS`.
+`SHADOWS`, `BUILDINGS`, `OBJECTS` and `LIGHTS`. The `…2` slots line up with the second pass, given
+the `MULTIPASS` global next door in `renderweb.h` — consistent, but not proven from the disassembly.
 
 ---
 
-## 4. Collision bounds
+## 4. Collision bounds — `.geo` and `.bnd`
 
-`LoadHitId` prefers a dedicated `<name>_hitid` bound template and falls back to the `BOUND`
-sub-object of `<name>city`, recording which it got in `HasHitIdBound`.
+`LoadHitId` prefers a dedicated `<name>_hitid` bound and falls back to the `BOUND` group of
+`<name>city`, recording which it got in `HasHitIdBound`. `LoadRoomBounds` then loads one bound per
+cell, named `BOUND%02d`, from the same container the geometry came from — **but only when
+`HasHitIdBound` is true**, so a city with no `_hitid` silently gets no per-room collision at all.
 
-`LoadRoomBounds` then loads one bound per cell, named `BOUND%02d` (matching the cell index), out of
-the same container the geometry came from — **but only if `HasHitIdBound` is true**. A city without a
-`_hitid` file gets no per-room bounds at all.
+Chicago overrides two: cell 60 (construction) uses `dl60_bnd`, both Wrigley cells use `dl24_bnd`.
 
-Chicago overrides two of these to standalone files: cell 60 (construction) uses `dl60_bnd` and both
-Wrigley cells use `dl24_bnd`.
+### 4.1 `GetBoundTemplate` is a cache in front of `Load`
 
-`mmBoundTemplate::GetBoundTemplate` itself is closed.
+Decoded from `game.asm` ~350772. It builds a key with `sprintf("%s_%s", name, group)`, looks it up
+in a global `HashTable`, and returns the existing template with an `AddRef` on a hit. On a miss it
+allocates `0xB4` bytes, calls `mmBoundTemplate::Load`, and on success `strdup`s the key into
+`Name` (offset `0xB0`) and inserts it. A failed `Load` deletes the object and returns null.
+
+### 4.2 `.bnd` is generated from `.geo`
+
+`mmBoundTemplate::Load` (`game.asm` 342715..344747) works on two paths:
+
+* **source** — `geo/%s.geo`
+* **cache** — `bnd/%s`, opened `"r"` to read and `"w"` to write
+
+It calls `OutOfDate()` on the pair, and when the cache is stale, or its header does not match, it
+prints
+
+```
+Bound file '%s/%s' format or offset doesn't match, regenerating.
+```
+
+and rebuilds from the `.geo`. **This is the same source-and-cache arrangement as `.map` -> `.bai`
+(§7.1) and the portal optimisation (§2.2), and it means `.bnd` files never need to be authored
+either** — ship the `.geo` and let the game bake them.
+
+The group names it looks for inside a `.geo` are `CULL`, `HITID` and `HOT_VERTS`. A missing one
+gives `mmBoundTemplate::Load: no group '%s' in '%s'`.
+
+An assert in this function still carries its original source path, `C:\mm\src\mmdyna\bndtmpl2.c`.
+
+### 4.3 `.bnd` header and scalar block
+
+Header, in file order:
+
+```c
+u32     Magic;    // 0x424E4432 - 'B','N','D','2' as a dword, so the bytes on disk read "2DNB"
+Vector3 Offset;   // the origin this bound was baked at
+i32     XDim;     // -> mmBoundTemplate +0x80
+b32     YDim;     //                    +0x84
+i32     ZDim;     //                    +0x88
+```
+
+Both the magic **and** the offset are validated: the stored `Offset` is differenced against the
+`Vector3*` the caller passed to `GetBoundTemplate` and the squared distance tested. A cache baked at
+a different origin is rejected and regenerated, which is why the offset is part of the header rather
+than applied at load.
+
+The scalar block then reads straight into the object, and every target maps onto a named member of
+`mmBoundTemplate` (`mmdyna/bndtmpl.h`):
+
+| Size | Offset | Field |
+|---|---|---|
+| 0x0C | 0x1C | `Center` |
+| 0x04 | 0x28 | `Radius` |
+| 0x04 | 0x2C | `RadiusSqr` |
+| 0x0C | 0x30 | `BBMin` |
+| 0x0C | 0x3C | `BBMax` |
+| 0x04 | 0x48 | `NumVerts` |
+| 0x04 | 0x4C | `NumPolys` |
+| 0x04 | 0x58 | `NumHotVerts1` |
+| 0x04 | 0x5C | `NumHotVerts2` |
+| 0x04 | 0x60 | `NumEdges` |
+| 0x04 | 0xA0 | `XScale` |
+| 0x04 | 0xA4 | `ZScale` |
+| 0x04 | *static* | `mmBoundTemplate::NumIndexs` — a **static**, not a member |
+| 0x04 | 0x9C | `HeightScale` |
+| 0x04 | *stack* | one more count, consumed locally |
+
+After that, `EnableBinaryFileMapping` decides whether the bulk arrays (`Verts`, `Polygons`,
+`HotVerts`, `EdgeVerts1/2`, `RowOffsets`, `BucketOffsets`, `RowBuckets`, `FixedHeights`) are
+memory-mapped in place or read into freshly allocated blocks — hence the `Tell`/`Seek` pairs around
+that point. Those array layouts are **not decoded here**; the member declarations in `bndtmpl.h`,
+including the bucket-walk comment above `RowOffsets`, describe how they are used at runtime.
+
+`XDim`/`YDim`/`ZDim` with `XScale`/`ZScale`/`HeightScale` and the `RowOffsets` / `BucketOffsets` /
+`RowBuckets` triple are a **uniform grid index over the polygons** — the bound is a heightfield-ish
+spatial hash, not a raw mesh, which is why it is baked rather than loaded directly from `.geo`.
 
 ---
 
@@ -433,6 +541,11 @@ Ordered by how much of the work is already done for you.
 **Already writable from open code.** Mesh data via `agiMeshSet::BinarySave`
 (`agiworld/meshsave.cpp`), portals via `SavePortals`, and `.cells` is text. `.bng` and `.fcd` are
 simple enough to emit from the layouts above.
+
+**Three formats bake themselves.** `.bai` from `.map`/`.road` (§7.1), `.bnd` from `.geo` (§4.2), and
+an optimised `.ptl` from a rough one (§2.2). All three compare timestamps, regenerate when stale and
+write the result. None of them needs a hand-authored binary — which is most of what once looked like
+the hard part of this format.
 
 **Constraints a generator must respect.**
 
