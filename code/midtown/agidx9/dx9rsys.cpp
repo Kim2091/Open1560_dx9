@@ -1753,7 +1753,7 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
     // it here rather than at the end of the skinned branch keeps it on the same shared path as every
     // other piece of state MeshWorld programs, which is the drift this function exists to prevent.
     device->SetRenderState(D3DRS_VERTEXBLEND, D3DVBF_DISABLE);
-    device->SetRenderState(D3DRS_INDEXEDVERTEXBLEND, FALSE);
+    device->SetRenderState(D3DRS_INDEXEDVERTEXBLENDENABLE, FALSE);
 
     // Reset the depth bias so it doesn't leak into pretransformed (agiScreenVtx) draws, which
     // have no need for it and aren't tracked by FlushState()'s dirty-checking anyway.
@@ -2420,7 +2420,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         // D3DVBF_0WEIGHTS: no weights at all, one matrix per vertex named by its own index. The
         // binding is rigid, so there is nothing to blend and nothing to normalise - this is the
         // degenerate case of vertex blending, and the cheapest thing the vertex pipeline can do.
-        device->SetRenderState(D3DRS_INDEXEDVERTEXBLEND, TRUE);
+        device->SetRenderState(D3DRS_INDEXEDVERTEXBLENDENABLE, TRUE);
         device->SetRenderState(D3DRS_VERTEXBLEND, D3DVBF_0WEIGHTS);
     }
     else
