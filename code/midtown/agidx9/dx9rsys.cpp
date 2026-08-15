@@ -43,7 +43,6 @@
 #include "dx9texdef.h"
 
 #include "dx9_windows.h"
-#include "mmsettings/settings.h"
 
 #include <algorithm>
 #include <cmath>
@@ -502,7 +501,7 @@ i32 agiDX9Rasterizer::BeginGfx()
 
         if (supported && (caps.MaxAnisotropy > 1))
         {
-            const DWORD wanted = static_cast<DWORD>(std::max(1, mmSettingInt("aniso", 16)));
+            const DWORD wanted = static_cast<DWORD>(std::max(1, PARAM_aniso.get_or(16)));
 
             g_MaxAnisotropy = std::min(wanted, caps.MaxAnisotropy);
         }
@@ -1172,7 +1171,7 @@ static u64 agiDX9GHashBytes(const void* data, usize size, u64 hash)
 static u64 agiDX9GHashRecord(
     const agiWorldVtx* vertices, i32 vertex_count, const u16* indices, i32 index_count, agiDX9TexDef* texture)
 {
-    if (!PARAM_ghash.get_or(false) && !mmSettingBool("ghashcolor"))
+    if (!PARAM_ghash.get_or(false) && !PARAM_ghashcolor.get_or(false))
         return 0;
 
     if (!vertices || !indices || (vertex_count <= 0) || (index_count <= 0))
@@ -1330,24 +1329,6 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
 
     FlushState();
 
-    // REVERTED - see below. Restored exactly as it was.
-    //
-    // This guard was changed to resolve the texture from agiCurState rather than from
-    // current_texture_, to fix menu bitmaps rendering as flat black. The reasoning still looks right
-    // in isolation: current_texture_ is FlushState()'s cache of stage 0, MeshWorld writes it
-    // directly without updating agiLastState.Texture, and a following screen draw can therefore find
-    // it holding a world texture or nothing at all - and be dropped by this guard.
-    //
-    // But it broke rendering broadly, not just the case it was aimed at, and that is the answer: for
-    // most draws current_texture_ IS the truth and agiCurState is not. FlushState() opens with
-    // `if (!agiCurState.IsTouched()) return;`, so a run of draws sharing one state never re-resolves
-    // anything - the device keeps the binding from the draw that did, and current_texture_ is the
-    // only record of it. Reading agiCurState instead reads a value nothing has been keeping current
-    // for this purpose, and drops or mis-textures everything that relies on the run.
-    //
-    // The menu bug is real and still unfixed. The fix has to keep current_texture_ authoritative and
-    // repair the specific place it goes stale - MeshWorld leaving it null after its second passes -
-    // rather than replacing the mechanism wholesale.
     if ((current_texture_ == nullptr) && (tex_env_ != agiTexEnv::Disable))
         return;
 
@@ -1406,7 +1387,7 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
     // draw has an identity Remix could key on. It does not: pretransformed vertices carry no
     // world-space information, so anything painted magenta here is geometry Remix cannot see at all.
     // Pair it with the IN-SCENE SCREEN DRAWS BY TEXTURE line, which names the same draws.
-    const bool mark_screen = mmSettingBool("ghashcolor") && Pipe()->IsInScene();
+    const bool mark_screen = PARAM_ghashcolor.get_or(false) && Pipe()->IsInScene();
 
     if (mark_screen)
     {
@@ -1627,7 +1608,7 @@ static mem::cmd_param PARAM_d3d9_specular {"d3d9specular", "Add a specular term 
 
 bool agiDX9WantsStaticSpecular()
 {
-    return mmSettingBool("d3d9specular");
+    return PARAM_d3d9_specular.get_or(false);
 }
 
 // Builds the fixed sun/fill1/fill2 + ambient rig agiMeshLighterTriple/Quarter compute on the CPU
@@ -2057,7 +2038,7 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
 // Capped at 256 because that is the width of the index the vertex carries - one byte.
 u32 agiDX9Rasterizer::MaxNativeSkinBones() const
 {
-    if (mmSettingBool("noskin"))
+    if (PARAM_noskin.get_or(false))
         return 1;
 
     agiDX9Context* context = Pipe()->Context();
@@ -2125,7 +2106,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     //
     // Kept as a parameter rather than deleted because the census still reports a nonzero in-scene
     // screen-triangle count, so some 3D content has not moved over yet.
-    const f32 depth_bias = mmSettingFloat("d3d9depthbias", 0.0f);
+    const f32 depth_bias = PARAM_d3d9_depthbias.get_or(0.0f);
     device->SetRenderState(D3DRS_DEPTHBIAS, *reinterpret_cast<const DWORD*>(&depth_bias));
 
     // FlushState()'s texture/texture-stage bookkeeping (current_texture_/tex_env_) only updates
@@ -2373,7 +2354,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // ---------------------------------------------------------------------------------------------
 
     // -d3d9nofx. Resolved once so both branches below agree.
-    const bool material_fx = fx && (fx->ReflectionTexture || fx->EnvTexture) && !mmSettingBool("d3d9nofx");
+    const bool material_fx = fx && (fx->ReflectionTexture || fx->EnvTexture) && !PARAM_d3d9_nofx.get_or(false);
 
     // Does this draw need the matrix palette, or just a world matrix? A palette of one is the
     // latter - see the transform block below.
@@ -2543,7 +2524,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // No explicit restore: RestoreStateAfterWorldDraw() below already re-applies ApplyTexEnv() from
     // tex_env_, which puts COLOROP/COLORARG1 back, and the stale TEXTUREFACTOR value is only ever
     // read when a stage selects TFACTOR, which nothing else does.
-    if (mmSettingBool("ghashcolor"))
+    if (PARAM_ghashcolor.get_or(false))
     {
         device->SetRenderState(D3DRS_TEXTUREFACTOR, agiDX9GHashColor(geometry_hash));
         device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);

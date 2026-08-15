@@ -28,8 +28,8 @@ class Matrix34;
 // This does not touch a camera. It maintains the STATE - how hard the car is currently being driven,
 // and where in the noise that puts us - and hands out samples; what to do with them is the camera's
 // business, and the two that use it do quite different things. OrbitCamCS rolls and nudges a chase
-// view; PovCamCS bobs a head in a seat. Sharing the model rather than the application is what keeps
-// them feeling like the same car without pretending they are the same shot.
+// view; DashCamCS bobs a head. Sharing the model rather than the application is what keeps them
+// feeling like the same car without pretending they are the same shot.
 //
 // Four sources feed one normalised trauma value: engine revs, road roughness, longitudinal
 // acceleration and impacts. The amplitude is its square, so low trauma stays imperceptible rather
@@ -81,15 +81,6 @@ public:
     f32 AccelTrauma {};
     f32 ImpactTrauma {};
 
-    // Longitudinal acceleration again, but SIGNED and not fed through the shake at all: positive
-    // when the car is gaining speed along its own nose, negative under braking, normalised to the
-    // same reference AccelTrauma uses.
-    //
-    // AccelTrauma measures how hard, which is all a vibration needs. A head also needs to know which
-    // WAY, because being pushed back into the seat and being thrown at the wheel are not the same
-    // event - and that lean is most of what separates a head from a camera mount.
-    f32 AccelSigned {};
-
     // Smoothed 0..1 measure of how hard the view is being turned, from whichever of the car and the
     // mouse is turning faster.
     f32 TurnFactor {};
@@ -131,9 +122,6 @@ private:
     f32 prev_suspension_[4] {};
     f32 prev_heading_ {};
     b32 has_history_ {};
-
-    // The settings generation the tunables above were resolved at - see mmSettingsGeneration.
-    u32 generation_ {};
 
     f32 Combine() const;
 };

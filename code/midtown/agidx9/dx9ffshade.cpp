@@ -26,7 +26,6 @@ define_dummy_symbol(agidx9_dx9ffshade);
 #include "dx9context.h"
 
 #include "dx9_windows.h"
-#include "mmsettings/settings.h"
 
 #include <algorithm>
 #include <cmath>
@@ -41,7 +40,7 @@ static mem::cmd_param PARAM_ffperpixel_reflect {
 
 bool agiDX9PerPixelEnabled()
 {
-    return mmSettingBool("ffperpixel");
+    return PARAM_ffperpixel.get_or(false);
 }
 
 u32 agiDX9PerPixelSpecularSteps()

@@ -32,11 +32,8 @@ public:
     // ?CancelAction@PUGraphics@@QAEXXZ
     ARTS_IMPORT void CancelAction();
 
-    // Reimplemented in mmui/pu_graphics.cpp to add the way through to the advanced pages. The
-    // original is a single call and is reproduced there unchanged.
-
     // ?PreSetup@PUGraphics@@UAEXXZ
-    ARTS_EXPORT void PreSetup() override;
+    ARTS_IMPORT void PreSetup() override;
 };
 
 check_size(PUGraphics, 0xC0);

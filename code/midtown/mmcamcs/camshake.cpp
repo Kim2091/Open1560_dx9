@@ -21,7 +21,6 @@ define_dummy_symbol(mmcamcs_camshake);
 #include "camshake.h"
 
 #include "mmcar/car.h"
-#include "mmsettings/settings.h"
 #include "vector7/matrix34.h"
 
 static mem::cmd_param PARAM_shake {"orbitshake", "Camera engine shake strength; 0 is off"};
@@ -167,26 +166,24 @@ static f32 ShakeNoise(f32 time, i32 salt)
 
 void mmCamShake::Init()
 {
-    generation_ = mmSettingsGeneration();
+    Amplitude = PARAM_shakeamp.get_or(1.0f);
+    EngineScale = PARAM_shake.get_or(0.8f);
+    RoughScale = PARAM_shakerough.get_or(0.55f);
+    ImpactScale = PARAM_shakeimpact.get_or(1.0f);
+    AccelScale = PARAM_shakeaccel.get_or(0.35f);
 
-    Amplitude = mmSettingFloat("orbitshakeamp", 1.0f);
-    EngineScale = mmSettingFloat("orbitshake", 0.8f);
-    RoughScale = mmSettingFloat("orbitshakerough", 0.55f);
-    ImpactScale = mmSettingFloat("orbitshakeimpact", 1.0f);
-    AccelScale = mmSettingFloat("orbitshakeaccel", 0.35f);
-
-    RpmStart = mmSettingFloat("orbitshakerpm", 0.55f);
+    RpmStart = PARAM_shakerpm.get_or(0.55f);
 
     // Narrow, and floored at third on top of that. The engine shake is at its most convincing as
     // something that only shows up once the car is genuinely working - in the gears it spends real
     // time in at speed - and it reads as a rattle rather than a top end when it can reach full
     // strength in a gear the car merely passes through.
-    GearSpan = mmSettingFloat("orbitshakegears", 1.5f);
-    MinGear = mmSettingFloat("orbitshakemingear", 3.0f);
-    ShiftDip = mmSettingFloat("orbitshakeshift", 0.35f);
-    RevRolloff = mmSettingFloat("orbitshakerevtop", 0.35f);
+    GearSpan = PARAM_shakegears.get_or(1.5f);
+    MinGear = PARAM_shakemingear.get_or(3.0f);
+    ShiftDip = PARAM_shakeshift.get_or(0.35f);
+    RevRolloff = PARAM_shakerevtop.get_or(0.35f);
 
-    TurnScale = mmSettingFloat("orbitshaketurn", 1.0f);
+    TurnScale = PARAM_shaketurn.get_or(1.0f);
 }
 
 void mmCamShake::Reset()
@@ -194,7 +191,6 @@ void mmCamShake::Reset()
     EngineTrauma = 0.0f;
     RoughTrauma = 0.0f;
     AccelTrauma = 0.0f;
-    AccelSigned = 0.0f;
     ImpactTrauma = 0.0f;
     TurnFactor = 0.0f;
 
@@ -229,12 +225,6 @@ void mmCamShake::Update(const mmCar* car, const Matrix34* car_matrix, f32 delta,
 {
     if (delta <= 0.0f)
         return;
-
-    // Re-resolve when the menu has changed something. One integer compare in the common case, which
-    // is what buys the tunables being ordinary fields rather than a name lookup each time they are
-    // read - and there are a dozen of them read several times a frame.
-    if (generation_ != mmSettingsGeneration())
-        Init();
 
     if (car)
     {
@@ -345,7 +335,6 @@ void mmCamShake::Update(const mmCar* car, const Matrix34* car_matrix, f32 delta,
         // looks like.
         Vector3 velocity = sim.ICS.LinearVelocity;
         f32 accel_target = 0.0f;
-        f32 signed_target = 0.0f;
 
         if (has_history_)
         {
@@ -353,10 +342,7 @@ void mmCamShake::Update(const mmCar* car, const Matrix34* car_matrix, f32 delta,
             f32 magnitude = change.Mag() / delta;
 
             if (car_matrix)
-            {
-                signed_target = std::clamp((change ^ car_matrix->m2) / delta / AccelReference, -1.0f, 1.0f);
-                accel_target = std::fabs(signed_target);
-            }
+                accel_target = std::clamp(std::fabs(change ^ car_matrix->m2) / delta / AccelReference, 0.0f, 1.0f);
 
             if (magnitude > ImpactThreshold)
                 ImpactTrauma =
@@ -366,11 +352,6 @@ void mmCamShake::Update(const mmCar* car, const Matrix34* car_matrix, f32 delta,
         prev_velocity_ = velocity;
 
         AccelTrauma = Envelope(AccelTrauma, accel_target, delta, AccelAttack, AccelRelease);
-
-        // Chased at the attack rate in both directions: the lean should track the throttle and the
-        // brake equally closely, and an asymmetric follower would make it drift back to centre at a
-        // different speed from the one it left at.
-        AccelSigned += (signed_target - AccelSigned) * Blend(AccelAttack, delta);
     }
     else
     {
@@ -378,7 +359,6 @@ void mmCamShake::Update(const mmCar* car, const Matrix34* car_matrix, f32 delta,
         EngineTrauma = Envelope(EngineTrauma, 0.0f, delta, EngineRelease, EngineRelease);
         RoughTrauma = Envelope(RoughTrauma, 0.0f, delta, RoughRelease, RoughRelease);
         AccelTrauma = Envelope(AccelTrauma, 0.0f, delta, AccelRelease, AccelRelease);
-        AccelSigned -= AccelSigned * Blend(AccelRelease, delta);
     }
 
     ImpactTrauma *= std::exp(-ImpactDecay * delta);

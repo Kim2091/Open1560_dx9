@@ -31,7 +31,6 @@ include "mmgame"
 include "mminput"
 include "mmnetwork"
 include "mmphysics"
-include "mmsettings"
 include "mmui"
 include "mmwidget"
 include "pcwindis"
@@ -103,7 +102,6 @@ project "Open1560"
         "arts_mminput",
         "arts_mmnetwork",
         "arts_mmphysics",
-        "arts_mmsettings",
         "arts_mmui",
         "arts_mmwidget",
         "arts_pcwindis",
