@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "camshake.h"
 #include "carcamcs.h"
 
 // A mouse-driven orbital chase camera with a speed-reactive shake.
@@ -26,14 +27,14 @@
 // exponential filter, so the view is smooth and behaves the same at 30 and 300 fps. After a short
 // idle the target eases back behind the car, the way a driving game's chase camera does.
 //
-// On top of that sits a trauma-driven shake. Four sources - engine revs, road roughness,
-// longitudinal acceleration and impacts - each contribute to a single normalised trauma value, and
-// the shake amplitude is its square, so low trauma stays imperceptible rather than a constant buzz.
-// A turn gate sits over the top of all four: while the view is being turned, by the car or by the
-// mouse, the shake stands down, because vibration on top of a view that is already moving reads as
-// instability rather than as speed.
-// The displacement itself is layered sine noise at incommensurate frequencies rather than
-// per-frame randomness, which is what makes it read as vibration instead of jitter.
+// On top of that sits a trauma-driven shake, which lives in mmCamShake and is shared with the
+// dashboard camera - see camshake.h for how it is driven and why. This class only decides what to do
+// with it: a little pitch and yaw, rather more roll, and a few centimetres across the view.
+//
+// The camera also stays out of the world. Every frame it probes from the point it orbits out to
+// where the eye wants to be, and sits just short of whatever stands in the way, so the view no
+// longer sinks through roads, walls and hillsides; a second probe straight down keeps it off the
+// surface underneath, which is the case an occlusion test alone cannot catch. See SolveCollision.
 //
 // This class does not exist in the original game, so unlike every other camera here it declares no
 // imported or exported members, no GetClass() override, and no check_size:
@@ -97,25 +98,6 @@ public:
     f32 FrameStartSpeed {};
     f32 FrameMaxSpeed {};
 
-    // Fraction of the redline the engine shake starts building from, how many of the top gears it
-    // is allowed in at all, and how far it dips while a shift is in progress.
-    f32 ShakeRpmStart {};
-    f32 ShakeGearSpan {};
-    f32 ShakeShiftDip {};
-
-    // Lowest forward gear the engine shake is allowed in at all - 1 is first gear. A hard floor
-    // underneath ShakeGearSpan's fade, so a car with a short gearbox cannot reach full shake in
-    // what is effectively second.
-    f32 ShakeMinGear {};
-
-    // How much of the rev band's top end is taken back off again. 0 keeps the original straight
-    // ramp to the redline; higher flattens the last of it, so the shake still builds with the revs
-    // but stops climbing as hard once the needle is already round.
-    f32 ShakeRevRolloff {};
-
-    // How much of the shake a full-rate turn removes. 1 silences it completely while turning.
-    f32 ShakeTurnScale {};
-
     // Added to Distance/Height across the framing band; the camera eases back and drops slightly.
     f32 SpeedDistance {};
     f32 SpeedHeight {};
@@ -126,43 +108,20 @@ public:
 
     // --- Shake ---------------------------------------------------------------------------------
 
-    // Overall displacement multiplier. Separate from the weights below because trauma is clamped
-    // to one, so those cannot push the shake past full strength - only this can.
-    f32 ShakeAmplitude {};
+    // The trauma model, shared with the dashboard camera - see mmCamShake. This class only decides
+    // what to do with the result; how hard the car is being driven is not its business.
+    mmCamShake Shake {};
 
-    // Per-source weights into the combined trauma. Any can be set to zero independently.
-    f32 ShakeScale {};
-    f32 ShakeRoughScale {};
-    f32 ShakeImpactScale {};
-    f32 ShakeAccelScale {};
+    // --- Collision -----------------------------------------------------------------------------
 
-    // Phase of the noise, advanced at a rate that rises with trauma, and the current amplitude.
-    // Both are held still while paused so the shake freezes rather than idling in place. GustTime
-    // runs much slower and drives the amplitude wander; it needs its own accumulator so that its
-    // phase wrap lands on the lattice too.
-    f32 ShakeTime {};
-    f32 GustTime {};
-    f32 ShakeAmount {};
+    b32 CollideEnabled {};
 
-    f32 EngineTrauma {};
-    f32 RoughTrauma {};
-    f32 AccelTrauma {};
-    f32 ImpactTrauma {};
-
-    // Smoothed 0..1 measure of how hard the view is being turned, from whichever of the car and
-    // the mouse is turning faster. Scales the whole shake down rather than any one source, because
-    // what makes shake unbearable in a corner is that it fights a camera that is already moving.
-    f32 TurnFactor {};
-
-    // Radians per second the mouse is currently yawing the camera at. Sampled in Update(), where
-    // the mouse delta is, and consumed by UpdateTrauma().
-    f32 MouseTurnRate {};
-
-    // Previous-frame state for the derivatives the trauma sources are built from.
-    Vector3 PrevVelocity {};
-    f32 PrevSuspension[4] {};
-    f32 PrevHeading {};
-    b32 HasHistory {};
+    // Distance the camera is actually allowed this frame, and how far it has been lifted to clear
+    // the ground beneath it. Both are rate limited rather than applied outright, so they carry
+    // between frames - see SolveCollision.
+    f32 CollideDistance {};
+    f32 CollideLift {};
+    b32 HasCollideHistory {};
 
 private:
     // Re-reads the mouse accumulator without applying it, so a stretch of suppressed input never
@@ -172,9 +131,10 @@ private:
     // Eases the target back behind the car once the mouse has been idle for RecenterDelay.
     void Recenter(f32 delta);
 
-    // Advances the four trauma sources from this frame's car state.
-    void UpdateTrauma(f32 delta);
+    // Advances the speed-driven framing (distance, height, FOV) from this frame's car state.
+    void UpdateFraming(f32 delta);
 
-    // Combines the trauma sources into the amplitude the shake is driven at.
-    f32 GetShakeAmount() const;
+    // How far back the camera may sit this frame given what is in the way, and how far it has to be
+    // lifted to stay out of the ground. Writes CollideDistance/CollideLift and returns the former.
+    f32 SolveCollision(f32 wanted, const Vector3& pivot, f32 yaw, f32 pitch, f32 roll);
 };

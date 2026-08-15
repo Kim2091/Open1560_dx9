@@ -24,6 +24,9 @@ define_dummy_symbol(mmcamcs_orbitcamcs);
 #include "eventq7/event.h"
 #include "mmcar/car.h"
 #include "mmcar/trailer.h"
+#include "mmdyna/isect.h"
+#include "mmdyna/poly.h"
+#include "mmphysics/phys.h"
 
 static mem::cmd_param PARAM_orbitsens {"orbitsens", "Orbital camera mouse sensitivity, in radians per mouse count"};
 static mem::cmd_param PARAM_orbitdist {"orbitdist", "Orbital camera distance from the car"};
@@ -36,28 +39,13 @@ static mem::cmd_param PARAM_orbitrecenter {
 static mem::cmd_param PARAM_orbitdrift {
     "orbitdrift", "How far the orbital camera follows the direction of travel in a slide; 0 locks it to the tail"};
 
-static mem::cmd_param PARAM_orbitshake {"orbitshake", "Orbital camera engine shake strength; 0 is off"};
-static mem::cmd_param PARAM_orbitshakeamp {"orbitshakeamp", "Overall orbital camera shake displacement multiplier"};
-static mem::cmd_param PARAM_orbitshakerough {"orbitshakerough", "Orbital camera road roughness shake strength"};
-static mem::cmd_param PARAM_orbitshakeimpact {"orbitshakeimpact", "Orbital camera collision impact shake strength"};
-static mem::cmd_param PARAM_orbitshakeaccel {"orbitshakeaccel", "Orbital camera acceleration shake strength"};
-static mem::cmd_param PARAM_orbitshakerpm {
-    "orbitshakerpm", "Fraction of the redline the engine shake starts building from"};
-static mem::cmd_param PARAM_orbitshakegears {
-    "orbitshakegears", "How many of the top gears the engine shake is allowed in"};
-static mem::cmd_param PARAM_orbitshakeshift {
-    "orbitshakeshift", "How far the engine shake dips while a gear change is in progress"};
-static mem::cmd_param PARAM_orbitshakemingear {
-    "orbitshakemingear", "Lowest forward gear the engine shake is allowed in at all; 1 is first"};
-static mem::cmd_param PARAM_orbitshakerevtop {
-    "orbitshakerevtop", "How much of the engine shake's top-end rev ramp is taken back off; 0 is the straight ramp"};
-static mem::cmd_param PARAM_orbitshaketurn {
-    "orbitshaketurn", "How much of the shake a turn removes; 1 silences it while turning, 0 is off"};
 static mem::cmd_param PARAM_orbitdistmin {"orbitdistmin", "Speed the camera starts pulling back at, in mph"};
 static mem::cmd_param PARAM_orbitdistmax {"orbitdistmax", "Speed the camera is fully pulled back at, in mph"};
 static mem::cmd_param PARAM_orbitpullback {"orbitpullback", "Metres the camera eases back by at full speed"};
 static mem::cmd_param PARAM_orbitpulldown {"orbitpulldown", "Metres the camera drops by at full speed"};
 static mem::cmd_param PARAM_orbitfov {"orbitfov", "Degrees of FOV widening at full speed; 0 is off"};
+static mem::cmd_param PARAM_orbitcollide {
+    "orbitcollide", "Keep the orbital camera out of world geometry; 0 lets it pass through"};
 
 // Kept clear of +/- PI/2 so the view never degenerates looking straight down or up.
 static constexpr f32 OrbitPitchMin = -0.35f;
@@ -90,6 +78,32 @@ static constexpr f32 OrbitRecenterMinSpeed = 6.0f;
 // delta - the mouse leaving the window, or a stretch of frames where input was suppressed.
 static constexpr i32 OrbitMaxMouseStep = 250;
 
+// --- Collision -------------------------------------------------------------------------------
+
+// How much clear space is kept between the eye and whatever it was stopped by, in metres. Large
+// enough that the near plane (CameraNear, 0.5 below) does not slice into the surface, and that the
+// shake applied after the solve cannot cross it.
+static constexpr f32 OrbitCollideSkin = 0.6f;
+
+// Closest the camera will ever be pulled, in metres. Below this the car fills the frame and the view
+// is useless anyway, so an obstruction this severe is better answered by giving up and letting the
+// geometry pass than by shoving the eye into the driver's seat.
+static constexpr f32 OrbitCollideMin = 1.2f;
+
+// Vertical clearance kept above whatever is directly under the eye, in metres, and the half-length
+// of the probe that measures it.
+static constexpr f32 OrbitCollideGround = 0.75f;
+
+// Metres per second the solve is allowed to move the camera by.
+//
+// The asymmetry is the whole trick. Pulling IN is near-instant, because a frame spent inside a wall
+// is a frame looking at the inside of the world and there is no graceful way to ease into that.
+// Pushing back OUT is slow, because the obstruction clearing is not something the player asked for,
+// and a camera that springs back the moment it can is far more distracting than one that takes half
+// a second to notice.
+static constexpr f32 OrbitCollidePullIn = 60.0f;
+static constexpr f32 OrbitCollidePushOut = 3.0f;
+
 // Peak rotational displacement at full amplitude, in radians. Roll is allowed the most: rolling the
 // view reads as violence without ever pointing the camera away from the car, which is why it
 // carries most of the effect here. All three are small - shake that is obvious on a screenshot is
@@ -101,63 +115,9 @@ static constexpr f32 OrbitShakeRoll = 0.024f;
 // Peak positional displacement, in metres, along the camera's own right and up axes.
 static constexpr f32 OrbitShakeOffset = 0.05f;
 
-// Fundamental frequency of the shake, in cycles per second, rising with trauma. Since trauma is
-// mostly engine revs, the vibration tightens as the needle climbs and slackens on every upshift,
-// which is what an engine actually does. The octave multipliers below sit on top of this.
-static constexpr f32 OrbitShakeBaseHz = 13.0f;
-static constexpr f32 OrbitShakeHzRange = 11.0f;
-
-// Rate the amplitude itself wanders at, relative to the shake frequency. Real vibration does not
-// hold a constant intensity - it gusts - and a fixed amplitude is most of what makes shake read as
-// artificial. This modulates between OrbitGustFloor and full strength.
-static constexpr f32 OrbitGustRatio = 0.25f;
-static constexpr f32 OrbitGustFloor = 0.4f;
-
-// Independent hash salts, so the axes never correlate into a single diagonal wobble.
-static constexpr i32 OrbitSaltPitch = 0;
-static constexpr i32 OrbitSaltYaw = 1;
-static constexpr i32 OrbitSaltRoll = 2;
-static constexpr i32 OrbitSaltRight = 3;
-static constexpr i32 OrbitSaltUp = 4;
-static constexpr i32 OrbitSaltGust = 5;
-
 // Envelope rates. Attack is quicker than release everywhere: effects should arrive promptly and
 // leave gently, or the camera feels twitchy.
 static constexpr f32 OrbitSpeedEnvelopeRate = 2.5f;
-
-// The engine envelope is much quicker than the framing one: revs move fast, and the whole point of
-// driving the shake from them is that it tracks them closely enough to feel the gear change.
-static constexpr f32 OrbitEngineAttack = 9.0f;
-static constexpr f32 OrbitEngineRelease = 6.0f;
-static constexpr f32 OrbitRoughAttack = 14.0f;
-static constexpr f32 OrbitRoughRelease = 5.0f;
-static constexpr f32 OrbitAccelAttack = 10.0f;
-static constexpr f32 OrbitAccelRelease = 3.5f;
-
-// Impacts have no attack at all - they land on the frame they happen and then decay.
-static constexpr f32 OrbitImpactDecay = 3.2f;
-
-// Acceleration magnitude, in m/s^2, beyond which a frame counts as a collision rather than
-// driving. Hard braking peaks around 10; anything near 30 is a wall.
-static constexpr f32 OrbitImpactThreshold = 30.0f;
-static constexpr f32 OrbitImpactRange = 55.0f;
-
-// Longitudinal acceleration, in m/s^2, that produces full acceleration shake.
-static constexpr f32 OrbitAccelReference = 11.0f;
-
-// Mean suspension travel rate, in m/s, that produces full roughness shake.
-static constexpr f32 OrbitRoughReference = 0.85f;
-
-// Turn rate, in radians per second, that produces full shake suppression. About a second and a
-// half for a half turn - brisk cornering rather than a lane change, so ordinary straight-line
-// steering corrections leave the shake alone.
-static constexpr f32 OrbitTurnRateFull = 1.1f;
-
-// Envelope for the turn gate. Attack is near-immediate so the shake is already gone by the time
-// the car is visibly turning; release is slow enough that it does not return between the two
-// halves of an S-bend, where the yaw rate passes through zero but the camera is still working.
-static constexpr f32 OrbitTurnAttack = 16.0f;
-static constexpr f32 OrbitTurnRelease = 2.5f;
 
 // Reduces an angle to [-PI, PI] so yaw never winds up and differences take the short way round.
 static f32 OrbitWrapAngle(f32 angle)
@@ -170,61 +130,6 @@ static f32 OrbitWrapAngle(f32 angle)
 static f32 OrbitBlend(f32 rate, f32 delta)
 {
     return 1.0f - std::exp(-rate * delta);
-}
-
-// Asymmetric envelope follower - rises at one rate, falls at another.
-static f32 OrbitEnvelope(f32 current, f32 target, f32 delta, f32 attack, f32 release)
-{
-    return current + ((target - current) * OrbitBlend((target > current) ? attack : release, delta));
-}
-
-// Length of the noise lattice. The hash index wraps within it, which makes every channel exactly
-// periodic over this many cells; that in turn lets the phase accumulator be wrapped without a
-// discontinuity, and keeps the values it feeds small enough for f32 to resolve them cleanly. At
-// the frequencies used here one period is several minutes, so the repeat is not perceptible.
-static constexpr f32 OrbitNoisePeriod = 4096.0f;
-static constexpr i32 OrbitNoiseMask = 4095;
-
-// Integer hash to [-1, 1]. Salt selects an independent sequence, so two channels sampled at the
-// same instant are uncorrelated.
-static f32 OrbitHash(i32 point, i32 salt)
-{
-    u32 hash = static_cast<u32>(point & OrbitNoiseMask) + (static_cast<u32>(salt) * 0x9E3779B9u);
-
-    hash ^= hash >> 16;
-    hash *= 0x7FEB352Du;
-    hash ^= hash >> 15;
-    hash *= 0x846CA68Bu;
-    hash ^= hash >> 16;
-
-    return (static_cast<f32>(hash >> 8) * (2.0f / 16777215.0f)) - 1.0f;
-}
-
-// Value noise: random values on the integer lattice, smoothstepped between. Unlike a sum of sines
-// this has no period at all, which is what stops the shake being anticipatable, and unlike
-// per-frame randomness it is a continuous function of time, so it looks the same at any frame rate
-// rather than turning into strobing when the frame rate drops.
-static f32 OrbitValueNoise(f32 time, i32 salt)
-{
-    f32 base = std::floor(time);
-    f32 frac = time - base;
-    i32 point = static_cast<i32>(base);
-
-    f32 weight = frac * frac * (3.0f - (2.0f * frac));
-    f32 low = OrbitHash(point, salt);
-
-    return low + ((OrbitHash(point + 1, salt) - low) * weight);
-}
-
-// Three octaves of value noise. The high octaves are what give the motion its grain; without them
-// it reads as a slow sway rather than vibration. Weights sum to one, bounding the result to
-// [-1, 1]. The octave multipliers are whole numbers so that every octave completes a whole number
-// of periods together, which is what keeps the phase wrap seamless; the octaves are decorrelated
-// by salt instead, so nothing lines up into a beat.
-static f32 OrbitShakeNoise(f32 time, i32 salt)
-{
-    return (OrbitValueNoise(time, salt) * 0.55f) + (OrbitValueNoise(time * 2.0f, salt + 64) * 0.33f) +
-        (OrbitValueNoise(time * 4.0f, salt + 128) * 0.12f);
 }
 
 void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
@@ -248,25 +153,6 @@ void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
     YawScale = PARAM_orbitinvertx.get_or(false) ? sensitivity : -sensitivity;
     PitchScale = PARAM_orbitinverty.get_or(false) ? sensitivity : -sensitivity;
 
-    ShakeAmplitude = PARAM_orbitshakeamp.get_or(1.0f);
-    ShakeScale = PARAM_orbitshake.get_or(0.8f);
-    ShakeRoughScale = PARAM_orbitshakerough.get_or(0.55f);
-    ShakeImpactScale = PARAM_orbitshakeimpact.get_or(1.0f);
-    ShakeAccelScale = PARAM_orbitshakeaccel.get_or(0.35f);
-
-    ShakeRpmStart = PARAM_orbitshakerpm.get_or(0.55f);
-
-    // Narrower than the two gears this used to fade over, and floored at third on top of that. The
-    // engine shake is at its most convincing as something that only shows up once the car is
-    // genuinely working - in the gears it spends real time in at speed - and it reads as a rattle
-    // rather than a top end when it can reach full strength in a gear the car passes through.
-    ShakeGearSpan = PARAM_orbitshakegears.get_or(1.5f);
-    ShakeMinGear = PARAM_orbitshakemingear.get_or(3.0f);
-    ShakeShiftDip = PARAM_orbitshakeshift.get_or(0.35f);
-    ShakeRevRolloff = PARAM_orbitshakerevtop.get_or(0.35f);
-
-    ShakeTurnScale = PARAM_orbitshaketurn.get_or(1.0f);
-
     // In mph. The framing band runs from a crawl to beyond what anything but a Panoz GTR-1 will
     // reach, so the fast cars keep opening out after a 140 mph car has run out of road.
     FrameStartSpeed = PARAM_orbitdistmin.get_or(5.0f);
@@ -275,6 +161,10 @@ void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
     SpeedDistance = PARAM_orbitpullback.get_or(6.0f);
     SpeedHeight = PARAM_orbitpulldown.get_or(-0.25f);
     SpeedFov = PARAM_orbitfov.get_or(18.0f);
+
+    CollideEnabled = PARAM_orbitcollide.get_or(true);
+
+    Shake.Init();
 
     // BaseCamCS defaults this to 3.0, which clips the car when orbiting in close.
     CameraNear = 0.5f;
@@ -309,17 +199,11 @@ void OrbitCamCS::MakeActive()
 
     // Start from a clean slate so a crash from the previous stint does not shake the new one, and
     // so the first frame's derivatives are not taken against stale state.
-    EngineTrauma = 0.0f;
-    RoughTrauma = 0.0f;
-    AccelTrauma = 0.0f;
-    ImpactTrauma = 0.0f;
-    ShakeAmount = 0.0f;
+    Shake.Reset();
+
     SpeedFactor = 0.0f;
-    ShakeTime = 0.0f;
-    GustTime = 0.0f;
-    TurnFactor = 0.0f;
-    MouseTurnRate = 0.0f;
-    HasHistory = false;
+    CollideDistance = 0.0f;
+    HasCollideHistory = false;
 
     SyncMouse();
 }
@@ -350,8 +234,8 @@ void OrbitCamCS::Update()
     if (!Sim()->IsPaused() && (delta > 0.0f))
     {
         // How fast the player is swinging the view, in the same units as the car's own yaw rate, so
-        // the two can be compared directly by the turn gate in UpdateTrauma().
-        MouseTurnRate = std::fabs(static_cast<f32>(step_x) * YawScale) / delta;
+        // the turn gate inside the shake can compare the two directly.
+        f32 mouse_turn_rate = std::fabs(static_cast<f32>(step_x) * YawScale) / delta;
 
         if ((step_x != 0) || (step_y != 0))
         {
@@ -381,51 +265,58 @@ void OrbitCamCS::Update()
             Pitch = TargetPitch;
         }
 
-        UpdateTrauma(delta);
+        UpdateFraming(delta);
 
-        ShakeAmount = GetShakeAmount();
-
-        // Phase is integrated rather than time being scaled at the sample point, so that changing
-        // the frequency with trauma speeds the vibration up instead of jumping its phase.
-        f32 rate = OrbitShakeBaseHz + (OrbitShakeHzRange * ShakeAmount);
-
-        ShakeTime = std::fmod(ShakeTime + (delta * rate), OrbitNoisePeriod);
-        GustTime = std::fmod(GustTime + (delta * rate * OrbitGustRatio), OrbitNoisePeriod);
+        Shake.Update(Car, CarMatrix, delta, mouse_turn_rate);
     }
 
     f32 pitch = Pitch;
     f32 yaw = Yaw;
     f32 roll = 0.0f;
-    f32 shake = 0.0f;
 
-    if (ShakeAmount > 0.0f)
+    const f32 shake = Shake.Strength();
+
+    if (shake > 0.0f)
     {
-        // Let the amplitude wander instead of holding steady. A constant-amplitude shake is the
-        // giveaway that it is being generated rather than caused.
-        f32 gust = (OrbitShakeNoise(GustTime, OrbitSaltGust) * 0.5f) + 0.5f;
-
-        shake = ShakeAmount * ShakeAmplitude * (OrbitGustFloor + ((1.0f - OrbitGustFloor) * gust));
-
-        pitch += OrbitShakeNoise(ShakeTime, OrbitSaltPitch) * shake * OrbitShakePitch;
-        yaw += OrbitShakeNoise(ShakeTime, OrbitSaltYaw) * shake * OrbitShakeYaw;
-        roll = OrbitShakeNoise(ShakeTime, OrbitSaltRoll) * shake * OrbitShakeRoll;
+        pitch += Shake.PitchNoise() * shake * OrbitShakePitch;
+        yaw += Shake.YawNoise() * shake * OrbitShakeYaw;
+        roll = Shake.RollNoise() * shake * OrbitShakeRoll;
     }
 
-    camera_.PolarView(
-        Distance + (SpeedDistance * SpeedFactor), yaw, std::clamp(pitch, OrbitPitchMin, OrbitPitchMax), roll);
+    // The point the camera orbits: the car's origin lifted to eye height. Everything below places
+    // the eye relative to it, and it is also where the occlusion probe is fired FROM - a camera is
+    // only obstructed if something stands between it and what it is looking at.
+    Vector3 pivot {0.0f, Height + (SpeedHeight * SpeedFactor), 0.0f};
 
     if (CarMatrix)
-        camera_.m3 += CarMatrix->m3;
+        pivot += CarMatrix->m3;
 
-    camera_.m3.y += Height + (SpeedHeight * SpeedFactor);
+    const f32 wanted = Distance + (SpeedDistance * SpeedFactor);
+
+    camera_.PolarView(SolveCollision(wanted, pivot, yaw, std::clamp(pitch, OrbitPitchMin, OrbitPitchMax), roll), yaw,
+        std::clamp(pitch, OrbitPitchMin, OrbitPitchMax), roll);
+
+    camera_.m3 += pivot;
 
     if (shake > 0.0f)
     {
         // Along the camera's own right and up axes rather than world axes, so the jitter stays
         // perpendicular to the view and never pushes the camera into or away from the car.
-        camera_.m3 += camera_.m0 * (OrbitShakeNoise(ShakeTime, OrbitSaltRight) * shake * OrbitShakeOffset);
-        camera_.m3 += camera_.m1 * (OrbitShakeNoise(ShakeTime, OrbitSaltUp) * shake * OrbitShakeOffset);
+        //
+        // Applied AFTER the collision solve rather than before it, deliberately. These offsets are
+        // centimetres and the solve leaves a margin far larger than that (OrbitCollideSkin), so the
+        // shake cannot push the eye through a wall; feeding them into the probe instead would make
+        // the pulled-in distance jitter with the noise, which is a far more visible fault than the
+        // millimetre of margin it would buy.
+        camera_.m3 += camera_.m0 * (Shake.RightNoise() * shake * OrbitShakeOffset);
+        camera_.m3 += camera_.m1 * (Shake.UpNoise() * shake * OrbitShakeOffset);
     }
+
+    // Ground clearance, in world Y rather than along the view. Pulling the camera in would raise it
+    // too, but only in proportion to how far the view is pitched down, so it does nothing at all in
+    // the level shot where the eye is most likely to be skimming a road surface. Lifting directly
+    // always works and changes the framing less.
+    camera_.m3.y += CollideLift;
 
     // Off by default. CameraFOV only reaches the asCamera through UpdateView(), which nothing in
     // the original game calls, so this has to push it through itself.
@@ -442,189 +333,145 @@ void OrbitCamCS::Update()
     }
 }
 
-void OrbitCamCS::UpdateTrauma(f32 delta)
+void OrbitCamCS::UpdateFraming(f32 delta)
 {
     if (!Car)
         return;
 
-    const mmCarSim& sim = Car->Sim;
-
     // Framing follows road speed, and reads mph directly so the tuning numbers line up with the
-    // cars' quoted top speeds rather than having to be converted.
+    // cars' quoted top speeds rather than having to be converted. The shake, by contrast, comes off
+    // the engine - see mmCamShake, which owns all of that now.
     f32 frame_span = FrameMaxSpeed - FrameStartSpeed;
     f32 frame_target =
-        (frame_span > 0.0f) ? std::clamp((sim.SpeedMPH - FrameStartSpeed) / frame_span, 0.0f, 1.0f) : 0.0f;
+        (frame_span > 0.0f) ? std::clamp((Car->Sim.SpeedMPH - FrameStartSpeed) / frame_span, 0.0f, 1.0f) : 0.0f;
 
-    SpeedFactor = OrbitEnvelope(SpeedFactor, frame_target, delta, OrbitSpeedEnvelopeRate, OrbitSpeedEnvelopeRate);
-
-    // The shake, by contrast, comes off the engine rather than road speed: what shakes a car is
-    // the motor, so it climbs towards the redline and falls away the moment a shift drops the
-    // needle - no gear change has to be scripted, the revs already describe it.
-    const mmEngine& engine = sim.Engine;
-    const mmTransmission& trans = sim.Trans;
-
-    f32 engine_target = 0.0f;
-
-    if (trans.IsForward() && (engine.MaxRPM > 0.0f))
-    {
-        f32 rpm_floor = engine.MaxRPM * ShakeRpmStart;
-        f32 rpm_span = engine.MaxRPM - rpm_floor;
-        f32 revs = (rpm_span > 0.0f) ? std::clamp((engine.RPM - rpm_floor) / rpm_span, 0.0f, 1.0f) : 0.0f;
-
-        // Ease the top of the rev band off. The straight ramp this replaces put full shake on the
-        // limiter and held it there, which is where the car spends the whole of a long straight -
-        // so the effect that was meant to mark the top end was simply the normal state of driving
-        // fast. Still monotonic in the revs, just flatter where it was hardest.
-        revs *= 1.0f - (std::clamp(ShakeRevRolloff, 0.0f, 0.9f) * revs);
-
-        // Top gears only, fading in over the last few. The lower gears are short and mostly spent
-        // mid-shift, and shaking through them turns every pull-away into a rattle.
-        //
-        // CurrentGear counts reverse as 0 and neutral as 1 (mmTransmission::IsForward), so the
-        // first forward gear is 2 and ShakeMinGear, which is expressed as an ordinary gear number,
-        // is compared against CurrentGear - 1.
-        i32 gear_count = trans.IsAutomatic ? trans.NumGears : trans.ManualNumGears;
-        f32 span = std::max(ShakeGearSpan, 1.0f);
-        f32 top = static_cast<f32>(gear_count - 1);
-        f32 gear = std::clamp((static_cast<f32>(trans.CurrentGear) - (top - span)) / span, 0.0f, 1.0f);
-
-        // The fade above is relative to the top of the box, so a short gearbox reaches full shake
-        // in what is really second. This is the absolute floor underneath it.
-        if (static_cast<f32>(trans.CurrentGear - 1) < ShakeMinGear)
-            gear = 0.0f;
-
-        engine_target = revs * gear;
-
-        // The revs falling already eases the shake off on their own; this deepens the gap so the
-        // shift lands as a beat rather than a shrug.
-        if (engine.ChangingGear)
-            engine_target *= ShakeShiftDip;
-    }
-
-    EngineTrauma = OrbitEnvelope(EngineTrauma, engine_target, delta, OrbitEngineAttack, OrbitEngineRelease);
-
-    // Road roughness, read as how fast the suspension is moving. Only wheels actually on the
-    // ground contribute - a wheel dangling in mid-air swings freely and would otherwise register
-    // as the roughest road in the city.
-    //
-    // Measured per AXLE, from the part of the motion both its wheels share, which is the fix for
-    // the camera shaking every time the car was turned. Body roll is the largest thing the
-    // suspension does in a corner and it is entirely differential - the outside wheel compresses by
-    // very nearly what the inside one extends - so summing the two wheels' travel independently, as
-    // this did, read a hard turn-in as the roughest road surface in the game. A bump moves both
-    // wheels the same way and survives the average; roll cancels out of it exactly, which is what
-    // it should do, because rolling the body is not the road being rough.
-    //
-    // An axle with only one wheel down has nothing to average against and contributes that wheel's
-    // own motion, which is the old behaviour and the right answer there: with one wheel in the air
-    // the car is over something, and the roll and the road are the same event.
-    const mmWheel* wheels[4] {&sim.FrontLeft, &sim.FrontRight, &sim.BackLeft, &sim.BackRight};
-
-    f32 rates[4] {};
-    bool grounded[4] {};
-
-    for (i32 i = 0; i < 4; ++i)
-    {
-        rates[i] = (wheels[i]->Suspension - PrevSuspension[i]) / delta;
-        grounded[i] = (wheels[i]->OnGround != 0);
-
-        PrevSuspension[i] = wheels[i]->Suspension;
-    }
-
-    f32 travel = 0.0f;
-    i32 axles = 0;
-
-    for (i32 axle = 0; axle < 2; ++axle)
-    {
-        const i32 left = axle * 2;
-        const i32 right = left + 1;
-
-        if (grounded[left] && grounded[right])
-            travel += std::fabs((rates[left] + rates[right]) * 0.5f);
-        else if (grounded[left])
-            travel += std::fabs(rates[left]);
-        else if (grounded[right])
-            travel += std::fabs(rates[right]);
-        else
-            continue;
-
-        ++axles;
-    }
-
-    f32 rough_target = 0.0f;
-
-    if (HasHistory && (axles > 0))
-    {
-        rough_target = std::clamp((travel / static_cast<f32>(axles)) / OrbitRoughReference, 0.0f, 1.0f);
-    }
-
-    RoughTrauma = OrbitEnvelope(RoughTrauma, rough_target, delta, OrbitRoughAttack, OrbitRoughRelease);
-
-    // One velocity derivative feeds both remaining sources: its component along the car's forward
-    // axis is acceleration and braking, while its total magnitude is what a collision looks like.
-    Vector3 velocity = sim.ICS.LinearVelocity;
-    f32 accel_target = 0.0f;
-
-    if (HasHistory)
-    {
-        Vector3 change = velocity - PrevVelocity;
-        f32 magnitude = change.Mag() / delta;
-
-        if (CarMatrix)
-            accel_target = std::clamp(std::fabs(change ^ CarMatrix->m2) / delta / OrbitAccelReference, 0.0f, 1.0f);
-
-        if (magnitude > OrbitImpactThreshold)
-        {
-            ImpactTrauma =
-                std::max(ImpactTrauma, std::clamp((magnitude - OrbitImpactThreshold) / OrbitImpactRange, 0.0f, 1.0f));
-        }
-    }
-
-    PrevVelocity = velocity;
-
-    AccelTrauma = OrbitEnvelope(AccelTrauma, accel_target, delta, OrbitAccelAttack, OrbitAccelRelease);
-    ImpactTrauma *= std::exp(-OrbitImpactDecay * delta);
-
-    // The turn gate. Roughness no longer mistakes body roll for a rough road, which removes the
-    // largest single cause of the camera shaking through corners, but it is not the only one: the
-    // car's own yaw is already swinging the view, and any vibration on top of a view that is
-    // moving reads as instability rather than as speed. So the shake steps aside while the view is
-    // being turned, whichever of the two is turning it.
-    //
-    // Taken from the car's heading rather than its yaw rate about its own axis, because it is the
-    // camera's motion that matters and the camera follows the heading. A spin registers as a turn
-    // too, which is correct - that is the last moment to be adding camera shake to.
-    f32 turn_rate = MouseTurnRate;
-
-    if (CarMatrix)
-    {
-        f32 heading = std::atan2(CarMatrix->m2.x, CarMatrix->m2.z);
-
-        if (HasHistory)
-            turn_rate = std::max(turn_rate, std::fabs(OrbitWrapAngle(heading - PrevHeading)) / delta);
-
-        PrevHeading = heading;
-    }
-
-    TurnFactor = OrbitEnvelope(
-        TurnFactor, std::clamp(turn_rate / OrbitTurnRateFull, 0.0f, 1.0f), delta, OrbitTurnAttack, OrbitTurnRelease);
-
-    HasHistory = true;
+    SpeedFactor += (frame_target - SpeedFactor) * OrbitBlend(OrbitSpeedEnvelopeRate, delta);
 }
 
-f32 OrbitCamCS::GetShakeAmount() const
+// Where along the segment from `from` to `to` the world first gets in the way, as a fraction, or 1
+// when it does not.
+//
+// PHYS_COLLIDE_ROOM is the static world - terrain, roads, buildings, kerbs - which is exactly the
+// set a camera should be stopped by and excludes the movers it should not be (the player's own car
+// most of all, since every probe here starts inside it).
+//
+// The hit DISTANCE is recovered from the polygon's own plane rather than read back off the
+// intersection. mmIntersection::Position is never read anywhere else in this codebase, so its
+// meaning after a segment test is not established; mmPolygon::PlaneN/PlaneD are public, are what
+// mmPolygon::GetPlaneY itself works from, and give the exact crossing for the price of a dot
+// product. A hit with no polygon behind it - possible in principle - is treated as a hit at the
+// start of the segment, which is the conservative reading.
+static f32 OrbitProbe(const Vector3& from, const Vector3& to)
 {
-    f32 trauma = std::clamp((EngineTrauma * ShakeScale) + (RoughTrauma * ShakeRoughScale) +
-            (AccelTrauma * ShakeAccelScale) + (ImpactTrauma * ShakeImpactScale),
-        0.0f, 1.0f);
+    const Vector3 direction = to - from;
 
-    // Applied to the combined trauma rather than to any one source, and before the squaring below
-    // rather than after, so that easing off in a corner is decisive rather than a slight thinning.
-    trauma *= 1.0f - (std::clamp(ShakeTurnScale, 0.0f, 1.0f) * TurnFactor);
+    if (direction.Mag2() < 1.0e-6f)
+        return 1.0f;
 
-    // Squaring keeps low trauma imperceptible rather than a permanent low buzz, and makes the ramp
-    // towards top speed feel like it builds instead of arriving linearly.
-    return trauma * trauma;
+    mmIntersection isect;
+    isect.InitSegment(from, to, nullptr, 2, 0);
+
+    if (!PHYS.Collide(&isect, PHYS_COLLIDE_ROOM))
+        return 1.0f;
+
+    const mmPolygon* poly = isect.HitPoly;
+
+    if (!poly)
+        return 0.0f;
+
+    const f32 denominator = poly->PlaneN ^ direction;
+
+    // Parallel to the plane. It cannot be crossed along this segment, whatever the broad-phase said.
+    if (std::fabs(denominator) < 1.0e-6f)
+        return 1.0f;
+
+    return std::clamp(-((poly->PlaneN ^ from) + poly->PlaneD) / denominator, 0.0f, 1.0f);
+}
+
+// How far back the camera may actually sit this frame, given what is behind it.
+//
+// The camera is a point on a sphere around the car, so an obstruction is anything standing between
+// the two - which makes this one segment test from the pivot out to where the eye wants to be. The
+// eye then sits just short of whatever it hits, and the roads, walls and hillsides the view used to
+// sink through simply push it in instead.
+//
+// The two rates are deliberately very different. Pulling IN is instant: a frame spent inside a wall
+// is a frame looking at the inside of the world, and there is no such thing as easing into that
+// gracefully. Pushing back OUT is slow, because the obstruction clearing is not something the player
+// asked for and a camera that springs back the instant it can is far more distracting than one that
+// takes half a second. That asymmetry is the whole trick, and it is why this keeps state at all
+// rather than just returning the probe's answer.
+f32 OrbitCamCS::SolveCollision(f32 wanted, const Vector3& pivot, f32 yaw, f32 pitch, f32 roll)
+{
+    if (!CollideEnabled || (wanted <= 0.0f))
+        return wanted;
+
+    // Where the eye would go with nothing in the way. Built with the same PolarView the draw below
+    // uses, so the probe is aimed at the position actually being solved for rather than at an
+    // approximation of it.
+    Matrix34 wanted_view;
+    wanted_view.PolarView(wanted, yaw, pitch, roll);
+
+    const Vector3 wanted_eye = wanted_view.m3 + pivot;
+
+    // Probe slightly past the eye, so the margin below is carved out of real clearance rather than
+    // out of the distance to a surface the eye had already reached.
+    const Vector3 probe_end = pivot + ((wanted_eye - pivot) * ((wanted + OrbitCollideSkin) / wanted));
+
+    f32 allowed = wanted;
+
+    const f32 hit = OrbitProbe(pivot, probe_end);
+
+    if (hit < 1.0f)
+        allowed = std::max((hit * (wanted + OrbitCollideSkin)) - OrbitCollideSkin, OrbitCollideMin);
+
+    // A separate downward probe, because the segment above only finds what is between the car and
+    // the camera and says nothing about what is directly UNDER it. Cresting a hill puts the eye over
+    // ground the pivot has clear line of sight to, and without this it sinks into the road surface -
+    // which is the "shows the car from underneath" case, and the one an occlusion test alone can
+    // never catch.
+    Matrix34 allowed_view;
+    allowed_view.PolarView(allowed, yaw, pitch, roll);
+
+    const Vector3 eye = allowed_view.m3 + pivot;
+
+    // A segment centred on the eye, so it finds ground the eye has already sunk below as readily as
+    // ground it is merely close to. The hit fraction maps back to a height directly: t = 0.5 is the
+    // eye's own level, so the clearance is (2t - 1) * OrbitCollideGround, negative when underground.
+    const Vector3 above = eye + Vector3 {0.0f, OrbitCollideGround, 0.0f};
+    const Vector3 below = eye - Vector3 {0.0f, OrbitCollideGround, 0.0f};
+
+    f32 lift = 0.0f;
+
+    if (const f32 ground = OrbitProbe(above, below); ground < 1.0f)
+    {
+        const f32 clearance = ((2.0f * ground) - 1.0f) * OrbitCollideGround;
+
+        lift = std::max(OrbitCollideGround - clearance, 0.0f);
+    }
+
+    // Rate limiting, in metres per second, applied to the answer rather than to the probe.
+    const f32 delta = Sim()->GetUpdateDelta();
+
+    if (!HasCollideHistory)
+    {
+        CollideDistance = allowed;
+        CollideLift = lift;
+        HasCollideHistory = true;
+
+        return CollideDistance;
+    }
+
+    CollideDistance = (allowed < CollideDistance) ? std::max(allowed, CollideDistance - (OrbitCollidePullIn * delta))
+                                                  : std::min(allowed, CollideDistance + (OrbitCollidePushOut * delta));
+
+    // The lift is rate limited the same way and for the same reasons, but on its own accumulator:
+    // it is a different correction with a different cause, and running them through one number would
+    // let a wall clearing release the camera into the road.
+    CollideLift = (lift > CollideLift) ? std::min(lift, CollideLift + (OrbitCollidePullIn * delta))
+                                       : std::max(lift, CollideLift - (OrbitCollidePushOut * delta));
+
+    return CollideDistance;
 }
 
 void OrbitCamCS::Recenter(f32 delta)
