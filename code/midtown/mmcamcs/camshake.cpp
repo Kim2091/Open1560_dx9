@@ -191,6 +191,7 @@ void mmCamShake::Reset()
     EngineTrauma = 0.0f;
     RoughTrauma = 0.0f;
     AccelTrauma = 0.0f;
+    AccelSigned = 0.0f;
     ImpactTrauma = 0.0f;
     TurnFactor = 0.0f;
 
@@ -335,6 +336,7 @@ void mmCamShake::Update(const mmCar* car, const Matrix34* car_matrix, f32 delta,
         // looks like.
         Vector3 velocity = sim.ICS.LinearVelocity;
         f32 accel_target = 0.0f;
+        f32 signed_target = 0.0f;
 
         if (has_history_)
         {
@@ -342,7 +344,10 @@ void mmCamShake::Update(const mmCar* car, const Matrix34* car_matrix, f32 delta,
             f32 magnitude = change.Mag() / delta;
 
             if (car_matrix)
-                accel_target = std::clamp(std::fabs(change ^ car_matrix->m2) / delta / AccelReference, 0.0f, 1.0f);
+            {
+                signed_target = std::clamp((change ^ car_matrix->m2) / delta / AccelReference, -1.0f, 1.0f);
+                accel_target = std::fabs(signed_target);
+            }
 
             if (magnitude > ImpactThreshold)
                 ImpactTrauma =
@@ -352,6 +357,11 @@ void mmCamShake::Update(const mmCar* car, const Matrix34* car_matrix, f32 delta,
         prev_velocity_ = velocity;
 
         AccelTrauma = Envelope(AccelTrauma, accel_target, delta, AccelAttack, AccelRelease);
+
+        // Chased at the attack rate in both directions: the lean should track the throttle and the
+        // brake equally closely, and an asymmetric follower would make it drift back to centre at a
+        // different speed from the one it left at.
+        AccelSigned += (signed_target - AccelSigned) * Blend(AccelAttack, delta);
     }
     else
     {
@@ -359,6 +369,7 @@ void mmCamShake::Update(const mmCar* car, const Matrix34* car_matrix, f32 delta,
         EngineTrauma = Envelope(EngineTrauma, 0.0f, delta, EngineRelease, EngineRelease);
         RoughTrauma = Envelope(RoughTrauma, 0.0f, delta, RoughRelease, RoughRelease);
         AccelTrauma = Envelope(AccelTrauma, 0.0f, delta, AccelRelease, AccelRelease);
+        AccelSigned -= AccelSigned * Blend(AccelRelease, delta);
     }
 
     ImpactTrauma *= std::exp(-ImpactDecay * delta);
