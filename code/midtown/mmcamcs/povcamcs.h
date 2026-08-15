@@ -47,8 +47,13 @@ public:
     // ?Reset@PovCamCS@@UAEXXZ
     ARTS_IMPORT void Reset() override;
 
+    // Reimplemented in mmcamcs/povcamcs.cpp to add the head bob and the free look. The original is
+    // two statements (UpdatePOV, then clear OneShot) and both are reproduced there unchanged, so
+    // everything that made this camera what it is - the offset, MakeActive's dash handling, Reset,
+    // whatever IsPOV() keys off - is untouched.
+
     // ?Update@PovCamCS@@UAEXXZ
-    ARTS_IMPORT void Update() override;
+    ARTS_EXPORT void Update() override;
 
     // ?UpdateInput@PovCamCS@@UAEXXZ
     ARTS_EXPORT void UpdateInput() override;

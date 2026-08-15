@@ -44,7 +44,6 @@ define_dummy_symbol(mmgame_game);
 #include "mmaudio/mmvoicecommentary.h"
 #include "mmaudio/sound.h"
 #include "mmbangers/data.h"
-#include "mmcamcs/dashcamcs.h"
 #include "mmcamcs/orbitcamcs.h"
 #include "mmcamcs/viewcs.h"
 #include "mmcar/carsimcheap.h"
@@ -167,36 +166,6 @@ mmGame::~mmGame()
 
         // FIXME: Freed by some child classes, but not zeroed
         StartSounds.release();
-    }
-}
-
-static mem::cmd_param PARAM_dashcam {
-    "dashcam", "Replace the stock dashboard camera with the head-bob/free-look one; 0 keeps the original"};
-
-// Puts the head-bob dashboard camera into the player's camera rotation, in place of the stock one.
-//
-// A swap of the pointer in CarCams[] rather than a key of its own, because unlike the orbital camera
-// this is not a new shot - it is the dashboard view the game already has, with a head on it, and it
-// should arrive on the same "Change Camera" press that has always reached it. mmPlayer::DashCam
-// itself is left alone and still owns the offset this reads, so -dashcam 0 restores the original
-// with nothing to unwind.
-//
-// Called once per race, after mmPlayer::Init has filled CarCams.
-static void InstallDashCam(mmPlayer* player)
-{
-    if (!player || !player->ViewCS || !PARAM_dashcam.get_or(true))
-        return;
-
-    // The camera outlives a race but its car does not, so this re-initialises against the new one
-    // every time - the same reason ToggleOrbitCam re-Inits below.
-    static DashCamCS dash_cam;
-
-    dash_cam.Init(&player->Car, player->ViewCS, player->DashCam.Offset);
-
-    for (i32 i = 0; i < static_cast<i32>(ARTS_SIZE(player->CarCams)); ++i)
-    {
-        if (player->CarCams[i] == &player->DashCam)
-            player->CarCams[i] = &dash_cam;
     }
 }
 
@@ -828,8 +797,6 @@ b32 mmGame::Init()
         pCullCity->Init(MapName, &Player->Camera);
         PHYS.Init(&Player->Car.Sim.ICS, Player->ViewCS);
         Player->Init(MMSTATE.CarName, MapName, this);
-
-        InstallDashCam(Player.get());
         Icons.Init(&Player->ViewCS->World, 2500.0f, 90000.0f);
 
         if (MMSTATE.AudFlags & AudManager::GetDSound3DMask())

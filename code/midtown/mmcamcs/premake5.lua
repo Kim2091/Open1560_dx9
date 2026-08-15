@@ -10,8 +10,6 @@ arts_component "mmcamcs"
         "carcamcs.h",
         "camshake.cpp",
         "camshake.h",
-        "dashcamcs.cpp",
-        "dashcamcs.h",
         "orbitcamcs.cpp",
         "orbitcamcs.h",
         "pointcamcs.cpp",
