@@ -189,7 +189,129 @@ i32 agiMeshModel::ModelDrawLit(agiMeshLighter lighter, u32 flags, agiLitAnimatio
     // predicate, not the pointer.
     u32* base_colors = HasVariantColors ? VariantColors[MESH_DRAW_GET_VARIANT(flags)] : Colors;
 
-    // Rigid-group submission - the hash-stable path, and the default.
+    // Hardware skinning - a matrix palette, one draw for the whole pedestrian, and the default.
+    //
+    // The skeleton is posed on the CPU (it has to be - it is a handful of matrices, and the
+    // animation data lives in system memory), and from there nothing else happens on the CPU at
+    // all: the bone matrices go out through SetTransform(D3DTS_WORLDMATRIX(i)) and every vertex is
+    // transformed by the vertex pipeline, exactly once, in the draw that submits it.
+    //
+    // This supersedes the per-bone rigid submission below on every count. That path already put the
+    // transform in hardware, but it expressed a pedestrian as N separate meshes and paid
+    // DrawNativeTransform's full per-draw cost N times over - facet sort, whole-vertex-array build,
+    // one draw per texture batch - to select one bone's worth of facets each time. It also had to
+    // refuse any model with a facet straddling two bones, because a facet is submitted with exactly
+    // one group and a straddling one would be submitted with none: a hole. A palette binds per
+    // VERTEX, so a straddling facet is simply drawn, with each corner on its own bone, and the
+    // coherence scan is only needed when a skeleton is too large for the device's palette and has to
+    // be split.
+    //
+    // Positions are untouched either way, which is what keeps the RTX Remix geometry hash a property
+    // of the mesh rather than of the frame. See -noskin (agidx9/dx9rsys.cpp) for the one respect in
+    // which the two differ for Remix.
+    const u32 palette_limit = RAST ? RAST->MaxNativeSkinBones() : 0u;
+
+    if (palette_limit && Pipe()->SupportsNativeTransform() && CanSkinModel(this) &&
+        agiNativePathEnabled(NATIVE_DRAWMODEL) && frame_normals && !PARAM_ped_skin.get_or(false) &&
+        (SkinGroupCount <= 255))
+    {
+        Skeleton.Pose(animation->Poses[frame]);
+        Skeleton.Transform(nullptr);
+
+        const agiViewParameters& view_params = ViewParams();
+        const Matrix34* bones = Skeleton.BoneMatrices;
+        const u8* run_lengths = SkinGroupVerts;
+
+        const u32 group_count = static_cast<u32>(SkinGroupCount);
+
+        // bone * world for each group, and the transpose of each bone's 3x3 to undo the pose the
+        // animation's normals already carry - the same two matrices the per-bone path builds, for
+        // all the groups at once instead of one at a time.
+        Matrix34* palette = ARTS_ALLOCA(Matrix34, group_count);
+        Matrix34* unpose = ARTS_ALLOCA(Matrix34, group_count);
+
+        // Which bone owns each vertex. The mesh stores this as run LENGTHS, which is the wrong way
+        // round for a per-vertex lookup, so it is expanded once here and then indexed.
+        u8* vertex_bones = ARTS_ALLOCA(u8, VertexCount);
+
+        u32 skinned_vertices = 0;
+
+        for (u32 group = 0; group < group_count; ++group)
+        {
+            palette[group].Dot(bones[group], view_params.World);
+
+            unpose[group].m0 = {bones[group].m0.x, bones[group].m1.x, bones[group].m2.x};
+            unpose[group].m1 = {bones[group].m0.y, bones[group].m1.y, bones[group].m2.y};
+            unpose[group].m2 = {bones[group].m0.z, bones[group].m1.z, bones[group].m2.z};
+            unpose[group].m3 = {0.0f, 0.0f, 0.0f};
+
+            for (u32 i = run_lengths[group]; i--;)
+                vertex_bones[skinned_vertices++] = static_cast<u8>(group);
+        }
+
+        // Any vertices past the end of the last run belong to no bone - CanSkinModel establishes
+        // only that the runs FIT in the array, not that they fill it. They stay outside every
+        // chunk's range and so are never submitted, which is what the per-bone path does with them
+        // too, and is why the ranges below are accumulated from the runs rather than set to
+        // VertexCount.
+        const u32 chunks = (group_count + palette_limit - 1) / palette_limit;
+
+        // Only a skeleton that does not fit the device's palette needs this, and then only because
+        // a chunk boundary reintroduces the per-bone path's problem: a facet spanning two chunks is
+        // submitted with neither. A single chunk covers the whole vertex array, so nothing can span
+        // anything and the scan is skipped - which is most of the point of this path.
+        if ((chunks == 1) || ModelFacetsAreGroupCoherent(this))
+        {
+            // The animation's per-frame normal set, for the duration - restored below, exactly as
+            // the paths beneath this one do. Without it the mesh reports no normals and submits
+            // unlit.
+            Normals = frame_normals;
+
+            b32 any_drawn = false;
+
+            u32 first_bone = 0;
+            u32 first_vertex = 0;
+
+            while (first_bone < group_count)
+            {
+                const u32 end_bone = std::min(first_bone + palette_limit, group_count);
+
+                u32 end_vertex = first_vertex;
+
+                for (u32 group = first_bone; group < end_bone; ++group)
+                    end_vertex += run_lengths[group];
+
+                agiNativeSkinPalette skin {};
+
+                skin.Bones = &palette[first_bone];
+                skin.NormalUnpose = &unpose[first_bone];
+                skin.Count = end_bone - first_bone;
+                skin.VertexBones = vertex_bones;
+                skin.FirstBone = first_bone;
+                skin.FirstVertex = first_vertex;
+                skin.EndVertex = end_vertex;
+
+                // static_lighting = false for the same reason every other path here gives: a
+                // pedestrian is a mover, lit by the dynamic rig.
+                any_drawn |= DrawNativeTransform(flags, /*static_lighting=*/false, nullptr, base_colors,
+                    /*unlit=*/false, nullptr, &skin);
+
+                first_bone = end_bone;
+                first_vertex = end_vertex;
+            }
+
+            Normals = saved_normals;
+
+            if (any_drawn)
+                return 1;
+
+            // Nothing submitted means the mesh could not be expressed this way at all. Fall through
+            // rather than dropping the pedestrian, as every path here does.
+        }
+    }
+
+    // Rigid-group submission - the hash-stable path, and the fallback when the device or the active
+    // rendering pathway has no matrix palette to skin with.
     //
     // Nothing here is animated in the sense that matters to Remix. The binding is rigid (see
     // SkinModelVertices), so every vertex belongs to exactly one bone, and posing the model is a

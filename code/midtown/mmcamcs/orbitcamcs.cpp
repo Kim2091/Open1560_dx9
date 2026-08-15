@@ -47,6 +47,12 @@ static mem::cmd_param PARAM_orbitshakegears {
     "orbitshakegears", "How many of the top gears the engine shake is allowed in"};
 static mem::cmd_param PARAM_orbitshakeshift {
     "orbitshakeshift", "How far the engine shake dips while a gear change is in progress"};
+static mem::cmd_param PARAM_orbitshakemingear {
+    "orbitshakemingear", "Lowest forward gear the engine shake is allowed in at all; 1 is first"};
+static mem::cmd_param PARAM_orbitshakerevtop {
+    "orbitshakerevtop", "How much of the engine shake's top-end rev ramp is taken back off; 0 is the straight ramp"};
+static mem::cmd_param PARAM_orbitshaketurn {
+    "orbitshaketurn", "How much of the shake a turn removes; 1 silences it while turning, 0 is off"};
 static mem::cmd_param PARAM_orbitdistmin {"orbitdistmin", "Speed the camera starts pulling back at, in mph"};
 static mem::cmd_param PARAM_orbitdistmax {"orbitdistmax", "Speed the camera is fully pulled back at, in mph"};
 static mem::cmd_param PARAM_orbitpullback {"orbitpullback", "Metres the camera eases back by at full speed"};
@@ -142,6 +148,17 @@ static constexpr f32 OrbitAccelReference = 11.0f;
 // Mean suspension travel rate, in m/s, that produces full roughness shake.
 static constexpr f32 OrbitRoughReference = 0.85f;
 
+// Turn rate, in radians per second, that produces full shake suppression. About a second and a
+// half for a half turn - brisk cornering rather than a lane change, so ordinary straight-line
+// steering corrections leave the shake alone.
+static constexpr f32 OrbitTurnRateFull = 1.1f;
+
+// Envelope for the turn gate. Attack is near-immediate so the shake is already gone by the time
+// the car is visibly turning; release is slow enough that it does not return between the two
+// halves of an S-bend, where the yaw rate passes through zero but the camera is still working.
+static constexpr f32 OrbitTurnAttack = 16.0f;
+static constexpr f32 OrbitTurnRelease = 2.5f;
+
 // Reduces an angle to [-PI, PI] so yaw never winds up and differences take the short way round.
 static f32 OrbitWrapAngle(f32 angle)
 {
@@ -232,14 +249,23 @@ void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
     PitchScale = PARAM_orbitinverty.get_or(false) ? sensitivity : -sensitivity;
 
     ShakeAmplitude = PARAM_orbitshakeamp.get_or(1.0f);
-    ShakeScale = PARAM_orbitshake.get_or(1.0f);
+    ShakeScale = PARAM_orbitshake.get_or(0.8f);
     ShakeRoughScale = PARAM_orbitshakerough.get_or(0.55f);
     ShakeImpactScale = PARAM_orbitshakeimpact.get_or(1.0f);
     ShakeAccelScale = PARAM_orbitshakeaccel.get_or(0.35f);
 
     ShakeRpmStart = PARAM_orbitshakerpm.get_or(0.55f);
-    ShakeGearSpan = PARAM_orbitshakegears.get_or(2.0f);
+
+    // Narrower than the two gears this used to fade over, and floored at third on top of that. The
+    // engine shake is at its most convincing as something that only shows up once the car is
+    // genuinely working - in the gears it spends real time in at speed - and it reads as a rattle
+    // rather than a top end when it can reach full strength in a gear the car passes through.
+    ShakeGearSpan = PARAM_orbitshakegears.get_or(1.5f);
+    ShakeMinGear = PARAM_orbitshakemingear.get_or(3.0f);
     ShakeShiftDip = PARAM_orbitshakeshift.get_or(0.35f);
+    ShakeRevRolloff = PARAM_orbitshakerevtop.get_or(0.35f);
+
+    ShakeTurnScale = PARAM_orbitshaketurn.get_or(1.0f);
 
     // In mph. The framing band runs from a crawl to beyond what anything but a Panoz GTR-1 will
     // reach, so the fast cars keep opening out after a 140 mph car has run out of road.
@@ -291,6 +317,8 @@ void OrbitCamCS::MakeActive()
     SpeedFactor = 0.0f;
     ShakeTime = 0.0f;
     GustTime = 0.0f;
+    TurnFactor = 0.0f;
+    MouseTurnRate = 0.0f;
     HasHistory = false;
 
     SyncMouse();
@@ -321,6 +349,10 @@ void OrbitCamCS::Update()
     // below runs, which also freezes the shake rather than leaving it idling on a paused screen.
     if (!Sim()->IsPaused() && (delta > 0.0f))
     {
+        // How fast the player is swinging the view, in the same units as the car's own yaw rate, so
+        // the two can be compared directly by the turn gate in UpdateTrauma().
+        MouseTurnRate = std::fabs(static_cast<f32>(step_x) * YawScale) / delta;
+
         if ((step_x != 0) || (step_y != 0))
         {
             TargetYaw = OrbitWrapAngle(TargetYaw + (static_cast<f32>(step_x) * YawScale));
@@ -439,12 +471,27 @@ void OrbitCamCS::UpdateTrauma(f32 delta)
         f32 rpm_span = engine.MaxRPM - rpm_floor;
         f32 revs = (rpm_span > 0.0f) ? std::clamp((engine.RPM - rpm_floor) / rpm_span, 0.0f, 1.0f) : 0.0f;
 
+        // Ease the top of the rev band off. The straight ramp this replaces put full shake on the
+        // limiter and held it there, which is where the car spends the whole of a long straight -
+        // so the effect that was meant to mark the top end was simply the normal state of driving
+        // fast. Still monotonic in the revs, just flatter where it was hardest.
+        revs *= 1.0f - (std::clamp(ShakeRevRolloff, 0.0f, 0.9f) * revs);
+
         // Top gears only, fading in over the last few. The lower gears are short and mostly spent
         // mid-shift, and shaking through them turns every pull-away into a rattle.
+        //
+        // CurrentGear counts reverse as 0 and neutral as 1 (mmTransmission::IsForward), so the
+        // first forward gear is 2 and ShakeMinGear, which is expressed as an ordinary gear number,
+        // is compared against CurrentGear - 1.
         i32 gear_count = trans.IsAutomatic ? trans.NumGears : trans.ManualNumGears;
         f32 span = std::max(ShakeGearSpan, 1.0f);
         f32 top = static_cast<f32>(gear_count - 1);
         f32 gear = std::clamp((static_cast<f32>(trans.CurrentGear) - (top - span)) / span, 0.0f, 1.0f);
+
+        // The fade above is relative to the top of the box, so a short gearbox reaches full shake
+        // in what is really second. This is the absolute floor underneath it.
+        if (static_cast<f32>(trans.CurrentGear - 1) < ShakeMinGear)
+            gear = 0.0f;
 
         engine_target = revs * gear;
 
@@ -459,27 +506,56 @@ void OrbitCamCS::UpdateTrauma(f32 delta)
     // Road roughness, read as how fast the suspension is moving. Only wheels actually on the
     // ground contribute - a wheel dangling in mid-air swings freely and would otherwise register
     // as the roughest road in the city.
+    //
+    // Measured per AXLE, from the part of the motion both its wheels share, which is the fix for
+    // the camera shaking every time the car was turned. Body roll is the largest thing the
+    // suspension does in a corner and it is entirely differential - the outside wheel compresses by
+    // very nearly what the inside one extends - so summing the two wheels' travel independently, as
+    // this did, read a hard turn-in as the roughest road surface in the game. A bump moves both
+    // wheels the same way and survives the average; roll cancels out of it exactly, which is what
+    // it should do, because rolling the body is not the road being rough.
+    //
+    // An axle with only one wheel down has nothing to average against and contributes that wheel's
+    // own motion, which is the old behaviour and the right answer there: with one wheel in the air
+    // the car is over something, and the roll and the road are the same event.
     const mmWheel* wheels[4] {&sim.FrontLeft, &sim.FrontRight, &sim.BackLeft, &sim.BackRight};
 
-    f32 travel = 0.0f;
-    i32 grounded = 0;
+    f32 rates[4] {};
+    bool grounded[4] {};
 
     for (i32 i = 0; i < 4; ++i)
     {
-        if (wheels[i]->OnGround)
-        {
-            travel += std::fabs(wheels[i]->Suspension - PrevSuspension[i]);
-            ++grounded;
-        }
+        rates[i] = (wheels[i]->Suspension - PrevSuspension[i]) / delta;
+        grounded[i] = (wheels[i]->OnGround != 0);
 
         PrevSuspension[i] = wheels[i]->Suspension;
     }
 
+    f32 travel = 0.0f;
+    i32 axles = 0;
+
+    for (i32 axle = 0; axle < 2; ++axle)
+    {
+        const i32 left = axle * 2;
+        const i32 right = left + 1;
+
+        if (grounded[left] && grounded[right])
+            travel += std::fabs((rates[left] + rates[right]) * 0.5f);
+        else if (grounded[left])
+            travel += std::fabs(rates[left]);
+        else if (grounded[right])
+            travel += std::fabs(rates[right]);
+        else
+            continue;
+
+        ++axles;
+    }
+
     f32 rough_target = 0.0f;
 
-    if (HasHistory && (grounded > 0))
+    if (HasHistory && (axles > 0))
     {
-        rough_target = std::clamp((travel / (static_cast<f32>(grounded) * delta)) / OrbitRoughReference, 0.0f, 1.0f);
+        rough_target = std::clamp((travel / static_cast<f32>(axles)) / OrbitRoughReference, 0.0f, 1.0f);
     }
 
     RoughTrauma = OrbitEnvelope(RoughTrauma, rough_target, delta, OrbitRoughAttack, OrbitRoughRelease);
@@ -509,6 +585,30 @@ void OrbitCamCS::UpdateTrauma(f32 delta)
     AccelTrauma = OrbitEnvelope(AccelTrauma, accel_target, delta, OrbitAccelAttack, OrbitAccelRelease);
     ImpactTrauma *= std::exp(-OrbitImpactDecay * delta);
 
+    // The turn gate. Roughness no longer mistakes body roll for a rough road, which removes the
+    // largest single cause of the camera shaking through corners, but it is not the only one: the
+    // car's own yaw is already swinging the view, and any vibration on top of a view that is
+    // moving reads as instability rather than as speed. So the shake steps aside while the view is
+    // being turned, whichever of the two is turning it.
+    //
+    // Taken from the car's heading rather than its yaw rate about its own axis, because it is the
+    // camera's motion that matters and the camera follows the heading. A spin registers as a turn
+    // too, which is correct - that is the last moment to be adding camera shake to.
+    f32 turn_rate = MouseTurnRate;
+
+    if (CarMatrix)
+    {
+        f32 heading = std::atan2(CarMatrix->m2.x, CarMatrix->m2.z);
+
+        if (HasHistory)
+            turn_rate = std::max(turn_rate, std::fabs(OrbitWrapAngle(heading - PrevHeading)) / delta);
+
+        PrevHeading = heading;
+    }
+
+    TurnFactor = OrbitEnvelope(
+        TurnFactor, std::clamp(turn_rate / OrbitTurnRateFull, 0.0f, 1.0f), delta, OrbitTurnAttack, OrbitTurnRelease);
+
     HasHistory = true;
 }
 
@@ -517,6 +617,10 @@ f32 OrbitCamCS::GetShakeAmount() const
     f32 trauma = std::clamp((EngineTrauma * ShakeScale) + (RoughTrauma * ShakeRoughScale) +
             (AccelTrauma * ShakeAccelScale) + (ImpactTrauma * ShakeImpactScale),
         0.0f, 1.0f);
+
+    // Applied to the combined trauma rather than to any one source, and before the squaring below
+    // rather than after, so that easing off in a corner is decisive rather than a slight thinning.
+    trauma *= 1.0f - (std::clamp(ShakeTurnScale, 0.0f, 1.0f) * TurnFactor);
 
     // Squaring keeps low trauma imperceptible rather than a permanent low buzz, and makes the ramp
     // towards top speed feel like it builds instead of arriving linearly.

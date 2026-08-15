@@ -97,6 +97,58 @@ struct agiNativeRigidGroup
     const Matrix34* NormalUnpose {};
 };
 
+// A whole skinned model submitted in ONE draw, with the bones handed to the hardware as a matrix
+// palette and every vertex carrying the index of the bone it is bound to.
+//
+// This is the same observation agiNativeRigidGroup is built on - the binding is rigid, one run of
+// vertices per bone, no per-vertex weights - taken the rest of the way. agiNativeRigidGroup keeps
+// the vertices in model space, which is what Remix needs, but it pays for that with one full
+// submission per bone: agiMeshSet::DrawNativeTransform sorts the facets, rebuilds the entire
+// vertex array and issues a draw per texture batch, and a pedestrian has as many bones as it has
+// limb segments. So a ~15-bone pedestrian did ~15x the CPU work of a static mesh of the same size,
+// and every one of those draws submitted the whole vertex array to select a fraction of it.
+//
+// A matrix palette collapses that back to one submission. D3D9 fixed function does exactly this
+// binding natively: D3DRS_INDEXEDVERTEXBLEND with D3DRS_VERTEXBLEND = D3DVBF_0WEIGHTS means "one
+// matrix per vertex, chosen by the vertex's own index, no weights" - the rigid case precisely. The
+// bone matrices go out through SetTransform(D3DTS_WORLDMATRIX(i)) and the transform happens in the
+// vertex pipeline, so no vertex position is ever touched by the CPU.
+//
+// Positions stay at their stored bind-pose values, exactly as with agiNativeRigidGroup, so the
+// hash stability that path was written for is preserved.
+struct agiNativeSkinPalette
+{
+    // Count entries, each already composed as bone * world - they replace D3DTS_WORLD entirely.
+    const Matrix34* Bones {};
+
+    // Count entries, the transpose of each bone's 3x3. See agiNativeRigidGroup::NormalUnpose: the
+    // only normals a pedestrian has are the animation's per-frame set, stored already posed, and
+    // the palette matrix the hardware applies to them carries the same bone.
+    const Matrix34* NormalUnpose {};
+
+    u32 Count {};
+
+    // One entry per agiMeshSet::Vertices index, holding a GLOBAL bone index. The palette slot is
+    // VertexBones[v] - FirstBone, which is what lets a skeleton larger than the device's palette be
+    // submitted as several chunks without rebuilding this table per chunk.
+    const u8* VertexBones {};
+    u32 FirstBone {};
+
+    // Facet range for this chunk, with the same meaning as agiNativeRigidGroup's: a facet is
+    // submitted only when every corner lands inside it. Equal to the whole vertex array when the
+    // palette holds the entire skeleton, which is the usual case.
+    u32 FirstVertex {};
+    u32 EndVertex {};
+
+    // Filled in by agiMeshSet::DrawNativeTransform, not by the caller: one palette slot per
+    // SUBMITTED vertex, in the order that path emits them. VertexBones above is indexed by mesh
+    // vertex, and the submitted vertices are adjuncts (or, under -flatnormals, unshared facet
+    // corners), so only that function knows the mapping. Everything outside the chunk is clamped
+    // into range - those vertices are unreferenced by the indices, but they are still inside the
+    // range handed to DrawIndexedPrimitiveUP and an out-of-palette index is undefined behaviour.
+    const u8* Slots {};
+};
+
 class agiRasterizer : public agiRefreshable
 {
 public:
@@ -156,9 +208,12 @@ public:
     // from their baked agiMeshSet::Colors, and agiMeshLighter* would fault on mesh->Normals[i] if
     // asked to light them - so they can still take this path, just unlit. The `normal` field of
     // the submitted vertices is then meaningless and must not be read.
+    // skin: when set, the draw is a hardware-skinned submission - see agiNativeSkinPalette. `world`
+    // is then unused, because the palette's matrices already carry it.
     virtual bool MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* indices, i32 index_count,
         const Matrix34& world, const Matrix34& view, const agiViewParameters& proj_params, bool static_lighting,
-        const agiNativeMaterialFx* fx = nullptr, bool hardware_lighting = true)
+        const agiNativeMaterialFx* fx = nullptr, bool hardware_lighting = true,
+        const agiNativeSkinPalette* skin = nullptr)
     {
         (void) vertices;
         (void) vertex_count;
@@ -170,8 +225,20 @@ public:
         (void) static_lighting;
         (void) fx;
         (void) hardware_lighting;
+        (void) skin;
 
         return false;
+    }
+
+    // How many bones one hardware-skinned draw may carry, or 0 if the renderer cannot skin at all -
+    // which is the default, so every other backend keeps the per-bone submission unchanged.
+    //
+    // A caller with more bones than this splits the skeleton into chunks of this size, so any
+    // nonzero answer is usable; it only decides how many draws a pedestrian costs. Asked once per
+    // model draw rather than cached, because it depends on device state (see agiDX9Rasterizer).
+    virtual u32 MaxNativeSkinBones() const
+    {
+        return 0;
     }
 };
 

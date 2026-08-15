@@ -305,6 +305,15 @@ void agiDX9Context::QueryCaps()
     max_texture_blend_stages_ = caps.MaxTextureBlendStages;
     supports_dot3_ = (caps.TextureOpCaps & D3DTEXOPCAPS_DOTPRODUCT3) != 0;
 
+    // Indexed vertex blending - the fixed-function matrix palette pedestrians are skinned with.
+    //
+    // MaxVertexBlendMatrixIndex is the largest index a vertex may name, so the palette holds one
+    // more than it, and zero means the driver does not support indexed blending at all. Both are
+    // reported per adapter and neither can change while a device exists, so this is the right
+    // place to read them.
+    max_vertex_blend_matrices_ = caps.MaxVertexBlendMatrices;
+    max_vertex_blend_matrix_index_ = caps.MaxVertexBlendMatrixIndex;
+
     D3DDISPLAYMODE display_mode {};
     d3d_->GetAdapterDisplayMode(D3DADAPTER_DEFAULT, &display_mode);
 

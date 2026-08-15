@@ -99,6 +99,28 @@ public:
         return supports_dot3_;
     }
 
+    // Size of the fixed-function matrix palette available to indexed vertex blending, or 0 when the
+    // device cannot do it. See QueryCaps.
+    //
+    // Software vertex processing implements the whole of fixed function in the runtime and always
+    // offers the full 256-entry palette, whatever the adapter reports, so it is answered separately
+    // - that is also the fallback path CreateDevice drops to when a device advertising hardware T&L
+    // fails to create one.
+    u32 GetSkinPaletteSize() const
+    {
+        if (!hardware_tl_)
+            return 256;
+
+        return (max_vertex_blend_matrix_index_ > 0) ? (max_vertex_blend_matrix_index_ + 1) : 0;
+    }
+
+    // How many matrices one vertex may blend BETWEEN. Not what the palette path needs - it binds
+    // one matrix per vertex - but a device reporting fewer than one cannot vertex blend at all.
+    u32 GetMaxVertexBlendMatrices() const
+    {
+        return max_vertex_blend_matrices_;
+    }
+
     static void CheckErrors(const char* what, long hr);
 
 private:
@@ -123,6 +145,8 @@ private:
     u32 max_anisotropy_ {};
     u32 max_simultaneous_textures_ {};
     u32 max_texture_blend_stages_ {};
+    u32 max_vertex_blend_matrices_ {};
+    u32 max_vertex_blend_matrix_index_ {};
     bool supports_dot3_ {};
     bool hardware_tl_ {};
 

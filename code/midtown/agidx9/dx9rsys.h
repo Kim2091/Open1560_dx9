@@ -101,7 +101,10 @@ public:
 
     bool MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* indices, i32 index_count, const Matrix34& world,
         const Matrix34& view, const agiViewParameters& proj_params, bool static_lighting,
-        const agiNativeMaterialFx* fx = nullptr, bool hardware_lighting = true) override;
+        const agiNativeMaterialFx* fx = nullptr, bool hardware_lighting = true,
+        const agiNativeSkinPalette* skin = nullptr) override;
+
+    u32 MaxNativeSkinBones() const override;
 
     agiDX9Pipeline* Pipe() const
     {

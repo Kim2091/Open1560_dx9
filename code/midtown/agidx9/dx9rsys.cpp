@@ -149,6 +149,37 @@ struct DX9ReflectVtx
     f32 tv;
 };
 
+// The hardware-skinned vertex - agiWorldVtx with the bone index spliced in.
+//
+// The layout is not a choice. D3D9's FVF ordering puts the blend weights immediately after the
+// position and before the normal, and D3DFVF_LASTBETA_UBYTE4 reinterprets the last (here only)
+// beta DWORD as four bytes of matrix INDEX rather than a float weight. Under D3DVBF_0WEIGHTS only
+// the first of those bytes is read - one matrix per vertex, no weights - which is exactly how a
+// pedestrian is bound. The remaining three bytes are unused and written zero so the vertex bytes
+// stay a pure function of the mesh, for the geometry hash's sake.
+struct DX9SkinVtx
+{
+    Vector3 pos;
+    u32 indices;
+    Vector3 normal;
+    u32 color;
+    f32 tu;
+    f32 tv;
+};
+
+static constexpr DWORD kWorldSkinFVF =
+    D3DFVF_XYZB1 | D3DFVF_LASTBETA_UBYTE4 | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+
+// -noskin. Back to agiNativeRigidGroup: one submission per bone, skinned by the world matrix of
+// each rather than by a matrix palette.
+//
+// Kept because the palette path changes what an RTX Remix capture sees. Remix reconstructs a draw's
+// world placement from D3DTS_WORLD, and a vertex-blended draw's placement lives in the
+// D3DTS_WORLDMATRIX(i) palette instead - the per-bone path hands it one plain world matrix per
+// submission, which is unambiguous. Nothing else differs: both submit the same bind-pose positions,
+// so the geometry hashes are equally stable either way.
+static mem::cmd_param PARAM_noskin {"noskin", "Disable hardware matrix-palette skinning (submit one draw per bone)"};
+
 static ARTS_FORCEINLINE f32 Clamp01(f32 value)
 {
     return std::clamp(value, 0.0f, 1.0f);
@@ -1714,6 +1745,16 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
     // subsequent vertex. Put it back the way BeginGfx() left it.
     device->SetRenderState(D3DRS_NORMALIZENORMALS, FALSE);
 
+    // Vertex blending off. Unconditional, and not optional: this is the one piece of state a
+    // skinned draw leaves behind that would silently corrupt every following draw rather than merely
+    // mis-shade it. With D3DVBF_0WEIGHTS still set, D3D9 reads a matrix index out of a vertex layout
+    // that has no beta field at all and transforms by whatever palette slot that lands on - so an
+    // XYZ or XYZRHW draw following a pedestrian would be placed by a leftover thigh bone. Restoring
+    // it here rather than at the end of the skinned branch keeps it on the same shared path as every
+    // other piece of state MeshWorld programs, which is the drift this function exists to prevent.
+    device->SetRenderState(D3DRS_VERTEXBLEND, D3DVBF_DISABLE);
+    device->SetRenderState(D3DRS_INDEXEDVERTEXBLEND, FALSE);
+
     // Reset the depth bias so it doesn't leak into pretransformed (agiScreenVtx) draws, which
     // have no need for it and aren't tracked by FlushState()'s dirty-checking anyway.
     constexpr f32 kNoDepthBias = 0.0f;
@@ -1986,9 +2027,51 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
     }
 }
 
+// Size of the fixed-function matrix palette this device can skin with, or 0 for "not at all".
+//
+// Answered per call rather than resolved once, because two of the three terms are live state: the
+// programmable path replaces the fixed-function transform pipeline wholesale, and vertex blending
+// is a fixed-function feature, so a bound world shader means no palette (agiMeshModel::ModelDrawLit
+// then submits per bone, which every path can do). The device cap itself cannot change while a
+// device exists but is cheap to re-read, and this runs once per skinned model, not per draw.
+//
+// Capped at 256 because that is the width of the index the vertex carries - one byte.
+u32 agiDX9Rasterizer::MaxNativeSkinBones() const
+{
+    if (PARAM_noskin.get_or(false))
+        return 0;
+
+    if (Pipe()->WorldShader())
+        return 0;
+
+    agiDX9Context* context = Pipe()->Context();
+
+    if (!context || (context->GetMaxVertexBlendMatrices() < 1))
+        return 0;
+
+    return std::min<u32>(context->GetSkinPaletteSize(), 256);
+}
+
+// Splices the bone index into each vertex, in the layout D3D9 wants it. Everything else is a
+// straight copy - the positions are the mesh's stored bind-pose values and stay untouched, which is
+// the whole point of skinning on the GPU.
+static void BuildSkinVertices(
+    DX9SkinVtx* ARTS_RESTRICT output, const agiWorldVtx* ARTS_RESTRICT input, i32 count, const u8* ARTS_RESTRICT slots)
+{
+    for (i32 i = 0; i < count; ++i)
+    {
+        output[i].pos = input[i].pos;
+        output[i].indices = slots[i];
+        output[i].normal = input[i].normal;
+        output[i].color = input[i].color;
+        output[i].tu = input[i].tu;
+        output[i].tv = input[i].tv;
+    }
+}
+
 bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* indices, i32 index_count,
     const Matrix34& world, const Matrix34& view, const agiViewParameters& proj_params, bool static_lighting,
-    const agiNativeMaterialFx* fx, bool hardware_lighting)
+    const agiNativeMaterialFx* fx, bool hardware_lighting, const agiNativeSkinPalette* skin)
 {
     if (!IsAppActive() || (vertex_count == 0) || (index_count == 0))
         return true;
@@ -2276,7 +2359,12 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // -d3d9nofx. Resolved once so both branches below agree.
     const bool material_fx = fx && (fx->ReflectionTexture || fx->EnvTexture) && !PARAM_d3d9_nofx.get_or(false);
 
-    agiDX9WorldShader* shader = Pipe()->WorldShader();
+    // A skinned submission always takes the fixed-function branch: the matrix palette IS a fixed-
+    // function feature, and the programmable path's shaders transform by a single world matrix.
+    // MaxNativeSkinBones() already reports 0 while a world shader exists, so this only ever fires if
+    // one appeared between that query and this draw - in which case falling through to fixed
+    // function is correct rather than merely safe, since the shader is unbound between draws.
+    agiDX9WorldShader* shader = skin ? nullptr : Pipe()->WorldShader();
 
     if (shader)
     {
@@ -2313,9 +2401,32 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     D3DMATRIX view_mat = ToD3DMatrix(view_zflip);
     D3DMATRIX proj_mat = BuildProjectionMatrix(proj_params);
 
-    device->SetTransform(D3DTS_WORLD, &world_mat);
     device->SetTransform(D3DTS_VIEW, &view_mat);
     device->SetTransform(D3DTS_PROJECTION, &proj_mat);
+
+    if (skin)
+    {
+        // The palette replaces D3DTS_WORLD outright - D3DTS_WORLDMATRIX(0) and D3DTS_WORLD are the
+        // same slot, so bone 0 lands in it and `world` is never used. Each entry already carries
+        // bone * world, so the hardware transform is (bind-pose vertex) * bone * world * view *
+        // projection, term for term what the CPU skinner computed and then threw away by projecting
+        // it.
+        for (u32 i = 0; i < skin->Count; ++i)
+        {
+            D3DMATRIX bone_mat = ToD3DMatrix(skin->Bones[i]);
+            device->SetTransform(D3DTS_WORLDMATRIX(i), &bone_mat);
+        }
+
+        // D3DVBF_0WEIGHTS: no weights at all, one matrix per vertex named by its own index. The
+        // binding is rigid, so there is nothing to blend and nothing to normalise - this is the
+        // degenerate case of vertex blending, and the cheapest thing the vertex pipeline can do.
+        device->SetRenderState(D3DRS_INDEXEDVERTEXBLEND, TRUE);
+        device->SetRenderState(D3DRS_VERTEXBLEND, D3DVBF_0WEIGHTS);
+    }
+    else
+    {
+        device->SetTransform(D3DTS_WORLD, &world_mat);
+    }
 
     // Meshes loaded without MESH_SET_NORMAL carry no normals, so there is nothing for hardware
     // lighting to work from - their agiWorldVtx::normal is filler. The CPU path draws them
@@ -2388,12 +2499,18 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         SetupD3D9Material(device);
     }
 
-    device->SetFVF(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    device->SetFVF(skin ? kWorldSkinFVF : (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1));
 
     i32 primitive_count = index_count / 3;
 
     // -ghash. Immediately before the draw, which is where Remix would hash it, and on exactly the
-    // bytes handed to the device.
+    // bytes handed to the device - with one exception. A skinned draw submits DX9SkinVtx, which is
+    // these bytes with a bone index spliced in after the position, so its true stride and layout
+    // differ. What the diagnostic exists to answer is whether the submitted geometry is STABLE
+    // frame to frame, and the spliced index is as stable as everything around it (it is a property
+    // of the mesh's bone binding), so hashing the unspliced form answers the same question.
+    // Skinned and unskinned submissions of one mesh are not comparable to each other, which no
+    // caller does anyway.
     const u64 geometry_hash = agiDX9GHashRecord(vertices, vertex_count, indices, index_count, native_tex);
 
     // -ghashcolor. Replace the texture with a flat hash colour for this draw only.
@@ -2412,12 +2529,33 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
     }
 
-    device->DrawIndexedPrimitiveUP(
-        D3DPT_TRIANGLELIST, 0, vertex_count, primitive_count, indices, D3DFMT_INDEX16, vertices, sizeof(agiWorldVtx));
+    if (skin)
+    {
+        // ARTS_ALLOCA for the reason DrawNativeTransform documents at length: calling the engine's
+        // allocator from inside a draw corrupts the simulation heap. A pedestrian is a few hundred
+        // vertices, so this is a few tens of KB.
+        DX9SkinVtx* skin_verts = ARTS_ALLOCA(DX9SkinVtx, vertex_count);
+
+        BuildSkinVertices(skin_verts, vertices, vertex_count, skin->Slots);
+
+        device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vertex_count, primitive_count, indices, D3DFMT_INDEX16,
+            skin_verts, sizeof(DX9SkinVtx));
+    }
+    else
+    {
+        device->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vertex_count, primitive_count, indices, D3DFMT_INDEX16,
+            vertices, sizeof(agiWorldVtx));
+    }
 
     // Per-fragment sun, added on top of the base pass's ambient + fills. Before the material second
     // passes, because chrome and the ground map composite over lit paint and lit road.
-    if (per_pixel)
+    //
+    // Neither this nor the material passes below is reachable for a skinned draw - both resubmit
+    // this draw's positions under their own vertex layout and their own single world matrix, which
+    // a palette-skinned mesh does not have. per_pixel is gated on static_lighting, which a
+    // pedestrian never has, and fx is null for every caller that skins; the guards say so rather
+    // than leaving it to those two facts holding.
+    if (per_pixel && !skin)
     {
         agiDX9Census.PerPixelPasses += per_pixel->DrawSunPasses(
             device, vertices, vertex_count, indices, index_count, sizeof(agiWorldVtx), native_handle, view_zflip);
@@ -2428,7 +2566,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // Second passes, in the order the original composited them: chrome over the paint, ground map
     // over the road. Both reuse this draw's vertex positions and world matrix, so they are ordinary
     // world-space geometry rather than the CPU-pretransformed overlays they replace.
-    if (material_fx)
+    if (material_fx && !skin)
     {
         DrawVehicleReflectionPass(
             device, vertices, vertex_count, indices, index_count, world, view, view_zflip, *fx, Pipe()->PerPixel());

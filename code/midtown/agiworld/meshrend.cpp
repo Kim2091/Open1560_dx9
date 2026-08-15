@@ -1734,7 +1734,7 @@ static void SmoothAdjunctNormals(Vector3* ARTS_RESTRICT out_normals, const u16* 
 }
 
 b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNativeMaterialFx* fx,
-    const u32* base_colors, bool unlit, const agiNativeRigidGroup* rigid)
+    const u32* base_colors, bool unlit, const agiNativeRigidGroup* rigid, const agiNativeSkinPalette* skin)
 {
     Init((Planes != nullptr) && (SurfaceCount > 1));
 
@@ -1816,11 +1816,21 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
     // A rigid group takes only the facets it wholly owns. A facet straddling two bones would tear,
     // so agiMeshModel::ModelDrawLit checks for that up front and does not use this path when it
     // finds one - the check here is the same predicate, applied per facet.
+    //
+    // A skin palette carries a range for the same reason, but almost never a partial one: it is the
+    // whole vertex array unless the skeleton is larger than the device's palette and had to be
+    // submitted in chunks. A facet cannot straddle two chunks, because a chunk is a whole number of
+    // bones and a facet lies inside one bone (which ModelDrawLit verifies before choosing either
+    // path), so nothing is dropped by this.
+    const u32 range_first = skin ? skin->FirstVertex : (rigid ? rigid->FirstVertex : 0u);
+    const u32 range_end = skin ? skin->EndVertex : (rigid ? rigid->EndVertex : 0u);
+    const bool ranged = (skin != nullptr) || (rigid != nullptr);
+
     const auto facet_excluded = [&](u32 facet) {
         if (cpu_cull && IsBackfacing(Planes[facet]))
             return true;
 
-        if (!rigid)
+        if (!ranged)
             return false;
 
         const u16* ARTS_RESTRICT surface = &SurfaceIndices[facet * 4];
@@ -1830,7 +1840,7 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
         {
             const u32 vertex = VertexIndices[surface[k]];
 
-            if ((vertex < rigid->FirstVertex) || (vertex >= rigid->EndVertex))
+            if ((vertex < range_first) || (vertex >= range_end))
                 return true;
         }
 
@@ -1949,6 +1959,23 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
     // stack allocations for the reason documented above.
     agiWorldVtx* verts = ARTS_ALLOCA(agiWorldVtx, flat_shading ? flat_capacity : AdjunctCount);
 
+    // One palette slot per SUBMITTED vertex, built alongside them - see agiNativeSkinPalette::Slots.
+    // _alloca is frame-scoped rather than block-scoped, so this outlives the branch it is taken in.
+    u8* skin_slots = nullptr;
+
+    if (skin)
+        skin_slots = ARTS_ALLOCA(u8, flat_shading ? flat_capacity : AdjunctCount);
+
+    // Mesh vertex -> palette slot. Out-of-chunk vertices land outside the palette and are clamped:
+    // no index references them, but they are inside the vertex range the draw hands the device and
+    // a matrix index past the end of the palette is undefined behaviour, not merely unused. The
+    // subtraction is unsigned, so a vertex below the chunk wraps large and clamps by the same test.
+    const auto skin_slot = [&](u32 vertex) -> u8 {
+        const u32 slot = static_cast<u32>(skin->VertexBones[vertex]) - skin->FirstBone;
+
+        return static_cast<u8>((slot < skin->Count) ? slot : 0u);
+    };
+
     u16* facet_base = nullptr;
     u32 flat_vertex_count = 0;
 
@@ -1972,7 +1999,22 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
             Vector3 reference {};
 
             for (u32 k = 0; k < corners; ++k)
-                reference = reference + UnpackNormal[Normals[surface[k]]];
+            {
+                Vector3 stored = UnpackNormal[Normals[surface[k]]];
+
+                // The stored normals of a skinned model are posed for the frame while its positions
+                // are not, so the two are in different spaces and the sign vote below - a dot
+                // product between the two - would be meaningless without putting them back in the
+                // same one. See agiNativeSkinPalette::NormalUnpose.
+                if (skin)
+                {
+                    Vector3 unposed;
+                    unposed.Dot3x3(stored, skin->NormalUnpose[skin_slot(VertexIndices[surface[k]])]);
+                    stored = unposed;
+                }
+
+                reference = reference + stored;
+            }
 
             const Vector3& p0 = Vertices[VertexIndices[surface[0]]];
             const Vector3& p1 = Vertices[VertexIndices[surface[1]]];
@@ -2003,6 +2045,9 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
             {
                 const u16 a = surface[k];
 
+                if (skin_slots)
+                    skin_slots[flat_vertex_count] = skin_slot(VertexIndices[a]);
+
                 agiWorldVtx& vertex = verts[flat_vertex_count++];
 
                 vertex.pos = Vertices[VertexIndices[a]];
@@ -2029,17 +2074,31 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
         }
 
         // See agiNativeRigidGroup::NormalUnpose. Hoisted out of the loop because it is null for
-        // every caller but the skinned-model one.
+        // every caller but the skinned-model ones. The per-bone path has one matrix for the whole
+        // submission; the palette path picks the vertex's own, which is the same correction applied
+        // at the granularity the palette works at.
         const Matrix34* unpose = rigid ? rigid->NormalUnpose : nullptr;
 
         for (u32 a = 0; a < AdjunctCount; ++a)
         {
-            verts[a].pos = Vertices[VertexIndices[a]];
+            const u32 vertex_index = VertexIndices[a];
+
+            verts[a].pos = Vertices[vertex_index];
 
             Vector3 normal =
                 has_normals ? (smooth_normals ? smooth_normals[a] : UnpackNormal[Normals[a]]) : filler_normal;
 
-            if (unpose)
+            if (skin_slots)
+            {
+                const u8 slot = skin_slot(vertex_index);
+
+                skin_slots[a] = slot;
+
+                Vector3 unposed;
+                unposed.Dot3x3(normal, skin->NormalUnpose[slot]);
+                normal = unposed;
+            }
+            else if (unpose)
             {
                 Vector3 unposed;
                 unposed.Dot3x3(normal, *unpose);
@@ -2086,6 +2145,17 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
         native_fx.SpecularBoost = PARAM_reflect_specular.get_or(0.0f);
 
         effective_fx = &native_fx;
+    }
+
+    // The palette as the renderer receives it: the caller's, plus the slot table built above. Kept
+    // as a local copy so the caller's struct - which describes the model, not this submission - is
+    // not written through.
+    agiNativeSkinPalette draw_skin {};
+
+    if (skin)
+    {
+        draw_skin = *skin;
+        draw_skin.Slots = skin_slots;
     }
 
     bool drawn = false;
@@ -2146,7 +2216,7 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
 
         if (RAST->MeshWorld(verts, static_cast<i32>(vertex_count), indices, static_cast<i32>(index_count),
                 rigid ? *rigid->World : view_params.World, view_params.View, view_params, static_lighting, effective_fx,
-                hardware_lighting))
+                hardware_lighting, skin ? &draw_skin : nullptr))
         {
             drawn = true;
             submitted_indices += index_count;

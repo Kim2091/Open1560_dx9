@@ -29,6 +29,7 @@ struct agiMeshCardInfo;
 struct agiMeshCardVertex;
 struct agiNativeMaterialFx;
 struct agiNativeRigidGroup;
+struct agiNativeSkinPalette;
 class agiTexDef;
 class agiViewParameters;
 
@@ -390,8 +391,13 @@ protected:
     // bone's world matrix - see agiNativeRigidGroup (agi/rsys.h). Used by agiMeshModel::ModelDrawLit
     // to submit a pedestrian as rigid segments rather than CPU-skinned geometry. Null for every
     // other caller, which submits the whole mesh against agiViewParameters::World as before.
+    // skin: submit the whole model in one draw with the bones handed to the hardware as a matrix
+    // palette - see agiNativeSkinPalette (agi/rsys.h). The preferred pedestrian path; `rigid` is
+    // the per-bone fallback for devices and pathways that cannot do it. The two are alternatives,
+    // never both.
     b32 DrawNativeTransform(u32 flags, bool static_lighting = false, const agiNativeMaterialFx* fx = nullptr,
-        const u32* base_colors = nullptr, bool unlit = false, const agiNativeRigidGroup* rigid = nullptr);
+        const u32* base_colors = nullptr, bool unlit = false, const agiNativeRigidGroup* rigid = nullptr,
+        const agiNativeSkinPalette* skin = nullptr);
 
     // Back to private immediately. Everything below is either ARTS_IMPORT/EXPORT or a static the
     // assembly references, and MSVC encodes private/protected/public into the mangled name - so

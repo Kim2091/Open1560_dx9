@@ -29,6 +29,9 @@
 // On top of that sits a trauma-driven shake. Four sources - engine revs, road roughness,
 // longitudinal acceleration and impacts - each contribute to a single normalised trauma value, and
 // the shake amplitude is its square, so low trauma stays imperceptible rather than a constant buzz.
+// A turn gate sits over the top of all four: while the view is being turned, by the car or by the
+// mouse, the shake stands down, because vibration on top of a view that is already moving reads as
+// instability rather than as speed.
 // The displacement itself is layered sine noise at incommensurate frequencies rather than
 // per-frame randomness, which is what makes it read as vibration instead of jitter.
 //
@@ -100,6 +103,19 @@ public:
     f32 ShakeGearSpan {};
     f32 ShakeShiftDip {};
 
+    // Lowest forward gear the engine shake is allowed in at all - 1 is first gear. A hard floor
+    // underneath ShakeGearSpan's fade, so a car with a short gearbox cannot reach full shake in
+    // what is effectively second.
+    f32 ShakeMinGear {};
+
+    // How much of the rev band's top end is taken back off again. 0 keeps the original straight
+    // ramp to the redline; higher flattens the last of it, so the shake still builds with the revs
+    // but stops climbing as hard once the needle is already round.
+    f32 ShakeRevRolloff {};
+
+    // How much of the shake a full-rate turn removes. 1 silences it completely while turning.
+    f32 ShakeTurnScale {};
+
     // Added to Distance/Height across the framing band; the camera eases back and drops slightly.
     f32 SpeedDistance {};
     f32 SpeedHeight {};
@@ -133,9 +149,19 @@ public:
     f32 AccelTrauma {};
     f32 ImpactTrauma {};
 
+    // Smoothed 0..1 measure of how hard the view is being turned, from whichever of the car and
+    // the mouse is turning faster. Scales the whole shake down rather than any one source, because
+    // what makes shake unbearable in a corner is that it fights a camera that is already moving.
+    f32 TurnFactor {};
+
+    // Radians per second the mouse is currently yawing the camera at. Sampled in Update(), where
+    // the mouse delta is, and consumed by UpdateTrauma().
+    f32 MouseTurnRate {};
+
     // Previous-frame state for the derivatives the trauma sources are built from.
     Vector3 PrevVelocity {};
     f32 PrevSuspension[4] {};
+    f32 PrevHeading {};
     b32 HasHistory {};
 
 private:
