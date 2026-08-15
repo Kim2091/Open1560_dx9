@@ -31,14 +31,22 @@ PUMenuBase::PUMenuBase(
 {
     if (background)
     {
-        if (MenuMgr()->Is3D())
-        {
-            bg_bitmap_ = as_rc Pipe()->GetBitmap(background, 1.0f, 1.0f, 0);
-        }
-        else
-        {
-            bg_bitmap_ = as_rc Pipe()->GetBitmap(background, 0.0f, 0.0f, BITMAP_TRANSPARENT);
-        }
+        // Both branches ask for the background at the size of the UI area rather than at the size it
+        // was authored, which is what makes the menu fill the screen at any resolution.
+        //
+        // The scale arguments are a FRACTION OF THE UI AREA, not of the window: agiBitmap::BeginGfx
+        // resolves them as UI_Width/UI_Height * scale and reloads the image resampled to that. Zero
+        // means "keep the file's own size", and that is what the flat branch used to pass - so a
+        // 640x480 background stayed 640x480 while the widgets laid over it were positioned in
+        // normalised coordinates across the whole UI area. At 1920x1080 (UI area 1440x1080, from the
+        // UI Position line in the log) that is a third-size picture under full-size controls, which
+        // is the "menu is stuck at 480p" this fixes.
+        //
+        // The art is upscaled rather than redrawn, so it is softer than it was at 640x480. That is
+        // inherent in 4:3 assets from 1999 and is the better of the two failures.
+        const i32 flags = MenuMgr()->Is3D() ? 0 : BITMAP_TRANSPARENT;
+
+        bg_bitmap_ = as_rc Pipe()->GetBitmap(background, 1.0f, 1.0f, flags);
 
         if (!bg_bitmap_)
         {
