@@ -37,6 +37,7 @@ define_dummy_symbol(agiworld_meshrend);
 #include "data7/utimer.h"
 #include "dyna7/gfx.h"
 #include "memory/alloca.h"
+#include "mmsettings/settings.h"
 #include "pcwindis/setupdata.h"
 #include "vector7/matrix34.h"
 #include "vector7/matrix44.h"
@@ -1667,13 +1668,28 @@ static mem::cmd_param PARAM_flat_normals {"flatnormals", "Shade from facet geome
 // it and neither may own it - a second cmd_param with the same name would register twice.
 static mem::cmd_param PARAM_no_cull {"nocull", "Disable backface, LOD and distance culling (for RTX Remix captures)"};
 
+// See agiNoCullEnabled. Refreshed by the settings change callback below rather than read per facet.
+static bool agiNoCullCached = false;
+
+static void agiWorldSettingsChanged()
+{
+    agiNoCullCached = mmSettingBool("nocull");
+}
+
+// Registered the first time this translation unit is entered. A static initialiser rather than an
+// explicit call from somewhere, because there is no init hook this file already participates in and
+// the alternative is one more thing to remember to wire up.
+[[maybe_unused]] static const bool agiWorldSettingsRegistered = [] {
+    mmSettingsOnChange(agiWorldSettingsChanged);
+    return true;
+}();
+
 bool agiNoCullEnabled()
 {
-    // Resolved once. cmd_param::init() has walked argv long before any draw, and re-reading it per
-    // facet would put a string lookup in the inner loop.
-    static const bool enabled = PARAM_no_cull.get_or(false);
-
-    return enabled;
+    // Cached across the frame rather than resolved once for the life of the process: it is now a
+    // menu setting and has to be able to change, but re-reading it would put a string lookup in the
+    // inner loop of every draw. mmSettingsSync clears the cache when anything is changed.
+    return agiNoCullCached;
 }
 
 // -nativecpucull. Restores the camera-dependent CPU backface cull that DrawNativeTransform used to
@@ -1928,7 +1944,7 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
     if (SurfaceCount > 0x7FFFu)
         return false;
 
-    const bool cpu_cull = (Planes != nullptr) && PARAM_native_cpu_cull.get_or(false);
+    const bool cpu_cull = (Planes != nullptr) && mmSettingBool("nativecpucull");
 
     // A chunk of a skinned model takes only the facets it wholly owns. When the palette holds the
     // whole skeleton - the usual case - that is every facet and this excludes nothing. When the
@@ -2060,7 +2076,7 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
     // and on well-formed meshes the stored normals are better.
     const u32 flat_capacity = SurfaceCount * 4;
 
-    const bool flat_shading = has_normals && hardware_lighting && PARAM_flat_normals.get_or(false) &&
+    const bool flat_shading = has_normals && hardware_lighting && mmSettingBool("flatnormals") &&
         (flat_capacity <= kFlatVertexCap) && (SurfaceCount > 0);
 
     // Flat mode needs one vertex per facet corner rather than one per adjunct, and both bounds are
@@ -2183,7 +2199,7 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
         // Not for a skinned model: BuildSkinBindNormals has already averaged over the facets, from
         // the geometry rather than from the packed set, so this would be a second smoothing pass
         // over an input that no longer exists.
-        if (!skin && has_normals && PARAM_smooth_normals.get_or(true) && (VertexCount <= 4096) &&
+        if (!skin && has_normals && mmSettingBool("smoothnormals", true) && (VertexCount <= 4096) &&
             (AdjunctCount <= 4096))
         {
             smooth_normals = ARTS_ALLOCA(Vector3, AdjunctCount);
@@ -2244,10 +2260,10 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
         ++agiReflectDraws;
 
         native_fx.ReflectionTexture = agiNativeReflectionTex;
-        native_fx.ReflectionAmount = agiNativeReflectivity * PARAM_reflect_amount.get_or(0.35f);
-        native_fx.FresnelBias = PARAM_reflect_fresnel_bias.get_or(1.0f);
-        native_fx.FresnelScale = PARAM_reflect_fresnel_scale.get_or(0.0f);
-        native_fx.SpecularBoost = PARAM_reflect_specular.get_or(0.0f);
+        native_fx.ReflectionAmount = agiNativeReflectivity * mmSettingFloat("reflectamount", 0.35f);
+        native_fx.FresnelBias = mmSettingFloat("reflectfresnelbias", 1.0f);
+        native_fx.FresnelScale = mmSettingFloat("reflectfresnelscale", 0.0f);
+        native_fx.SpecularBoost = mmSettingFloat("reflectspecular", 0.0f);
 
         effective_fx = &native_fx;
     }
@@ -2586,10 +2602,10 @@ bool agiGlowKindEnabled(agiGlowKind kind)
 {
     switch (kind)
     {
-        case agiGlowKind::Headlight: return PARAM_glow_on_head.get_or(true);
-        case agiGlowKind::Vehicle: return PARAM_glow_on_vehicle.get_or(true);
-        case agiGlowKind::Traffic: return PARAM_glow_on_traffic.get_or(true);
-        case agiGlowKind::Lamp: return PARAM_glow_on_lamp.get_or(true);
+        case agiGlowKind::Headlight: return mmSettingBool("glowheadlights", true);
+        case agiGlowKind::Vehicle: return mmSettingBool("glowvehiclelights", true);
+        case agiGlowKind::Traffic: return mmSettingBool("glowtrafficlights", true);
+        case agiGlowKind::Lamp: return mmSettingBool("glowstreetlamps", true);
         default: return PARAM_glow_on_generic.get_or(true);
     }
 }
@@ -2674,7 +2690,7 @@ static mem::cmd_param PARAM_glow_reach_min {"glowreachmin", "Minimum reach of a 
 
 f32 agiGlowLightReach(f32 flare_half_extent)
 {
-    return std::max(flare_half_extent * PARAM_glow_reach_scale.get_or(14.0f), PARAM_glow_reach_min.get_or(20.0f));
+    return std::max(flare_half_extent * mmSettingFloat("glowreachscale", 14.0f), PARAM_glow_reach_min.get_or(20.0f));
 }
 
 void agiAddGlowLightRGB(const Vector3& position, const Vector3& tint, f32 radius, agiTexDef* texture, f32 u, f32 v)

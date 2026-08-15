@@ -24,6 +24,7 @@ define_dummy_symbol(mmcamcs_povcamcs);
 #include "camshake.h"
 #include "eventq7/event.h"
 #include "mmcar/car.h"
+#include "mmsettings/settings.h"
 
 static mem::cmd_param PARAM_povbob {"povbob", "In-car head bob strength; 0 is off"};
 static mem::cmd_param PARAM_povbobsway {"povbobsway", "How much the in-car head bob rotates the view"};
@@ -101,9 +102,10 @@ struct PovHeadState
     // what invalidates this state, the car being a different car is.
     const mmCar* Car {};
 
-    // Tunables, read once on first use. There is no Init() hook to hang them off that is guaranteed
-    // to run for a camera the game creates itself, so they are resolved lazily instead.
-    b32 Ready {};
+    // Tunables, resolved from the settings table. There is no Init() hook to hang them off that is
+    // guaranteed to run for a camera the game creates itself, so they are resolved lazily and then
+    // again whenever the settings change - see mmSettingsGeneration.
+    u32 Generation {};
     b32 LookEnabled {};
     f32 YawScale {};
     f32 PitchScale {};
@@ -122,14 +124,14 @@ static f32 PovBlend(f32 rate, f32 delta)
 
 static void PovEnsureReady()
 {
-    if (PovHead.Ready)
+    if (PovHead.Generation == mmSettingsGeneration())
         return;
 
-    PovHead.Ready = true;
+    PovHead.Generation = mmSettingsGeneration();
 
-    PovHead.LookEnabled = PARAM_povlook.get_or(true);
+    PovHead.LookEnabled = mmSettingBool("povlook", true);
 
-    f32 sensitivity = PARAM_povlooksens.get_or(0.0035f);
+    f32 sensitivity = mmSettingFloat("povlooksens", 0.0035f);
 
     // Negative by default for the same reason the orbital camera's are: raw mouse motion drives both
     // axes the wrong way round for a view that turns with the mouse rather than being dragged by it.
@@ -139,8 +141,8 @@ static void PovEnsureReady()
     PovHead.SmoothRate = PARAM_povlooksmooth.get_or(16.0f);
     PovHead.RecenterDelay = PARAM_povlookrecenter.get_or(1.2f);
 
-    PovHead.BobShift = PARAM_povbob.get_or(1.0f);
-    PovHead.BobSway = PARAM_povbobsway.get_or(1.0f);
+    PovHead.BobShift = mmSettingFloat("povbob", 1.0f);
+    PovHead.BobSway = mmSettingFloat("povbobsway", 1.0f);
 
     PovHead.Shake.Init();
 }

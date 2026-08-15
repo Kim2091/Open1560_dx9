@@ -43,6 +43,7 @@
 #include "dx9texdef.h"
 
 #include "dx9_windows.h"
+#include "mmsettings/settings.h"
 
 #include <algorithm>
 #include <cmath>
@@ -501,7 +502,7 @@ i32 agiDX9Rasterizer::BeginGfx()
 
         if (supported && (caps.MaxAnisotropy > 1))
         {
-            const DWORD wanted = static_cast<DWORD>(std::max(1, PARAM_aniso.get_or(16)));
+            const DWORD wanted = static_cast<DWORD>(std::max(1, mmSettingInt("aniso", 16)));
 
             g_MaxAnisotropy = std::min(wanted, caps.MaxAnisotropy);
         }
@@ -1171,7 +1172,7 @@ static u64 agiDX9GHashBytes(const void* data, usize size, u64 hash)
 static u64 agiDX9GHashRecord(
     const agiWorldVtx* vertices, i32 vertex_count, const u16* indices, i32 index_count, agiDX9TexDef* texture)
 {
-    if (!PARAM_ghash.get_or(false) && !PARAM_ghashcolor.get_or(false))
+    if (!PARAM_ghash.get_or(false) && !mmSettingBool("ghashcolor"))
         return 0;
 
     if (!vertices || !indices || (vertex_count <= 0) || (index_count <= 0))
@@ -1387,7 +1388,7 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
     // draw has an identity Remix could key on. It does not: pretransformed vertices carry no
     // world-space information, so anything painted magenta here is geometry Remix cannot see at all.
     // Pair it with the IN-SCENE SCREEN DRAWS BY TEXTURE line, which names the same draws.
-    const bool mark_screen = PARAM_ghashcolor.get_or(false) && Pipe()->IsInScene();
+    const bool mark_screen = mmSettingBool("ghashcolor") && Pipe()->IsInScene();
 
     if (mark_screen)
     {
@@ -1608,7 +1609,7 @@ static mem::cmd_param PARAM_d3d9_specular {"d3d9specular", "Add a specular term 
 
 bool agiDX9WantsStaticSpecular()
 {
-    return PARAM_d3d9_specular.get_or(false);
+    return mmSettingBool("d3d9specular");
 }
 
 // Builds the fixed sun/fill1/fill2 + ambient rig agiMeshLighterTriple/Quarter compute on the CPU
@@ -2038,7 +2039,7 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
 // Capped at 256 because that is the width of the index the vertex carries - one byte.
 u32 agiDX9Rasterizer::MaxNativeSkinBones() const
 {
-    if (PARAM_noskin.get_or(false))
+    if (mmSettingBool("noskin"))
         return 1;
 
     agiDX9Context* context = Pipe()->Context();
@@ -2106,7 +2107,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     //
     // Kept as a parameter rather than deleted because the census still reports a nonzero in-scene
     // screen-triangle count, so some 3D content has not moved over yet.
-    const f32 depth_bias = PARAM_d3d9_depthbias.get_or(0.0f);
+    const f32 depth_bias = mmSettingFloat("d3d9depthbias", 0.0f);
     device->SetRenderState(D3DRS_DEPTHBIAS, *reinterpret_cast<const DWORD*>(&depth_bias));
 
     // FlushState()'s texture/texture-stage bookkeeping (current_texture_/tex_env_) only updates
@@ -2354,7 +2355,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // ---------------------------------------------------------------------------------------------
 
     // -d3d9nofx. Resolved once so both branches below agree.
-    const bool material_fx = fx && (fx->ReflectionTexture || fx->EnvTexture) && !PARAM_d3d9_nofx.get_or(false);
+    const bool material_fx = fx && (fx->ReflectionTexture || fx->EnvTexture) && !mmSettingBool("d3d9nofx");
 
     // Does this draw need the matrix palette, or just a world matrix? A palette of one is the
     // latter - see the transform block below.
@@ -2524,7 +2525,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // No explicit restore: RestoreStateAfterWorldDraw() below already re-applies ApplyTexEnv() from
     // tex_env_, which puts COLOROP/COLORARG1 back, and the stale TEXTUREFACTOR value is only ever
     // read when a stage selects TFACTOR, which nothing else does.
-    if (PARAM_ghashcolor.get_or(false))
+    if (mmSettingBool("ghashcolor"))
     {
         device->SetRenderState(D3DRS_TEXTUREFACTOR, agiDX9GHashColor(geometry_hash));
         device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);

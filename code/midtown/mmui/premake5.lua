@@ -44,6 +44,8 @@ arts_component "mmui"
         "options.h",
         "optionsbase.cpp",
         "optionsbase.h",
+        "pu_advanced.cpp",
+        "pu_advanced.h",
         "pu_audio.cpp",
         "pu_audio.h",
         "pu_chat.cpp",

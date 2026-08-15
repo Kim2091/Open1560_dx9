@@ -21,6 +21,7 @@ define_dummy_symbol(mmcamcs_camshake);
 #include "camshake.h"
 
 #include "mmcar/car.h"
+#include "mmsettings/settings.h"
 #include "vector7/matrix34.h"
 
 static mem::cmd_param PARAM_shake {"orbitshake", "Camera engine shake strength; 0 is off"};
@@ -166,24 +167,26 @@ static f32 ShakeNoise(f32 time, i32 salt)
 
 void mmCamShake::Init()
 {
-    Amplitude = PARAM_shakeamp.get_or(1.0f);
-    EngineScale = PARAM_shake.get_or(0.8f);
-    RoughScale = PARAM_shakerough.get_or(0.55f);
-    ImpactScale = PARAM_shakeimpact.get_or(1.0f);
-    AccelScale = PARAM_shakeaccel.get_or(0.35f);
+    generation_ = mmSettingsGeneration();
 
-    RpmStart = PARAM_shakerpm.get_or(0.55f);
+    Amplitude = mmSettingFloat("orbitshakeamp", 1.0f);
+    EngineScale = mmSettingFloat("orbitshake", 0.8f);
+    RoughScale = mmSettingFloat("orbitshakerough", 0.55f);
+    ImpactScale = mmSettingFloat("orbitshakeimpact", 1.0f);
+    AccelScale = mmSettingFloat("orbitshakeaccel", 0.35f);
+
+    RpmStart = mmSettingFloat("orbitshakerpm", 0.55f);
 
     // Narrow, and floored at third on top of that. The engine shake is at its most convincing as
     // something that only shows up once the car is genuinely working - in the gears it spends real
     // time in at speed - and it reads as a rattle rather than a top end when it can reach full
     // strength in a gear the car merely passes through.
-    GearSpan = PARAM_shakegears.get_or(1.5f);
-    MinGear = PARAM_shakemingear.get_or(3.0f);
-    ShiftDip = PARAM_shakeshift.get_or(0.35f);
-    RevRolloff = PARAM_shakerevtop.get_or(0.35f);
+    GearSpan = mmSettingFloat("orbitshakegears", 1.5f);
+    MinGear = mmSettingFloat("orbitshakemingear", 3.0f);
+    ShiftDip = mmSettingFloat("orbitshakeshift", 0.35f);
+    RevRolloff = mmSettingFloat("orbitshakerevtop", 0.35f);
 
-    TurnScale = PARAM_shaketurn.get_or(1.0f);
+    TurnScale = mmSettingFloat("orbitshaketurn", 1.0f);
 }
 
 void mmCamShake::Reset()
@@ -226,6 +229,12 @@ void mmCamShake::Update(const mmCar* car, const Matrix34* car_matrix, f32 delta,
 {
     if (delta <= 0.0f)
         return;
+
+    // Re-resolve when the menu has changed something. One integer compare in the common case, which
+    // is what buys the tunables being ordinary fields rather than a name lookup each time they are
+    // read - and there are a dozen of them read several times a frame.
+    if (generation_ != mmSettingsGeneration())
+        Init();
 
     if (car)
     {

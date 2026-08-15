@@ -27,6 +27,7 @@ define_dummy_symbol(mmcamcs_orbitcamcs);
 #include "mmdyna/isect.h"
 #include "mmdyna/poly.h"
 #include "mmphysics/phys.h"
+#include "mmsettings/settings.h"
 
 static mem::cmd_param PARAM_orbitsens {"orbitsens", "Orbital camera mouse sensitivity, in radians per mouse count"};
 static mem::cmd_param PARAM_orbitdist {"orbitdist", "Orbital camera distance from the car"};
@@ -142,13 +143,13 @@ void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
     // Sits in tight and low on the car at a standstill and opens out with speed, so the framing
     // itself carries the sense of pace rather than the shake having to do all of it. Height is
     // what sets most of the downward angle at these distances, so it stays modest.
-    Distance = PARAM_orbitdist.get_or(6.0f);
+    Distance = mmSettingFloat("orbitdist", 6.0f);
     Height = PARAM_orbitheight.get_or(1.15f);
     SmoothRate = PARAM_orbitsmooth.get_or(14.0f);
     RecenterDelay = PARAM_orbitrecenter.get_or(0.6f);
     DriftBias = PARAM_orbitdrift.get_or(0.85f);
 
-    f32 sensitivity = PARAM_orbitsens.get_or(0.0045f);
+    f32 sensitivity = mmSettingFloat("orbitsens", 0.0045f);
 
     YawScale = PARAM_orbitinvertx.get_or(false) ? sensitivity : -sensitivity;
     PitchScale = PARAM_orbitinverty.get_or(false) ? sensitivity : -sensitivity;
@@ -160,9 +161,9 @@ void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
 
     SpeedDistance = PARAM_orbitpullback.get_or(6.0f);
     SpeedHeight = PARAM_orbitpulldown.get_or(-0.25f);
-    SpeedFov = PARAM_orbitfov.get_or(18.0f);
+    SpeedFov = mmSettingFloat("orbitfov", 18.0f);
 
-    CollideEnabled = PARAM_orbitcollide.get_or(true);
+    CollideEnabled = mmSettingBool("orbitcollide", true);
 
     Shake.Init();
 

@@ -20,6 +20,8 @@ define_dummy_symbol(midtown);
 
 #include "midtown.h"
 
+#include "mmsettings/settings.h"
+
 #include "agi/bitmap.h"
 #include "agi/physlib.h"
 #include "agi/pipeline.h"
@@ -1197,6 +1199,11 @@ int main(int argc, char** argv)
     agiDX9LoadShaderConfig();
 
     mem::cmd_param::init(argc, argv);
+
+    // Immediately after, and before anything reads a setting: the live table is seeded from the
+    // parameters that were just parsed, so a command line still wins over every default. See
+    // mmsettings/settings.h.
+    mmSettingsInit();
 
     if (PARAM_console.get_or(false))
         LogToConsole();

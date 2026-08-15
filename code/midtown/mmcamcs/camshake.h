@@ -132,5 +132,8 @@ private:
     f32 prev_heading_ {};
     b32 has_history_ {};
 
+    // The settings generation the tunables above were resolved at - see mmSettingsGeneration.
+    u32 generation_ {};
+
     f32 Combine() const;
 };

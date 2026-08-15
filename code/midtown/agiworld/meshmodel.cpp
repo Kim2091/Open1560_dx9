@@ -24,6 +24,7 @@ define_dummy_symbol(agiworld_meshmodel);
 #include "agi/rsys.h"
 #include "agi/viewport.h"
 #include "memory/alloca.h"
+#include "mmsettings/settings.h"
 #include "skeleton.h"
 #include "vector7/matrix34.h"
 
@@ -229,7 +230,7 @@ i32 agiMeshModel::ModelDrawLit(agiMeshLighter lighter, u32 flags, agiLitAnimatio
     // bound is the same one agiMeshSet::DrawNativeTransform applies to its own smoothing pass. A
     // pedestrian is far below it; anything above takes the CPU paths below.
     if (palette_limit && Pipe()->SupportsNativeTransform() && CanSkinModel(this) &&
-        agiNativePathEnabled(NATIVE_DRAWMODEL) && frame_normals && !PARAM_ped_skin.get_or(false) &&
+        agiNativePathEnabled(NATIVE_DRAWMODEL) && frame_normals && !mmSettingBool("pedskin") &&
         (SkinGroupCount <= 255) && (VertexCount <= 4096) && (AdjunctCount <= 4096))
     {
         Skeleton.Pose(animation->Poses[frame]);
