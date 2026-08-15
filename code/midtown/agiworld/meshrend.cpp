@@ -1733,8 +1733,125 @@ static void SmoothAdjunctNormals(Vector3* ARTS_RESTRICT out_normals, const u16* 
     }
 }
 
+// Bind-pose vertex normals for a skinned model, rebuilt from the mesh's own geometry.
+//
+// This is what makes a pedestrian hash to ONE mesh instead of one per animation frame, and it is
+// worth being precise about why the obvious source will not do.
+//
+// A pedestrian has no normals of its own. mmInstance::InitMeshes only asks for MESH_SET_NORMAL on
+// COLLIDER and MOVER instances, so agiMeshSet::Normals is null for one, and the normals it is drawn
+// with come from agiLitAnimation::Frames[frame] - one packed set PER ANIMATION FRAME, already posed.
+// Submitting those means the normal bytes of the vertex change every time the walk cycle advances,
+// and RTX Remix hashes the vertex bytes: same positions, same colours, same UVs, new mesh, sixty
+// times a second. That is the -ghashcolor tint strobing on pedestrians and nothing else in the
+// vertex was ever responsible - it is why the earlier work on positions, correct as far as it went,
+// did not settle the churn.
+//
+// Unposing them does not fix it either, which is the trap here. The unposed value is *approximately*
+// the bind-pose normal, but it is a 198-entry quantised direction rotated by a matrix rebuilt from
+// the frame's pose, so it lands on slightly different floats for every frame of the animation. The
+// hash needs bit-identical bytes, not a close answer.
+//
+// So the normals are computed from data that has no frame in it at all: the mesh's own positions and
+// facets. Both are immutable, so this returns the same bytes for the life of the process, in every
+// pose of every animation the model is played through - and, unlike the packed set, it is also a
+// better normal, being a real area-weighted average rather than an 8-bit index into a coarse table.
+//
+// The vertices are in BONE-LOCAL space (agiMeshModel::ModelGeometry computes vertex * bone, with no
+// inverse-bind step), so a facet's corners are only in a common frame when they share a bone. Those
+// are the only facets used, which costs nothing in practice - a model is checked for exactly that
+// property before this path is chosen - and a normal computed this way is in the same space as the
+// positions beside it, so the palette matrix poses both together and no unposing is needed anywhere.
+//
+// The one thing geometry cannot supply is which side of the plane is outward: a cross product
+// defines the plane, and the winding convention that would settle the rest is not something to bet a
+// pedestrian's shading on. That is resolved by voting the geometric normals against the animation's
+// stored ones, and it is the single place a per-frame input is consulted - deliberately reduced to
+// ONE BIT for the whole submission, over hundreds of facets, so that it cannot vary between frames:
+// a per-facet vote would put the frame back into the vertex bytes, one facet at a time.
+static void BuildSkinBindNormals(Vector3* ARTS_RESTRICT out_normals, Vector3* ARTS_RESTRICT accum,
+    const agiNativeSkinPalette& skin, const Vector3* ARTS_RESTRICT vertices, const u16* ARTS_RESTRICT vertex_indices,
+    const u16* ARTS_RESTRICT surface_indices, const u8* ARTS_RESTRICT packed_normals, u32 surface_count,
+    u32 adjunct_count, u32 vertex_count, const Vector3& filler)
+{
+    for (u32 v = 0; v < vertex_count; ++v)
+        accum[v] = {0.0f, 0.0f, 0.0f};
+
+    f32 vote = 0.0f;
+
+    for (u32 facet = 0; facet < surface_count; ++facet)
+    {
+        const u16* ARTS_RESTRICT surface = &surface_indices[facet * 4];
+        const u32 corners = surface[3] ? 4u : 3u;
+
+        const u32 v0 = vertex_indices[surface[0]];
+        const u8 bone = skin.VertexBones[v0];
+
+        bool coherent = true;
+
+        for (u32 k = 1; k < corners; ++k)
+        {
+            if (skin.VertexBones[vertex_indices[surface[k]]] != bone)
+            {
+                coherent = false;
+                break;
+            }
+        }
+
+        // A facet spanning two bones has its corners in two different local frames, so the triangle
+        // it describes is not a triangle anywhere. It contributes no normal; its corners take theirs
+        // from the facets around them, which do share their bone.
+        if (!coherent)
+            continue;
+
+        const Vector3& p0 = vertices[v0];
+        const Vector3& p1 = vertices[vertex_indices[surface[1]]];
+        const Vector3& p2 = vertices[vertex_indices[surface[2]]];
+
+        // Deliberately not normalised: the magnitude of the cross product is twice the triangle's
+        // area, so accumulating it weights each facet by how much of the surface it actually is.
+        // Normalising first would let a sliver of a facet pull a vertex normal as hard as the large
+        // one next to it.
+        Vector3 face;
+        face.Cross(p1 - p0, p2 - p0);
+
+        for (u32 k = 0; k < corners; ++k)
+            accum[vertex_indices[surface[k]]] += face;
+
+        // The sign vote. Bones outside this chunk's palette have no unpose matrix here, so they sit
+        // it out; every chunk still votes over its own bones, which is far more than enough.
+        const u32 slot = static_cast<u32>(bone) - skin.FirstBone;
+
+        if (slot >= skin.Count)
+            continue;
+
+        Vector3 reference {};
+
+        for (u32 k = 0; k < corners; ++k)
+            reference += UnpackNormal[packed_normals[surface[k]]];
+
+        Vector3 unposed;
+        unposed.Dot3x3(reference, skin.NormalUnpose[slot]);
+
+        vote += face ^ unposed;
+    }
+
+    const f32 sign = (vote < 0.0f) ? -1.0f : 1.0f;
+
+    for (u32 a = 0; a < adjunct_count; ++a)
+    {
+        const Vector3& sum = accum[vertex_indices[a]];
+
+        const f32 mag2 = sum.Mag2();
+
+        // A vertex no usable facet reached - every facet touching it spans two bones, or has no
+        // area. Rare, and a flat-lit vertex is a far smaller error than an unstable one.
+        out_normals[a] = (mag2 > 1.0e-12f) ? (sum * (sign / std::sqrt(mag2))) : filler;
+    }
+}
+
 b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNativeMaterialFx* fx,
-    const u32* base_colors, bool unlit, const agiNativeRigidGroup* rigid, const agiNativeSkinPalette* skin)
+    const u32* base_colors, bool unlit, const agiNativeSkinPalette* skin)
 {
     Init((Planes != nullptr) && (SurfaceCount > 1));
 
@@ -1813,24 +1930,15 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
 
     const bool cpu_cull = (Planes != nullptr) && PARAM_native_cpu_cull.get_or(false);
 
-    // A rigid group takes only the facets it wholly owns. A facet straddling two bones would tear,
-    // so agiMeshModel::ModelDrawLit checks for that up front and does not use this path when it
-    // finds one - the check here is the same predicate, applied per facet.
-    //
-    // A skin palette carries a range for the same reason, but almost never a partial one: it is the
-    // whole vertex array unless the skeleton is larger than the device's palette and had to be
-    // submitted in chunks. A facet cannot straddle two chunks, because a chunk is a whole number of
-    // bones and a facet lies inside one bone (which ModelDrawLit verifies before choosing either
-    // path), so nothing is dropped by this.
-    const u32 range_first = skin ? skin->FirstVertex : (rigid ? rigid->FirstVertex : 0u);
-    const u32 range_end = skin ? skin->EndVertex : (rigid ? rigid->EndVertex : 0u);
-    const bool ranged = (skin != nullptr) || (rigid != nullptr);
-
+    // A chunk of a skinned model takes only the facets it wholly owns. When the palette holds the
+    // whole skeleton - the usual case - that is every facet and this excludes nothing. When the
+    // skeleton had to be split, a facet spanning the boundary would tear, so it is left out and
+    // agiMeshModel::ModelDrawLit only splits a model it has checked has no such facet.
     const auto facet_excluded = [&](u32 facet) {
         if (cpu_cull && IsBackfacing(Planes[facet]))
             return true;
 
-        if (!ranged)
+        if (!skin)
             return false;
 
         const u16* ARTS_RESTRICT surface = &SurfaceIndices[facet * 4];
@@ -1840,7 +1948,7 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
         {
             const u32 vertex = VertexIndices[surface[k]];
 
-            if ((vertex < range_first) || (vertex >= range_end))
+            if ((vertex < skin->FirstVertex) || (vertex >= skin->EndVertex))
                 return true;
         }
 
@@ -1960,11 +2068,29 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
     agiWorldVtx* verts = ARTS_ALLOCA(agiWorldVtx, flat_shading ? flat_capacity : AdjunctCount);
 
     // One palette slot per SUBMITTED vertex, built alongside them - see agiNativeSkinPalette::Slots.
-    // _alloca is frame-scoped rather than block-scoped, so this outlives the branch it is taken in.
+    // _alloca is frame-scoped rather than block-scoped, so these outlive the branch they are taken
+    // in.
     u8* skin_slots = nullptr;
 
+    // Frame-independent normals for a skinned model - the whole reason a pedestrian hashes to one
+    // mesh. See BuildSkinBindNormals. Built for the adjunct array in both shading modes, because
+    // flat mode needs them for its sign reference even though it computes its own face normals.
+    Vector3* bind_normals = nullptr;
+
     if (skin)
+    {
         skin_slots = ARTS_ALLOCA(u8, flat_shading ? flat_capacity : AdjunctCount);
+
+        if (has_normals)
+        {
+            bind_normals = ARTS_ALLOCA(Vector3, AdjunctCount);
+
+            Vector3* bind_accum = ARTS_ALLOCA(Vector3, VertexCount);
+
+            BuildSkinBindNormals(bind_normals, bind_accum, *skin, Vertices, VertexIndices, SurfaceIndices, Normals,
+                SurfaceCount, AdjunctCount, VertexCount, filler_normal);
+        }
+    }
 
     // Mesh vertex -> palette slot. Out-of-chunk vertices land outside the palette and are clamped:
     // no index references them, but they are inside the vertex range the draw hands the device and
@@ -1998,23 +2124,12 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
 
             Vector3 reference {};
 
+            // The stored normals of a skinned model are posed for the frame while its positions are
+            // not, so the two are in different spaces and this sign vote - a dot product between
+            // them - would be comparing nothing. The bind normals are already in the positions'
+            // space and already carry the resolved sign, so they are the reference there.
             for (u32 k = 0; k < corners; ++k)
-            {
-                Vector3 stored = UnpackNormal[Normals[surface[k]]];
-
-                // The stored normals of a skinned model are posed for the frame while its positions
-                // are not, so the two are in different spaces and the sign vote below - a dot
-                // product between the two - would be meaningless without putting them back in the
-                // same one. See agiNativeSkinPalette::NormalUnpose.
-                if (skin)
-                {
-                    Vector3 unposed;
-                    unposed.Dot3x3(stored, skin->NormalUnpose[skin_slot(VertexIndices[surface[k]])]);
-                    stored = unposed;
-                }
-
-                reference = reference + stored;
-            }
+                reference = reference + (bind_normals ? bind_normals[surface[k]] : UnpackNormal[Normals[surface[k]]]);
 
             const Vector3& p0 = Vertices[VertexIndices[surface[0]]];
             const Vector3& p1 = Vertices[VertexIndices[surface[1]]];
@@ -2065,7 +2180,11 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
         // of how the lighting is evaluated.
         Vector3* smooth_normals = nullptr;
 
-        if (has_normals && PARAM_smooth_normals.get_or(true) && (VertexCount <= 4096) && (AdjunctCount <= 4096))
+        // Not for a skinned model: BuildSkinBindNormals has already averaged over the facets, from
+        // the geometry rather than from the packed set, so this would be a second smoothing pass
+        // over an input that no longer exists.
+        if (!skin && has_normals && PARAM_smooth_normals.get_or(true) && (VertexCount <= 4096) &&
+            (AdjunctCount <= 4096))
         {
             smooth_normals = ARTS_ALLOCA(Vector3, AdjunctCount);
             Vector3* accum = ARTS_ALLOCA(Vector3, VertexCount);
@@ -2073,37 +2192,23 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
             SmoothAdjunctNormals(smooth_normals, VertexIndices, Normals, AdjunctCount, accum, VertexCount);
         }
 
-        // See agiNativeRigidGroup::NormalUnpose. Hoisted out of the loop because it is null for
-        // every caller but the skinned-model ones. The per-bone path has one matrix for the whole
-        // submission; the palette path picks the vertex's own, which is the same correction applied
-        // at the granularity the palette works at.
-        const Matrix34* unpose = rigid ? rigid->NormalUnpose : nullptr;
-
         for (u32 a = 0; a < AdjunctCount; ++a)
         {
             const u32 vertex_index = VertexIndices[a];
 
             verts[a].pos = Vertices[vertex_index];
 
-            Vector3 normal =
-                has_normals ? (smooth_normals ? smooth_normals[a] : UnpackNormal[Normals[a]]) : filler_normal;
-
             if (skin_slots)
-            {
-                const u8 slot = skin_slot(vertex_index);
+                skin_slots[a] = skin_slot(vertex_index);
 
-                skin_slots[a] = slot;
+            // bind_normals first: for a skinned model it is the only source that does not carry the
+            // animation frame into the vertex bytes.
+            Vector3 normal = filler_normal;
 
-                Vector3 unposed;
-                unposed.Dot3x3(normal, skin->NormalUnpose[slot]);
-                normal = unposed;
-            }
-            else if (unpose)
-            {
-                Vector3 unposed;
-                unposed.Dot3x3(normal, *unpose);
-                normal = unposed;
-            }
+            if (bind_normals)
+                normal = bind_normals[a];
+            else if (has_normals)
+                normal = smooth_normals ? smooth_normals[a] : UnpackNormal[Normals[a]];
 
             verts[a].normal = normal;
             verts[a].color = src_colors ? src_colors[a] : 0xFFFFFFFF;
@@ -2215,7 +2320,7 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
         const u32 vertex_count = flat_shading ? flat_vertex_count : AdjunctCount;
 
         if (RAST->MeshWorld(verts, static_cast<i32>(vertex_count), indices, static_cast<i32>(index_count),
-                rigid ? *rigid->World : view_params.World, view_params.View, view_params, static_lighting, effective_fx,
+                skin ? skin->Bones[0] : view_params.World, view_params.View, view_params, static_lighting, effective_fx,
                 hardware_lighting, skin ? &draw_skin : nullptr))
         {
             drawn = true;

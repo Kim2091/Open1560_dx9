@@ -60,70 +60,43 @@ struct agiNativeMaterialFx
 // traversal is closed assembly. See the note at the definition.
 bool agiNoCullEnabled();
 
-// One rigid segment of a skinned model, submitted with its bone folded into the world matrix
-// instead of applied to the vertices.
+// A skinned model submitted with the bones handed to the hardware as a matrix palette, and every
+// vertex carrying the index of the bone it is bound to.
 //
 // agiMeshModel's binding is rigid - agiMeshModel::SkinGroupVerts partitions the vertex array into
-// one contiguous run per bone, with no per-vertex weights - so a pedestrian is not a deforming
-// mesh at all. It is a handful of rigid pieces on a skeleton, and skinning it on the CPU threw that
+// one contiguous run per bone, with no per-vertex weights - so a pedestrian is not a deforming mesh
+// at all. It is a handful of rigid pieces on a skeleton, and skinning it on the CPU threw that
 // structure away: the submitted positions changed every frame, which gave every pedestrian a new
 // RTX Remix geometry hash every frame and made them unreplaceable.
 //
-// Submitting each run separately against `World` = bone * world keeps the vertices at their stored
-// model-space values, so the hash is a property of the mesh again. Normals come from the mesh's own
-// bind-pose set rather than the animation's per-frame set, because the fixed-function pipeline
-// applies the same world matrix to them and so re-poses them for free.
-struct agiNativeRigidGroup
-{
-    // Replaces agiViewParameters::World for this submission.
-    const Matrix34* World {};
-
-    // Half-open vertex range this bone owns. A facet is submitted with the group only when every
-    // one of its corners lands inside the range.
-    u32 FirstVertex {};
-    u32 EndVertex {};
-
-    // Undoes the bone's rotation on each normal before submission, when set.
-    //
-    // Needed because the only normals a pedestrian has are the animation's, and those are stored
-    // ALREADY POSED for the frame. Handing them to a draw whose world matrix also carries the bone
-    // would rotate them twice, so the surface would light as though it faced somewhere it does not.
-    // Multiplying by the bone's inverse rotation first cancels that exactly - the composition is the
-    // identity - and bone matrices are rigid, so the inverse rotation is just the transpose of the
-    // 3x3 and costs nothing to build.
-    //
-    // Only the normals move. Positions are the mesh's stored bind-pose values and stay untouched,
-    // which is the entire point: they are what gets hashed.
-    const Matrix34* NormalUnpose {};
-};
-
-// A whole skinned model submitted in ONE draw, with the bones handed to the hardware as a matrix
-// palette and every vertex carrying the index of the bone it is bound to.
+// D3D9 fixed function expresses this binding natively: D3DRS_INDEXEDVERTEXBLENDENABLE with
+// D3DRS_VERTEXBLEND = D3DVBF_0WEIGHTS means "one matrix per vertex, chosen by the vertex's own
+// index, no weights" - the rigid case precisely. The bone matrices go out through
+// SetTransform(D3DTS_WORLDMATRIX(i)) and the transform happens in the vertex pipeline, so no vertex
+// position is ever touched by the CPU and the whole model costs one submission.
 //
-// This is the same observation agiNativeRigidGroup is built on - the binding is rigid, one run of
-// vertices per bone, no per-vertex weights - taken the rest of the way. agiNativeRigidGroup keeps
-// the vertices in model space, which is what Remix needs, but it pays for that with one full
-// submission per bone: agiMeshSet::DrawNativeTransform sorts the facets, rebuilds the entire
-// vertex array and issues a draw per texture batch, and a pedestrian has as many bones as it has
-// limb segments. So a ~15-bone pedestrian did ~15x the CPU work of a static mesh of the same size,
-// and every one of those draws submitted the whole vertex array to select a fraction of it.
+// A palette of ONE is the degenerate case and is not vertex blending at all - it is a single world
+// matrix, which is what a renderer without a palette falls back to, submitting the model one bone
+// at a time. Everything below reads the same in both cases; only the draw differs.
 //
-// A matrix palette collapses that back to one submission. D3D9 fixed function does exactly this
-// binding natively: D3DRS_INDEXEDVERTEXBLEND with D3DRS_VERTEXBLEND = D3DVBF_0WEIGHTS means "one
-// matrix per vertex, chosen by the vertex's own index, no weights" - the rigid case precisely. The
-// bone matrices go out through SetTransform(D3DTS_WORLDMATRIX(i)) and the transform happens in the
-// vertex pipeline, so no vertex position is ever touched by the CPU.
-//
-// Positions stay at their stored bind-pose values, exactly as with agiNativeRigidGroup, so the
-// hash stability that path was written for is preserved.
+// NOTHING in the submitted vertex may depend on the animation frame, which is the whole point:
+// positions are the mesh's stored bind-pose values, colours and UVs are immutable mesh data, and
+// normals are rebuilt from the mesh's own geometry rather than taken from the animation's per-frame
+// set (see BuildSkinBindNormals in agiworld/meshrend.cpp). A pedestrian therefore submits
+// byte-identical vertices in every pose of every animation, and hashes to one mesh.
 struct agiNativeSkinPalette
 {
     // Count entries, each already composed as bone * world - they replace D3DTS_WORLD entirely.
     const Matrix34* Bones {};
 
-    // Count entries, the transpose of each bone's 3x3. See agiNativeRigidGroup::NormalUnpose: the
-    // only normals a pedestrian has are the animation's per-frame set, stored already posed, and
-    // the palette matrix the hardware applies to them carries the same bone.
+    // Count entries, the transpose of each bone's 3x3, i.e. its inverse rotation.
+    //
+    // Used for ONE thing, and deliberately not per vertex: resolving which side of its own plane a
+    // facet's geometric normal is meant to point at, by comparing it against the animation's stored
+    // normals - which are posed for the frame, so they have to be brought back into the mesh's own
+    // space before they can be compared with anything. That comparison produces a single sign bit
+    // for the whole submission (see BuildSkinBindNormals), so no per-frame value reaches the
+    // vertices through it.
     const Matrix34* NormalUnpose {};
 
     u32 Count {};
@@ -134,9 +107,10 @@ struct agiNativeSkinPalette
     const u8* VertexBones {};
     u32 FirstBone {};
 
-    // Facet range for this chunk, with the same meaning as agiNativeRigidGroup's: a facet is
-    // submitted only when every corner lands inside it. Equal to the whole vertex array when the
-    // palette holds the entire skeleton, which is the usual case.
+    // Facet range for this chunk. A facet is submitted only when every corner lands inside it,
+    // which is how a chunk takes the facets belonging to its own bones and no others. Equal to the
+    // whole vertex array when the palette holds the entire skeleton - the usual case, and the one
+    // where no facet can be dropped for straddling a boundary because there is no boundary.
     u32 FirstVertex {};
     u32 EndVertex {};
 
@@ -230,15 +204,17 @@ public:
         return false;
     }
 
-    // How many bones one hardware-skinned draw may carry, or 0 if the renderer cannot skin at all -
-    // which is the default, so every other backend keeps the per-bone submission unchanged.
+    // How many bones one skinned draw may carry.
     //
-    // A caller with more bones than this splits the skeleton into chunks of this size, so any
-    // nonzero answer is usable; it only decides how many draws a pedestrian costs. Asked once per
-    // model draw rather than cached, because it depends on device state (see agiDX9Rasterizer).
+    // A caller with more bones than this splits the skeleton into chunks of this size, so this only
+    // decides how many draws a skinned model costs, never whether it can be drawn. One - the
+    // default - means no matrix palette: each bone is submitted on its own against a plain world
+    // matrix, which is something every renderer that implements MeshWorld() can already do. Asked
+    // once per model draw rather than cached, because it depends on device state (see
+    // agiDX9Rasterizer).
     virtual u32 MaxNativeSkinBones() const
     {
-        return 0;
+        return 1;
     }
 };
 
