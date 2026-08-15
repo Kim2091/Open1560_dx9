@@ -32,16 +32,21 @@ enum
     IDC_ADV_DEFAULTS = 381,
 };
 
-// How many settings one page shows. Bounded by the menu's height rather than by taste - the rows are
-// laid out from the title down and have to fit above the exit button.
-static constexpr i32 AdvancedRowsPerPage = 9;
+// The layout is the pause menu's own, not one of this file's invention.
+//
+// PUMain lays its rows out as
+//     AddButton(id, label, 0.0f, POS / 7.0f, 1.0f, widget_height_, widget_font_size_, 2)
+// - full width, evenly spaced on sevenths, at the menu's own widget height and font size - and every
+// other page in the pause menu reads as part of the same thing because they all follow it. An
+// earlier version of this page picked its own column, its own spacing and a hardcoded font size, and
+// looked exactly as out of place as that description suggests.
+//
+// So: five rows on slots 1..5, the button row on slot 6, and slot 7 left clear at the bottom the way
+// PUMain leaves it.
+static constexpr i32 AdvancedRowsPerPage = 5;
 
-// The right-hand column, matching what the original graphics page uses for its own controls, so the
-// two pages line up if the player moves between them.
-static constexpr f32 AdvancedControlX = 0.55f;
-static constexpr f32 AdvancedControlWidth = 0.4f;
-
-static constexpr i32 AdvancedFontSize = 24;
+static constexpr f32 AdvancedSlots = 7.0f;
+static constexpr f32 AdvancedButtonSlot = 6.0f;
 
 PUAdvanced::PUAdvanced(i32 menu_id, mmSettingPage page, i32 first, i32 count, i32 next_menu_id, const char* title)
     : PUMenuBase(menu_id, 0.0f, 0.0f, 0.0f, 0.0f, nullptr)
@@ -49,16 +54,11 @@ PUAdvanced::PUAdvanced(i32 menu_id, mmSettingPage page, i32 first, i32 count, i3
 {
     AssignName(LOC_TEXT(title));
 
-    const f32 top = CreateTitle();
-
+    CreateTitle();
     AddExit(0.65f, 0.0f, 0.35f, 0.075f);
 
     i32 total = 0;
     mmSetting* settings = mmSettingsAll(total);
-
-    const f32 step = widget_height_ * 1.15f;
-
-    f32 y = top;
 
     for (i32 i = 0; i < count; ++i)
     {
@@ -67,40 +67,40 @@ PUAdvanced::PUAdvanced(i32 menu_id, mmSettingPage page, i32 first, i32 count, i3
         // The row id is only ever used to find the widget again; nothing dispatches on it.
         const i32 idc = IDC_ADV_ROW + first + i;
 
+        const f32 y = static_cast<f32>(i + 1) / AdvancedSlots;
+
         if (setting.Kind == mmSettingKind::Toggle)
         {
             // Bound to the integer mirror, because that is what a toggle writes. mmSettingsSync
             // copies it back to the value the game actually reads.
-            AddToggle2(idc, LOC_TEXT(setting.Label), &setting.Integer, AdvancedControlX, y, AdvancedControlWidth,
-                widget_height_, AdvancedFontSize, 1, Callback {});
+            AddToggle2(idc, LOC_TEXT(setting.Label), &setting.Integer, 0.0f, y, 1.0f, widget_height_, widget_font_size_,
+                1, Callback {});
         }
         else
         {
             // Bound to the value directly. The trailing four arguments are the ones the original
             // graphics page passes for its own sliders (game.asm ~191161); they are not documented
             // anywhere and copying a known-good set is better than guessing at their meaning.
-            AddSlider(idc, LOC_TEXT(setting.Label), &setting.Value, AdvancedControlX, y, AdvancedControlWidth,
-                widget_height_, setting.Min, setting.Max, 11, 0, AdvancedFontSize, 0, Callback {});
+            AddSlider(idc, LOC_TEXT(setting.Label), &setting.Value, 0.0f, y, 1.0f, widget_height_, setting.Min,
+                setting.Max, 11, 0, widget_font_size_, 0, Callback {});
         }
-
-        y += step;
     }
 
     // Defaults applies to this page only. Restoring everything from one button is a bigger action
     // than it looks - it would silently undo a camera the player spent a while tuning because they
     // wanted to reset the renderer.
     const mmSettingPage reset_page = page;
+    const f32 button_y = AdvancedButtonSlot / AdvancedSlots;
 
-    AddButton(IDC_ADV_DEFAULTS, LOC_TEXT("Restore Defaults"), 0.0f, y, 0.45f, widget_height_, AdvancedFontSize, 2,
-        Callback {[reset_page] { mmSettingsRestoreDefaults(reset_page); }});
+    AddButton(IDC_ADV_DEFAULTS, LOC_TEXT("Restore Defaults"), 0.0f, button_y, 0.48f, widget_height_, widget_font_size_,
+        2, Callback {[reset_page] { mmSettingsRestoreDefaults(reset_page); }});
 
-    if (next_menu_id >= 0)
-    {
-        const i32 next = next_menu_id;
+    // Always present, and the last page wraps to the first, so the pages are a ring the player can
+    // walk without having to back out to the graphics page between each one.
+    const i32 next = next_menu_id;
 
-        AddButton(IDC_ADV_MORE, LOC_TEXT("More..."), 0.5f, y, 0.45f, widget_height_, AdvancedFontSize, 2,
-            Callback {[next] { MenuMgr()->Switch(next); }});
-    }
+    AddButton(IDC_ADV_MORE, LOC_TEXT("More..."), 0.52f, button_y, 0.48f, widget_height_, widget_font_size_, 2,
+        Callback {[next] { MenuMgr()->Switch(next); }});
 
     SetBstate(0);
 }
@@ -197,7 +197,7 @@ i32 mmAdvancedMenuEnsure(bool debug_pages)
         // manager owns it from that moment and destroys it with the rest of its children. Holding a
         // second owning pointer here is what would be wrong.
         new PUAdvanced(IDD_PU_ADV_FIRST + i, chunks[i].Page, chunks[i].First, chunks[i].Count,
-            has_next ? (IDD_PU_ADV_FIRST + i + 1) : -1, chunks[i].Title);
+            has_next ? (IDD_PU_ADV_FIRST + i + 1) : IDD_PU_ADV_FIRST, chunks[i].Title);
     }
 
     return IDD_PU_ADV_FIRST;

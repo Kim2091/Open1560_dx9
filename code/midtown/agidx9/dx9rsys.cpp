@@ -1330,43 +1330,26 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
 
     FlushState();
 
-    // Resolve the texture from agiCurState rather than trusting current_texture_, and bind it below
-    // from that answer. This is the same correction MeshWorld() already applies to itself, made for
-    // the screen path as well, and it is the fix for menu art rendering as flat black.
+    // REVERTED - see below. Restored exactly as it was.
     //
-    // current_texture_ is a cache of what is bound to stage 0, maintained by FlushState(). MeshWorld
-    // writes it directly - it has to, since it binds its own texture - and its material and
-    // per-pixel second passes set it to NULL to mean "something else is bound now". None of that
-    // updates agiLastState.Texture, which is the key FlushState() compares against, so the next
-    // FlushState() finds agiCurState's texture unchanged, skips its texture block entirely, and
-    // leaves current_texture_ holding a world texture or nothing at all.
+    // This guard was changed to resolve the texture from agiCurState rather than from
+    // current_texture_, to fix menu bitmaps rendering as flat black. The reasoning still looks right
+    // in isolation: current_texture_ is FlushState()'s cache of stage 0, MeshWorld writes it
+    // directly without updating agiLastState.Texture, and a following screen draw can therefore find
+    // it holding a world texture or nothing at all - and be dropped by this guard.
     //
-    // The guard below then reads that as "this draw has no texture" and returns without drawing. A
-    // menu bitmap disappears completely, and stays gone for as long as agiCurState's texture does
-    // not happen to change - which is why the art came back wherever something else was drawn
-    // between two bitmaps, and why the showroom, with a 3D car rendering behind the widgets, looked
-    // fine while a plain menu did not.
+    // But it broke rendering broadly, not just the case it was aimed at, and that is the answer: for
+    // most draws current_texture_ IS the truth and agiCurState is not. FlushState() opens with
+    // `if (!agiCurState.IsTouched()) return;`, so a run of draws sharing one state never re-resolves
+    // anything - the device keeps the binding from the draw that did, and current_texture_ is the
+    // only record of it. Reading agiCurState instead reads a value nothing has been keeping current
+    // for this purpose, and drops or mis-textures everything that relies on the run.
     //
-    // Poisoning agiLastState instead does not work, and the note in RestoreStateAfterWorldDraw
-    // explains why: FlushState() opens with `if (!agiCurState.IsTouched()) return;`, so a draw that
-    // wants exactly the state the engine already has never reaches the comparison at all.
-    agiDX9TexDef* screen_texture =
-        (agiCurState.GetDrawMode() == agiDrawTextured) ? static_cast<agiDX9TexDef*>(agiCurState.GetTexture()) : nullptr;
-
-    IDirect3DTexture9* screen_handle = screen_texture ? screen_texture->GetHandle() : nullptr;
-
-    // Unchanged in meaning: a textured draw with no texture to draw with is not submitted. Only the
-    // answer it is asked of has changed, from a stale cache to the state the caller actually set.
-    if ((screen_handle == nullptr) && (tex_env_ != agiTexEnv::Disable))
+    // The menu bug is real and still unfixed. The fix has to keep current_texture_ authoritative and
+    // repair the specific place it goes stale - MeshWorld leaving it null after its second passes -
+    // rather than replacing the mechanism wholesale.
+    if ((current_texture_ == nullptr) && (tex_env_ != agiTexEnv::Disable))
         return;
-
-    if (screen_handle != current_texture_)
-    {
-        current_texture_ = screen_handle;
-
-        if (screen_texture)
-            ApplyTexFilters(screen_texture, agiCurState.GetTexFilter());
-    }
 
     ARTS_UTIMED(agiRasterization);
     ++STATS.GeomCalls;

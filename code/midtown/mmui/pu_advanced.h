@@ -56,7 +56,10 @@ private:
 enum
 {
     IDD_PU_ADV_FIRST = 20,
-    IDD_PU_ADV_COUNT = 8,
+
+    // Enough ids for every page the table can produce. Five rows to a page over forty-odd settings
+    // needs eleven; the slack is so that adding a setting does not silently drop a page off the end.
+    IDD_PU_ADV_COUNT = 20,
 };
 
 // Creates the pages if they are not already registered, and returns the id of the first one.
