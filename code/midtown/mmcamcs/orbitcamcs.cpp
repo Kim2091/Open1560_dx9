@@ -322,11 +322,11 @@ void OrbitCamCS::Update()
     // the original game calls, so this has to push it through itself.
     if (SpeedFov != 0.0f)
     {
-        f32 wanted = BaseFov + (SpeedFov * SpeedFactor);
+        f32 wanted_fov = BaseFov + (SpeedFov * SpeedFactor);
 
-        if (std::fabs(wanted - CameraFOV) > 0.05f)
+        if (std::fabs(wanted_fov - CameraFOV) > 0.05f)
         {
-            CameraFOV = wanted;
+            CameraFOV = wanted_fov;
 
             UpdateView();
         }
