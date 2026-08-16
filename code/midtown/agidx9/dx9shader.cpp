@@ -1053,6 +1053,11 @@ static D3DMATRIX ToD3D(const Matrix34& m)
 // Reproduces BuildProjectionMatrix() from dx9rsys.cpp. Duplicated rather than shared because the
 // two paths are free to diverge - Pathway B has no reason to keep matching agiMeshSet::DepthScale
 // once it stops sharing a depth buffer with pretransformed content.
+//
+// The 0.5/0.5 NDC halving is literal here for the same reason it is there: anything else describes
+// a frustum with no far plane. See the long note at BuildProjectionMatrix(). Pathway B is unwired,
+// so this is dead code - but a shader path that ever comes back would want the valid frustum too,
+// and leaving the broken form here as the template it is copied from would just re-import the bug.
 static D3DMATRIX BuildProj(const agiViewParameters& p)
 {
     D3DMATRIX r {};
@@ -1063,9 +1068,9 @@ static D3DMATRIX BuildProj(const agiViewParameters& p)
     if (agiMeshSet::FlipX)
         r._11 = -r._11;
 
-    r._33 = -p.ProjZZ * agiMeshSet::DepthScale + agiMeshSet::DepthOffset;
+    r._33 = -p.ProjZZ * 0.5f + 0.5f;
     r._34 = 1.0f;
-    r._43 = p.ProjZW * agiMeshSet::DepthScale;
+    r._43 = p.ProjZW * 0.5f;
 
     return r;
 }

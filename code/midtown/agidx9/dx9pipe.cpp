@@ -250,6 +250,35 @@ void agiDX9Pipeline::BeginFrame()
 
     IDirect3DDevice9* device = dx9_context_->GetDevice();
 
+    // Canonical depth range, re-asserted every frame. The other half of the projection-matrix fix
+    // documented at length in BuildProjectionMatrix() (dx9rsys.cpp) - read that first; this is the
+    // part that keeps the CPU pretransform path in step with it.
+    //
+    // BuildProjectionMatrix() now hardcodes the 0.5/0.5 NDC halving, because folding the engine's
+    // depth guard band (DepthScale 0.495/0.499, minus ShadowZBias) into the matrix produces a
+    // frustum with no far plane, which is what stops RTX Remix reconstructing a camera in gameplay.
+    // The CPU pretransform path applies these same two globals per vertex in ToScreen(), so if they
+    // stayed at the city's values the two paths would disagree about depth by up to 0.005 - enough,
+    // at distance, to swap the depth order of world geometry and the screen-space effects drawn
+    // against it (blob shadows, smoke, glow cards). Putting them back to 0.5/0.5 means both paths
+    // write exactly the same depth for the same point, as they do today, only over the full range.
+    //
+    // Once per frame rather than once at startup because mmCullCity's constructor writes DepthScale
+    // when a city loads (game.asm ~175726) and would otherwise silently undo this on the way into a
+    // race - which is precisely when it matters.
+    //
+    // ShadowZBias is deliberately NOT touched. mmCullCity::Cull() subtracts it from DepthOffset for
+    // the asPortalWeb pass and restores it afterwards; that still happens, the CPU path still honours
+    // it, and the hardware path - whose projection no longer reads DepthOffset at all - simply does
+    // not follow it down. The relative offset that leaves is 0.005 in the direction the bias exists
+    // to create (shadow content in front of the surface it lies on), where before the two paths
+    // moved together and the bias did nothing between them.
+    if (!PARAM_d3d9_legacydepth.get_or(false))
+    {
+        agiMeshSet::DepthScale = 0.5f;
+        agiMeshSet::DepthOffset = 0.5f;
+    }
+
     // Bind the offscreen target before the clear, so the clear lands on it rather than on a
     // backbuffer that is about to be overwritten by the blit anyway.
     scene_target_bound_ = scene_target_.IsValid() && scene_target_.Begin(device);

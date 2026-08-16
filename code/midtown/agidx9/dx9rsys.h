@@ -22,6 +22,12 @@
 
 #include "dx9pipe.h"
 
+// -d3d9legacydepth. Restores the pre-fix behaviour on both sides of the depth-range change:
+// BuildProjectionMatrix() folds agiMeshSet::DepthScale/DepthOffset back into the projection, and
+// agiDX9Pipeline::BeginFrame() stops forcing them to 0.5/0.5. Defined in dx9rsys.cpp, shared with
+// dx9pipe.cpp because the two halves only make sense together. See BuildProjectionMatrix().
+extern mem::cmd_param PARAM_d3d9_legacydepth;
+
 class Matrix34;
 class agiViewParameters;
 struct IDirect3DTexture9;

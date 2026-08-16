@@ -133,6 +133,12 @@ static DWORD g_MaxAnisotropy = 1;
 static mem::cmd_param PARAM_d3d9_identityproj {
     "d3d9identityproj", "Reset PROJECTION to identity after world draws (breaks RTX Remix)"};
 
+// Escape hatch for the depth-range change described at BuildProjectionMatrix() and re-asserted in
+// agiDX9Pipeline::BeginFrame(). Off by default: folding the engine's depth guard band into the
+// projection matrix is what stops RTX Remix path tracing in gameplay.
+mem::cmd_param PARAM_d3d9_legacydepth {
+    "d3d9legacydepth", "Fold agiMeshSet::DepthScale/DepthOffset into PROJECTION (breaks RTX Remix)"};
+
 static u32 ImmPrimType = D3DPT_TRIANGLELIST;
 
 static agiVtx* ImmVtxBase = nullptr;
@@ -1449,11 +1455,55 @@ static D3DMATRIX ToD3DMatrix(const Matrix34& m)
 // `z_clip = view_z * ProjZZ + ProjZW` and `w_clip = view_z` exactly as agiMeshSet::Transform() does.
 //
 // The CPU path's ToScreen() doesn't stop at `ProjZZ + ProjZW/view_z` - it additionally remaps
-// that value through `* agiMeshSet::DepthScale + agiMeshSet::DepthOffset` (0.5/0.5 by default)
-// before writing agiScreenVtx::z. That remap turns the engine's OpenGL-style [-1, 1] NDC depth
-// into D3D9's [0, 1] depth range. Skipping it here would leave clip-space Z in the wrong range
-// for D3D9's hardware near/far clipping, causing incorrect clipping of large surfaces (roads,
-// building facades) that span a wide depth range.
+// that value through `* agiMeshSet::DepthScale + agiMeshSet::DepthOffset` before writing
+// agiScreenVtx::z. That remap turns the engine's OpenGL-style [-1, 1] NDC depth into D3D9's
+// [0, 1] depth range, so the *halving* part of it has to be here: skipping it would leave
+// clip-space Z in the wrong range for D3D9's hardware near/far clipping, causing incorrect
+// clipping of large surfaces (roads, building facades) that span a wide depth range.
+//
+// THE HALVING IS ALL THAT MAY BE HERE. This function deliberately hardcodes 0.5/0.5 rather than
+// reading agiMeshSet::DepthScale/DepthOffset, and agiDX9Pipeline::BeginFrame() forces those two
+// globals to 0.5/0.5 so the CPU path agrees. Both halves of that are one fix, and it is the fix
+// for "RTX Remix path traces the car selector but not the race".
+//
+// The engine does not actually keep DepthScale at 0.5. mmCullCity's constructor - which runs when
+// a city loads, and never in the menus or the showroom - lowers agiMeshSet::DepthScale to 0.495 or
+// 0.499 (game.asm ~175726), and mmCullCity::Cull() additionally subtracts ShadowZBias (0.005) from
+// DepthOffset for the duration of the asPortalWeb pass (~180783). That is a guard band: it insets
+// the written depth to roughly [0.005, 0.995] so a software rasteriser never lands exactly on the
+// endpoints. Harmless as a per-vertex remap. Fatal as a projection matrix, because a projection
+// matrix is not a remap - it IS the frustum, and the numbers must describe a real one:
+//
+//     _33 = -ProjZZ * s + o   _43 = ProjZW * s   _34 = 1   _44 = 0
+//     z_ndc = _33 + _43 / view_z   ->   near at z_ndc = 0, far at z_ndc = 1
+//     far = -_43 / (_33 - 1)
+//
+// With s = o = 0.5 and the logged runtime values (Near = 2.997619, Far = 1000, ProjZZ = -1.006013,
+// ProjZW = -6.013264) that gives _33 = 1.003007, _43 = -3.006632, far = 999.9. Correct.
+//
+// With the city's s = 0.495, o = 0.495 (inside the portal pass) it gives _33 = 0.99297, and
+// _33 < 1 means z_ndc *never reaches 1* - it asymptotes to 0.993 at infinity. Solving for the far
+// plane yields a NEGATIVE distance. The frustum is not merely wrong, it does not exist. Anything
+// that decomposes the projection matrix back into near/far - which is exactly what RTX Remix's
+// camera reconstruction does, having no other source for them - gets nonsense and rejects the
+// camera outright: "[RTX-Compatibility-Info] Trying to raytrace but not detecting a valid camera",
+// followed by a zeroed camera transform ("Attempted invert a non-invertible matrix", then
+// "WorldToScreenMatrix not invertible!" from DLSS every frame for the rest of the session).
+//
+// It also moved *between passes of one frame*, because ShadowZBias is subtracted for the portal
+// pass and restored for agiTexSorter's - so the frame's geometry arrived under two different
+// projections, which is the "CameraManager: FOV of a camera changed between frames" warning and
+// the spurious camera cuts. And 0.005 of DepthOffset is enough to flip _33 across 1.0 on its own,
+// so the failure is not even stable: at s = 0.499 the far plane comes out as 1500 instead of 1000.
+//
+// This is why the showroom path traced and the race did not, and it is not something the earlier
+// in-scene-RHW work could have reached: mmCullCity does not exist until a city loads, so the menus
+// and the car selector ran at the default 0.5/0.5 and produced a valid frustum by accident.
+//
+// Nothing is lost by dropping the guard band. It buys a software rasteriser some headroom at the
+// endpoints; against a 24-bit depth buffer it only throws away 1% of the range, and the CPU path's
+// own clamp (mrkni.cpp, KniMinZ/KniMaxZ) already pins depth to [0, 1] regardless. ShadowZBias is
+// untouched and still works - see the note in agiDX9Pipeline::BeginFrame().
 static D3DMATRIX BuildProjectionMatrix(const agiViewParameters& p)
 {
     // NOTE: ProjXZ/ProjYZ deliberately do NOT appear here. The actual mesh transform
@@ -1498,10 +1548,16 @@ static D3DMATRIX BuildProjectionMatrix(const agiViewParameters& p)
     // call still reported success. With the sign corrected, z_clip reaches 0 exactly at view_z ==
     // Near (1.003007 * 2.997619 - 3.006632 ~= 0) and z_clip/w_clip reaches 1 at view_z == Far,
     // matching ToScreen()'s `z * inv_w * DepthScale + DepthOffset` term for term.
-    result._33 = -p.ProjZZ * agiMeshSet::DepthScale + agiMeshSet::DepthOffset;
+    //
+    // The NDC-halving constants are literals, not agiMeshSet::DepthScale/DepthOffset - see the
+    // frustum note above. -d3d9legacydepth puts the globals back for A/B testing.
+    const f32 depth_scale = PARAM_d3d9_legacydepth.get_or(false) ? agiMeshSet::DepthScale : 0.5f;
+    const f32 depth_offset = PARAM_d3d9_legacydepth.get_or(false) ? agiMeshSet::DepthOffset : 0.5f;
+
+    result._33 = -p.ProjZZ * depth_scale + depth_offset;
     result._34 = 1.0f;
 
-    result._43 = p.ProjZW * agiMeshSet::DepthScale;
+    result._43 = p.ProjZW * depth_scale;
 
     return result;
 }
