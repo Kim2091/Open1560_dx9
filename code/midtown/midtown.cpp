@@ -894,6 +894,27 @@ static void ApplicationHelper(i32 argc, char** argv)
 #undef ARG
 #undef ARGN
 
+// -menu640. Puts the menu pipeline back on the fixed 640x480 it used to be built at, which is what
+// the original game did and what every menu asset was authored for. See the note in CreatePipeline.
+static mem::cmd_param PARAM_menu640 {"menu640", "Run the menus at a fixed 640x480 pipeline"};
+
+// Builds the pipeline at the renderer's selected mode, with -width/-height taking precedence. When
+// no mode has been detected the backend keeps whatever it chose for itself in its own Init().
+static void ResolvePipelineRes(const dxiRendererInfo_t& info, agiPipeline* pipe)
+{
+    i32 width = pipe->GetWidth();
+    i32 height = pipe->GetHeight();
+
+    if (info.ResCount)
+    {
+        const dxiResolution& res = info.Resolutions[info.ResChoice];
+        width = res.uWidth;
+        height = res.uHeight;
+    }
+
+    pipe->SetRes(PARAM_width.get_or(width), PARAM_height.get_or(height));
+}
+
 Ptr<agiPipeline> CreatePipeline(i32 argc, char** argv)
 {
     dxiRendererInfo_t& info = GetRendererInfo();
@@ -910,17 +931,7 @@ Ptr<agiPipeline> CreatePipeline(i32 argc, char** argv)
             default: Quitf("Unknown renderer type %i", static_cast<int>(info.Type));
         }
 
-        i32 width = pipe->GetWidth();
-        i32 height = pipe->GetHeight();
-
-        if (info.ResCount)
-        {
-            dxiResolution& res = info.Resolutions[info.ResChoice];
-            width = res.uWidth;
-            height = res.uHeight;
-        }
-
-        pipe->SetRes(PARAM_width.get_or(width), PARAM_height.get_or(height));
+        ResolvePipelineRes(info, pipe.get());
 
         if (pipe->Validate())
         {
@@ -943,12 +954,46 @@ Ptr<agiPipeline> CreatePipeline(i32 argc, char** argv)
             default: Quitf("Unknown renderer type %i", static_cast<int>(info.Type));
         }
 
-        pipe->SetRes(640, 480);
+        // The menus get the selected resolution too, the same way gameplay does.
+        //
+        // This used to be an unconditional SetRes(640, 480) - not the selected mode, and not even
+        // -width/-height, which the branch above has always honoured. That is why the menus ran at
+        // 640x480 no matter what the game was set to, and why the pipeline is torn down and rebuilt
+        // on every transition between the menus and a race (the two ResetSwapChain entries per race
+        // in a Remix log, and the paired "Window Resolution"/"UI Position" entries in Open1560.log).
+        //
+        // It is not the reason the menus rendered into a corner of the screen - agiDX9Pipeline's
+        // presentation transform covers that, and covers it at any resolution, including the menu
+        // resolution this now stops being. What this changes is that the menu is *composed* at the
+        // display's resolution instead of upscaled from 640x480, so its art is resampled to size
+        // (agiBitmap::Init resolves a scale of 1.0 against UI_Width) rather than magnified.
+        //
+        // Everything downstream is already resolution-independent and was only ever exercised at
+        // one resolution: menu geometry is normalised against UI_ScaleX/UI_StartX
+        // (MenuManager::GetScale), backgrounds and widgets are placed relative to
+        // PUMenuBase::menu_width_, and the event handler's mouse coordinates are normalised through
+        // its own scale_x_, so none of it is tied to 640x480. The assets are - they are 4:3 art from
+        // 1999 - which is what agiPipeline::BeginAllGfx's pillarbox is for: at 1920x1080 the UI area
+        // becomes 1440x1080 at x=240, and the aspect ratio is preserved.
+        //
+        // -menu640 restores the old fixed size.
+        if (PARAM_menu640.get_or(false))
+            pipe->SetRes(640, 480);
+        else
+            ResolvePipelineRes(info, pipe.get());
 
         if (pipe->Validate())
         {
-            MessageBoxA(NULL, LOC_STR(MM_IDS_REDETECT_VIDEO), APPTITLE, MB_ICONERROR);
-            Quit();
+            // Retry at 640x480 before giving up. The old code could not fail this way - it only ever
+            // asked for 640x480, which every device supports - so a mode that validates for gameplay
+            // but not here must not become a dead end at the main menu.
+            pipe->SetRes(640, 480);
+
+            if (pipe->Validate())
+            {
+                MessageBoxA(NULL, LOC_STR(MM_IDS_REDETECT_VIDEO), APPTITLE, MB_ICONERROR);
+                Quit();
+            }
         }
     }
 
