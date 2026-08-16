@@ -160,7 +160,25 @@ void OrbitCamCS::Init(mmCar* car, mmViewCS* view)
 
     SpeedDistance = PARAM_orbitpullback.get_or(6.0f);
     SpeedHeight = PARAM_orbitpulldown.get_or(-0.25f);
-    SpeedFov = PARAM_orbitfov.get_or(18.0f);
+
+    // OFF by default, which is what the note at the widening itself always claimed and what the
+    // 18.0f here contradicted.
+    //
+    // A camera that widens with speed is the one framing trick on this camera that RTX Remix cannot
+    // follow. Remix reconstructs the camera from the projection matrix and has no previous-frame
+    // projection to reproject through when the FOV moves - which is why it warns about it at all
+    // ("CameraManager: FOV of a camera changed between frames"). Every other thing this camera does
+    // to the framing is a change of POSITION, and a position change is exactly what the view matrix
+    // already tells Remix; the pullback and drop below are free for that reason and stay on.
+    //
+    // Reading the closed camera assembly shows how unusual this is in the first place. The stock
+    // cameras never touch the FOV in flight: TrackCamCS's constructor writes CameraFOV (BaseCamCS
+    // +0x90) once, as 60 degrees, and nothing writes it again, while asCamera::SetView is only
+    // reached from mmViewCS::SetCamera/Reset/NewCam and from UpdateView - camera changes, never a
+    // frame update. mmViewCS::Update only copies the camera MATRIX out. So the game's projection is
+    // constant for a whole race, and this was the one thing in the renderer that would have made it
+    // move every frame.
+    SpeedFov = PARAM_orbitfov.get_or(0.0f);
 
     CollideEnabled = PARAM_orbitcollide.get_or(true);
 
@@ -318,8 +336,9 @@ void OrbitCamCS::Update()
     // always works and changes the framing less.
     camera_.m3.y += CollideLift;
 
-    // Off by default. CameraFOV only reaches the asCamera through UpdateView(), which nothing in
-    // the original game calls, so this has to push it through itself.
+    // Off by default - see the note at SpeedFov in Init() for why, and why the pullback and drop
+    // above are not. CameraFOV only reaches the asCamera through UpdateView(), which nothing in the
+    // original game calls per frame, so this has to push it through itself.
     if (SpeedFov != 0.0f)
     {
         f32 wanted_fov = BaseFov + (SpeedFov * SpeedFactor);
