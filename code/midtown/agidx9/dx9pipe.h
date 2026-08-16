@@ -104,7 +104,70 @@ public:
         return per_pixel_.IsValid() ? &per_pixel_ : nullptr;
     }
 
+    // PRESENTATION TRANSFORM: logical pixels -> backbuffer pixels.
+    //
+    // The engine draws in a coordinate space of agiPipeline::width_ x height_ ("logical pixels"):
+    // agiViewport rectangles are fractions of it, and every CPU-pretransformed agiScreenVtx carries
+    // an absolute position in it. This backend's backbuffer is a different size - BeginGfx() builds
+    // the device at the *window* size (horz_res_/vert_res_), which in fullscreen is the whole
+    // display no matter what the pipeline resolution is. Those two disagree whenever the pipeline is
+    // not running at the desktop resolution, and in the menus they ALWAYS disagree, because
+    // CreatePipeline() (midtown.cpp) hardcodes SetRes(640, 480) for the menu game state.
+    //
+    // Nothing used to close that gap, so logical pixels were written to the backbuffer one-for-one:
+    // a 640x480 menu occupied the top-left ninth of a 1920x1080 screen with black around it, and the
+    // showroom's car viewport - a fraction of 640x480 - became a small box beside the widget boxes.
+    // agigl has never had this problem because it renders into an FBO at the pipeline size and
+    // blits it to blit_x_/blit_y_/blit_width_/blit_height_; sdlswpipe scales its blit the same way.
+    // This backend called InitScaling() and then ignored the answer.
+    //
+    // It is applied as a coordinate transform rather than agigl's render-to-texture-and-blit, and
+    // that choice is about RTX Remix. Remix reconstructs the scene from the draw calls it sees, so
+    // world geometry has to keep going to the real backbuffer with its real transforms - the warning
+    // dx9target.h opens with. A viewport rectangle and a pretransformed vertex position are both
+    // things Remix ignores entirely (it skips pretransformed draws outright), so scaling them costs
+    // it nothing, while routing the frame through an offscreen target would have hidden gameplay
+    // from it at every resolution below the desktop.
+    //
+    // Identity whenever the blit rect matches the pipeline size, which is the ordinary windowed case
+    // and fullscreen at the desktop resolution - see ScreenScaleActive().
+    f32 ScreenScaleX() const
+    {
+        return screen_scale_x_;
+    }
+
+    f32 ScreenScaleY() const
+    {
+        return screen_scale_y_;
+    }
+
+    i32 ScreenOffsetX() const
+    {
+        return blit_x_;
+    }
+
+    i32 ScreenOffsetY() const
+    {
+        return blit_y_;
+    }
+
+    // False means the transform is the identity and callers may take their untouched fast path.
+    bool ScreenScaleActive() const
+    {
+        return screen_scale_active_;
+    }
+
+    // Maps a rectangle in logical pixels onto the backbuffer. Right/bottom edges are mapped rather
+    // than the width scaled, so adjacent rectangles stay adjacent after rounding.
+    void MapScreenRect(i32& x, i32& y, i32& w, i32& h) const;
+
 private:
+    void InitScreenScale();
+
+    f32 screen_scale_x_ {1.0f};
+    f32 screen_scale_y_ {1.0f};
+    bool screen_scale_active_ {};
+
     agiDX9WorldShader world_shader_ {};
     agiDX9FFPerPixel per_pixel_ {};
     agiDX9RenderTarget scene_target_ {};

@@ -66,6 +66,16 @@ void agiDX9Viewport::GetPixelRect(i32& x, i32& y, i32& w, i32& h) const
     h = std::lround(pipe_height * (params_.Y + params_.Height)) - bottom;
 
     y = pipe_height - (bottom + h);
+
+    // Logical pixels so far - a fraction of agiPipeline::width_/height_, which is not the size of
+    // the backbuffer this rectangle is about to be handed to. See the PRESENTATION TRANSFORM note in
+    // dx9pipe.h; this is a no-op unless the two differ.
+    //
+    // Both callers want the mapped rectangle: Activate() sets it as the device viewport (which is
+    // what puts hardware-transformed world geometry inside the same box the pretransformed content
+    // lands in), and Clear() uses it as a scissor rect, which has to name the region actually being
+    // drawn or it clears somewhere else.
+    Pipe()->MapScreenRect(x, y, w, h);
 }
 
 void agiDX9Viewport::Activate()

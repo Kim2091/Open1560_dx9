@@ -1402,8 +1402,47 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
         device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
     }
 
+    // Logical pixels -> backbuffer pixels. See the PRESENTATION TRANSFORM note in dx9pipe.h.
+    //
+    // This is the one place every CPU-pretransformed submission passes through - Mesh(), Card() and
+    // ImmDraw() all end here - so it is the only place the mapping has to be applied for screen
+    // content. It has to be applied to the vertices themselves: an agiScreenVtx is XYZRHW, and D3D9
+    // gives pretransformed geometry the viewport's *origin* and its clip rectangle but never its
+    // scale, so nothing about the device viewport can move these.
+    //
+    // Working on a copy rather than in place because the caller owns this memory and keeps using it:
+    // ImmVtxBase is one vertex array that ImmDraw() may submit several times as ImmAddIndices()
+    // flushes on a primitive-type change or a full index buffer, and transforming it in place would
+    // scale the second flush twice. ARTS_ALLOCA for the copy, for the reason
+    // agiMeshModel::ModelDrawLit documents - the engine allocator must not be called from inside a
+    // draw - and because the ceiling is BigVtxSize (16384), which the world path already alloca's
+    // more than (meshrend.cpp ~2018).
+    //
+    // Untouched, not merely unscaled, when the transform is the identity: that is the ordinary
+    // windowed case and fullscreen at the desktop resolution, and it is most of the time.
+    const agiScreenVtx* draw_verts = reinterpret_cast<const agiScreenVtx*>(vertices);
+
+    if (Pipe()->ScreenScaleActive())
+    {
+        const f32 scale_x = Pipe()->ScreenScaleX();
+        const f32 scale_y = Pipe()->ScreenScaleY();
+        const f32 offset_x = static_cast<f32>(Pipe()->ScreenOffsetX());
+        const f32 offset_y = static_cast<f32>(Pipe()->ScreenOffsetY());
+
+        agiScreenVtx* scaled = ARTS_ALLOCA(agiScreenVtx, vertex_count);
+
+        for (i32 i = 0; i < vertex_count; ++i)
+        {
+            scaled[i] = draw_verts[i];
+            scaled[i].x = draw_verts[i].x * scale_x + offset_x;
+            scaled[i].y = draw_verts[i].y * scale_y + offset_y;
+        }
+
+        draw_verts = scaled;
+    }
+
     device->DrawIndexedPrimitiveUP(static_cast<D3DPRIMITIVETYPE>(prim_type), 0, vertex_count, primitive_count, indices,
-        D3DFMT_INDEX16, vertices, sizeof(agiScreenVtx));
+        D3DFMT_INDEX16, draw_verts, sizeof(agiScreenVtx));
 
     // Put the stage back, or every following screen draw inherits TFACTOR - including the HUD, which
     // is drawn after EndScene and would go solid magenta with it.

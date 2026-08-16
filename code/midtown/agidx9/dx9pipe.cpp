@@ -168,10 +168,55 @@ i32 agiDX9Pipeline::BeginGfx()
     // have to deal with agiScreenVtx2 before it can.
 
     InitScaling();
+    InitScreenScale();
 
     gfx_started_ = true;
 
     return AGI_ERROR_SUCCESS;
+}
+
+// See the PRESENTATION TRANSFORM note in dx9pipe.h for what this is for.
+void agiDX9Pipeline::InitScreenScale()
+{
+    screen_scale_x_ = 1.0f;
+    screen_scale_y_ = 1.0f;
+    screen_scale_active_ = false;
+
+    // InitScaling() has already resolved -scaling into a destination rectangle on the backbuffer,
+    // including the aspect correction: at a 640x480 pipeline on a 1920x1080 display it produces
+    // 1440x1080 at x=240, which is the 4:3 pillarbox this content wants and the same rectangle the
+    // UI layout arrives at on its own when the pipeline runs at the display resolution.
+    if ((width_ <= 0) || (height_ <= 0) || (blit_width_ <= 0) || (blit_height_ <= 0))
+        return;
+
+    screen_scale_x_ = static_cast<f32>(blit_width_) / static_cast<f32>(width_);
+    screen_scale_y_ = static_cast<f32>(blit_height_) / static_cast<f32>(height_);
+
+    screen_scale_active_ = (blit_width_ != width_) || (blit_height_ != height_) || blit_x_ || blit_y_;
+
+    if (screen_scale_active_)
+    {
+        Displayf("D3D9: Presenting %ix%i logical pixels as %ix%i at %i,%i", width_, height_, blit_width_, blit_height_,
+            blit_x_, blit_y_);
+    }
+}
+
+void agiDX9Pipeline::MapScreenRect(i32& x, i32& y, i32& w, i32& h) const
+{
+    if (!screen_scale_active_)
+        return;
+
+    // Map both edges rather than scaling the width, so two rectangles that shared an edge in logical
+    // pixels still share it afterwards instead of leaving a seam or overlapping by a pixel.
+    const i32 left = blit_x_ + static_cast<i32>(std::lround(x * screen_scale_x_));
+    const i32 top = blit_y_ + static_cast<i32>(std::lround(y * screen_scale_y_));
+    const i32 right = blit_x_ + static_cast<i32>(std::lround((x + w) * screen_scale_x_));
+    const i32 bottom = blit_y_ + static_cast<i32>(std::lround((y + h) * screen_scale_y_));
+
+    x = left;
+    y = top;
+    w = right - left;
+    h = bottom - top;
 }
 
 void agiDX9Pipeline::EndGfx()
