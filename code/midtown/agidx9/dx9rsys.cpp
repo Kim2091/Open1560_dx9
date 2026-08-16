@@ -485,6 +485,11 @@ i32 agiDX9Rasterizer::BeginGfx()
 {
     IDirect3DDevice9* device = Pipe()->Context()->GetDevice();
 
+    // A fresh or reset device holds none of what the mirrors below remember. See
+    // agiDX9InvalidateLightCache() and the world-state note on LeaveWorldState().
+    agiDX9InvalidateLightCache();
+    world_state_active_ = false;
+
     // These never change for our purposes - our vertex format never carries per-vertex specular,
     // and lighting is only used by the (separate) world-space path.
     device->SetRenderState(D3DRS_LIGHTING, FALSE);
@@ -530,6 +535,11 @@ i32 agiDX9Rasterizer::BeginGfx()
 void agiDX9Rasterizer::EndGfx()
 {
     current_texture_ = nullptr;
+
+    // The device is going away or being reset; nothing it held is knowable afterwards, and there is
+    // no point restoring state onto it either.
+    agiDX9InvalidateLightCache();
+    world_state_active_ = false;
 }
 
 void agiDX9Rasterizer::BeginGroup()
@@ -538,6 +548,10 @@ void agiDX9Rasterizer::BeginGroup()
 void agiDX9Rasterizer::EndGroup()
 {
     ImmDraw();
+
+    // End of a render group is a boundary the world path must not straddle - see LeaveWorldState().
+    LeaveWorldState();
+
     ImmVtxBase = nullptr;
     ImmVtxCount = 0;
 }
@@ -1333,6 +1347,11 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
     if (!IsAppActive() || (vertex_count == 0) || (index_count == 0))
         return;
 
+    // Before FlushState(), not after: FlushState() only re-issues state agiCurState has actually
+    // changed, so it cannot undo what MeshWorld() left on the device. Putting the device back to
+    // what agiLastState describes has to happen first, which is exactly what this does.
+    LeaveWorldState();
+
     FlushState();
 
     if ((current_texture_ == nullptr) && (tex_env_ != agiTexEnv::Disable))
@@ -1604,6 +1623,141 @@ static D3DMATRIX BuildProjectionMatrix(const agiViewParameters& p)
 static constexpr i32 kMaxWorldLights = 8;
 static constexpr f32 kDegToRad = 3.14159265358979323846f / 180.0f;
 
+// --- Light and material state mirror ------------------------------------------------------------
+//
+// MeshWorld() re-programs the lights and the material on EVERY world draw (see the two Setup calls
+// near the end of it). The values almost never differ between draws: the static rig reads
+// agiMeshLighterSun/Fill1/Fill2 and their colours, which mmCullCity::Cull sets once a frame, and the
+// material is a constant. At 706-1007 world draws a frame that was ~12 device calls each - three
+// D3DLIGHT9 structs of 104 bytes, five LightEnable calls for slots nobody is using, and a
+// D3DMATERIAL9 - for around 9,600 calls a frame that change nothing.
+//
+// Under RTX Remix that is not merely driver overhead. The game is a 32-bit client talking to a
+// 64-bit server across shared memory, so every one of those is a command serialised into a queue and
+// read back out by another process.
+//
+// This mirrors what was last sent and drops the call when it would be a repeat. Byte comparison
+// rather than a "has the rig changed" flag on purpose: a flag has to be invalidated by every writer
+// and silently goes stale when a new one appears, whereas comparing the bytes about to be sent is
+// correct by construction and cannot drift from what the device actually holds.
+//
+// The only thing that can put the device out of step with this is losing it, so the reset path
+// clears the mirror - see agiDX9InvalidateLightCache() and its callers in BeginGfx/EndGfx.
+struct agiDX9LightMirror
+{
+    D3DLIGHT9 Lights[kMaxWorldLights];
+    bool LightKnown[kMaxWorldLights];
+    bool Enabled[kMaxWorldLights];
+    bool EnabledKnown[kMaxWorldLights];
+
+    D3DMATERIAL9 Material;
+    bool MaterialKnown;
+};
+
+static agiDX9LightMirror g_LightMirror {};
+
+// The three render states MeshWorld() used to set only inside a branch and rely on the restore to
+// put back. With the restore deferred (see agiDX9Rasterizer::LeaveWorldState) each of them would
+// otherwise carry from one world draw into the next, so they are programmed on every draw instead -
+// and mirrored, because "every draw" is 706-1007 of them and the value changes on almost none.
+//
+// Tri-state rather than bool: -1 means the device has been reset and nothing is known yet, which is
+// not the same as knowing it is off.
+static i8 g_WorldZWrite = -1;
+static i8 g_WorldFogTable = -1;
+static i8 g_WorldFogEnable = -1;
+static i8 g_WorldVertexBlend = -1;
+
+static void agiDX9InvalidateWorldStates()
+{
+    g_WorldZWrite = -1;
+    g_WorldFogTable = -1;
+    g_WorldFogEnable = -1;
+    g_WorldVertexBlend = -1;
+}
+
+static void SetWorldZWrite(IDirect3DDevice9* device, bool enable)
+{
+    if (g_WorldZWrite == static_cast<i8>(enable))
+        return;
+
+    g_WorldZWrite = static_cast<i8>(enable);
+    device->SetRenderState(D3DRS_ZWRITEENABLE, enable ? TRUE : FALSE);
+}
+
+static void SetWorldFogTable(IDirect3DDevice9* device, bool linear)
+{
+    if (g_WorldFogTable == static_cast<i8>(linear))
+        return;
+
+    g_WorldFogTable = static_cast<i8>(linear);
+    device->SetRenderState(D3DRS_FOGTABLEMODE, linear ? D3DFOG_LINEAR : D3DFOG_NONE);
+}
+
+static void SetWorldFogEnable(IDirect3DDevice9* device, bool enable)
+{
+    if (g_WorldFogEnable == static_cast<i8>(enable))
+        return;
+
+    g_WorldFogEnable = static_cast<i8>(enable);
+    device->SetRenderState(D3DRS_FOGENABLE, enable ? TRUE : FALSE);
+}
+
+static void SetWorldVertexBlend(IDirect3DDevice9* device, bool enable)
+{
+    if (g_WorldVertexBlend == static_cast<i8>(enable))
+        return;
+
+    g_WorldVertexBlend = static_cast<i8>(enable);
+    device->SetRenderState(D3DRS_INDEXEDVERTEXBLENDENABLE, enable ? TRUE : FALSE);
+    device->SetRenderState(D3DRS_VERTEXBLEND, enable ? D3DVBF_0WEIGHTS : D3DVBF_DISABLE);
+}
+
+void agiDX9InvalidateLightCache()
+{
+    g_LightMirror = {};
+    agiDX9InvalidateWorldStates();
+}
+
+static void MirroredSetLight(IDirect3DDevice9* device, DWORD index, const D3DLIGHT9& light)
+{
+    if (index >= kMaxWorldLights)
+        return;
+
+    if (g_LightMirror.LightKnown[index] && (std::memcmp(&g_LightMirror.Lights[index], &light, sizeof(light)) == 0))
+        return;
+
+    g_LightMirror.Lights[index] = light;
+    g_LightMirror.LightKnown[index] = true;
+
+    device->SetLight(index, &light);
+}
+
+static void MirroredLightEnable(IDirect3DDevice9* device, DWORD index, bool enable)
+{
+    if (index >= kMaxWorldLights)
+        return;
+
+    if (g_LightMirror.EnabledKnown[index] && (g_LightMirror.Enabled[index] == enable))
+        return;
+
+    g_LightMirror.Enabled[index] = enable;
+    g_LightMirror.EnabledKnown[index] = true;
+
+    device->LightEnable(index, enable ? TRUE : FALSE);
+}
+
+static void MirroredSetMaterial(IDirect3DDevice9* device, const D3DMATERIAL9& material)
+{
+    if (g_LightMirror.MaterialKnown && (std::memcmp(&g_LightMirror.Material, &material, sizeof(material)) == 0))
+        return;
+
+    g_LightMirror.Material = material;
+    g_LightMirror.MaterialKnown = true;
+
+    device->SetMaterial(&material);
+}
+
 static void SetupD3D9Lights(IDirect3DDevice9* device)
 {
     i32 enabled = 0;
@@ -1672,14 +1826,14 @@ static void SetupD3D9Lights(IDirect3DDevice9* device)
         // past kMaxWorldLights while `enabled` stopped at it, so slots 8..15 got enabled and were
         // never disabled again: they leaked into every later draw and exceeded the
         // D3DCAPS9::MaxActiveLights most drivers report.
-        device->SetLight(static_cast<DWORD>(enabled), &d3dlight);
-        device->LightEnable(static_cast<DWORD>(enabled), TRUE);
+        MirroredSetLight(device, static_cast<DWORD>(enabled), d3dlight);
+        MirroredLightEnable(device, static_cast<DWORD>(enabled), true);
 
         ++enabled;
     }
 
     for (i32 i = enabled; i < kMaxWorldLights; ++i)
-        device->LightEnable(static_cast<DWORD>(i), FALSE);
+        MirroredLightEnable(device, static_cast<DWORD>(i), false);
 }
 
 // The city's static rig has no specular term at all. agiMeshLighterTriple (agiworld/meshlight.cpp,
@@ -1733,8 +1887,8 @@ static void SetupD3D9StaticLights(IDirect3DDevice9* device, bool sun_per_pixel)
         light.Direction = {-direction_to_light.x, -direction_to_light.y, -direction_to_light.z};
         light.Range = 1.0e8f;
 
-        device->SetLight(index, &light);
-        device->LightEnable(index, TRUE);
+        MirroredSetLight(device, index, light);
+        MirroredLightEnable(device, index, true);
     };
 
     // With -ffperpixel the sun is evaluated per fragment in its own additive pass, so it must NOT
@@ -1742,7 +1896,7 @@ static void SetupD3D9StaticLights(IDirect3DDevice9* device, bool sun_per_pixel)
     // triangle and once correctly. The two fills stay on the lighting unit; see dx9ffshade.h for why
     // only the sun is worth the extra passes.
     if (sun_per_pixel)
-        device->LightEnable(0, FALSE);
+        MirroredLightEnable(device, 0, false);
     else
         set_directional(0, agiMeshLighterSun, agiMeshLighterSunColor);
 
@@ -1768,15 +1922,15 @@ static void SetupD3D9StaticLights(IDirect3DDevice9* device, bool sun_per_pixel)
     if (fill1)
         set_directional(1, agiMeshLighterFill1, agiMeshLighterFill1Color);
     else
-        device->LightEnable(1, FALSE);
+        MirroredLightEnable(device, 1, false);
 
     if (fill2)
         set_directional(2, agiMeshLighterFill2, agiMeshLighterFill2Color);
     else
-        device->LightEnable(2, FALSE);
+        MirroredLightEnable(device, 2, false);
 
     for (i32 i = 3; i < kMaxWorldLights; ++i)
-        device->LightEnable(static_cast<DWORD>(i), FALSE);
+        MirroredLightEnable(device, static_cast<DWORD>(i), false);
 }
 
 // agiMeshLighterTriple has no material concept - it multiplies the summed sun/fill/ambient
@@ -1795,7 +1949,7 @@ static void SetupD3D9StaticMaterial(IDirect3DDevice9* device)
         d3dmtl.Power = 20.0f;
     }
 
-    device->SetMaterial(&d3dmtl);
+    MirroredSetMaterial(device, d3dmtl);
 }
 
 static void SetupD3D9Material(IDirect3DDevice9* device)
@@ -1820,12 +1974,28 @@ static void SetupD3D9Material(IDirect3DDevice9* device)
         d3dmtl.Power = 24.0f;
     }
 
-    device->SetMaterial(&d3dmtl);
+    MirroredSetMaterial(device, d3dmtl);
 }
 
 // Restores every piece of device state MeshWorld() programs, for both pathways. Shared so the
 // fixed-function and programmable branches cannot drift apart on cleanup - which is the failure
 // mode this whole file has been bitten by repeatedly (see the agiLastState note below).
+void agiDX9Rasterizer::LeaveWorldState()
+{
+    if (!world_state_active_)
+        return;
+
+    world_state_active_ = false;
+
+    RestoreStateAfterWorldDraw(world_remap_vertex_fog_);
+
+    // The device now belongs to the CPU path, and FlushState() writes depth and fog state from
+    // agiLastState without going through the world mirrors. Rather than teach two caches about each
+    // other, drop the world ones at the handover: the next world draw re-establishes all four, which
+    // is four calls per TRANSITION (about 14 a frame in scene) instead of four per draw.
+    agiDX9InvalidateWorldStates();
+}
+
 void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
 {
     IDirect3DDevice9* device = Pipe()->Context()->GetDevice();
@@ -2305,9 +2475,11 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // The CPU path never hits this because its draws go through agiTexSorter, which binds depth
     // state per texture from the same flags. This path bypasses the sorter, so it has to do it here
     // - the same class of omission already fixed for the texture bind, the blend mode and fog.
-    // Restored by RestoreStateAfterWorldDraw() from agiLastState.
-    if (additive_glow)
-        device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    // Programmed unconditionally now, and mirrored, rather than only being switched off for a glow
+    // and put back by the restore. The restore no longer runs between two world draws (see
+    // LeaveWorldState), so "only touch it when this draw is a glow" would leave the glow's setting
+    // on every following world draw until something else happened to change it.
+    SetWorldZWrite(device, !additive_glow && agiLastState.ZWrite);
 
     // Glow harvesting is unwired along with the rest of Pathway B (see agiDX9Pipeline::BeginGfx).
     // This was the mesh route - vehicle head, tail, brake and reverse lights, which never reach
@@ -2320,10 +2492,10 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // IsInScene() is not incidental - it keeps menu and showroom glows, which have no city around
     // them to light, out of the set.
 
-    // Fog off for additive glows on this path as well - same reason as the screen path, see
-    // IsAdditiveGlow(). Restored by RestoreStateAfterWorldDraw().
-    if (additive_glow)
-        device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    // Fog for this draw is decided in one place further down, once remap_vertex_fog is known - see
+    // the vertex-fog remap. Additive glows want it off for the same reason as the screen path (see
+    // IsAdditiveGlow()), and that is folded into the same decision rather than being a second switch
+    // the restore then has to undo.
 
     // Program the blend mode rather than inheriting whatever the last CPU-path draw left on the
     // device. An AlphaGlow texture is additive by definition and has no usable alpha channel left
@@ -2401,24 +2573,29 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // CPU's per-vertex ramp (better, in fact - it interpolates per pixel).
     const bool remap_vertex_fog = (agiLastState.FogMode == agiFogMode::Vertex);
 
-    if (remap_vertex_fog)
-    {
-        if (agiMeshSet::FogValue > 0.0f)
-        {
-            constexpr f32 kFogStart = 1.0f;
-            const f32 fog_end = 255.0f / agiMeshSet::FogValue;
+    // One decision, covering the remap, the additive-glow suppression and the ordinary case. It used
+    // to be two conditional switches undone by the restore; with the restore deferred past the next
+    // world draw, whatever a glow or a remap left behind would carry into it.
+    bool fog_enable = (agiLastState.FogMode != agiFogMode::None) && !additive_glow;
+    const bool want_fog_table = remap_vertex_fog && !additive_glow && (agiMeshSet::FogValue > 0.0f);
 
-            device->SetRenderState(D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
-            device->SetRenderState(D3DRS_FOGSTART, *reinterpret_cast<const DWORD*>(&kFogStart));
-            device->SetRenderState(D3DRS_FOGEND, *reinterpret_cast<const DWORD*>(&fog_end));
-        }
-        else
-        {
-            // No usable range to rebuild the ramp from - drawing unfogged is a far smaller error
-            // than drawing in solid fog colour.
-            device->SetRenderState(D3DRS_FOGENABLE, FALSE);
-        }
+    if (want_fog_table)
+    {
+        constexpr f32 kFogStart = 1.0f;
+        const f32 fog_end = 255.0f / agiMeshSet::FogValue;
+
+        device->SetRenderState(D3DRS_FOGSTART, *reinterpret_cast<const DWORD*>(&kFogStart));
+        device->SetRenderState(D3DRS_FOGEND, *reinterpret_cast<const DWORD*>(&fog_end));
     }
+    else if (remap_vertex_fog && !additive_glow)
+    {
+        // No usable range to rebuild the ramp from - drawing unfogged is a far smaller error than
+        // drawing in solid fog colour.
+        fog_enable = false;
+    }
+
+    SetWorldFogTable(device, want_fog_table);
+    SetWorldFogEnable(device, fog_enable);
 
     D3DMATRIX world_mat = ToD3DMatrix(world);
 
@@ -2491,7 +2668,8 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
             current_texture_ = nullptr;
         }
 
-        RestoreStateAfterWorldDraw(remap_vertex_fog);
+        world_state_active_ = true;
+        world_remap_vertex_fog_ = remap_vertex_fog;
         return true;
     }
 
@@ -2517,13 +2695,19 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
             D3DMATRIX bone_mat = ToD3DMatrix(skin->Bones[i]);
             device->SetTransform(D3DTS_WORLDMATRIX(i), &bone_mat);
         }
-
-        // D3DVBF_0WEIGHTS: no weights at all, one matrix per vertex named by its own index. The
-        // binding is rigid, so there is nothing to blend and nothing to normalise - this is the
-        // degenerate case of vertex blending, and the cheapest thing the vertex pipeline can do.
-        device->SetRenderState(D3DRS_INDEXEDVERTEXBLENDENABLE, TRUE);
-        device->SetRenderState(D3DRS_VERTEXBLEND, D3DVBF_0WEIGHTS);
     }
+
+    // D3DVBF_0WEIGHTS: no weights at all, one matrix per vertex named by its own index. The binding
+    // is rigid, so there is nothing to blend and nothing to normalise - this is the degenerate case
+    // of vertex blending, and the cheapest thing the vertex pipeline can do.
+    //
+    // Outside the `blend` branch and mirrored, because this is the one piece of state a skinned draw
+    // leaves behind that corrupts rather than mis-shades what follows: with D3DVBF_0WEIGHTS still
+    // set, D3D9 reads a matrix index out of a vertex layout that has no beta field and transforms by
+    // whatever palette slot that lands on. The restore used to catch it after every draw; it no
+    // longer runs between world draws, so a pedestrian would place the next building by a thigh
+    // bone. Almost every draw is unskinned, so the mirror means this costs nothing in practice.
+    SetWorldVertexBlend(device, blend);
 
     // Meshes loaded without MESH_SET_NORMAL carry no normals, so there is nothing for hardware
     // lighting to work from - their agiWorldVtx::normal is filler. The CPU path draws them
@@ -2671,7 +2855,10 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         current_texture_ = nullptr;
     }
 
-    RestoreStateAfterWorldDraw(remap_vertex_fog);
+    // Deferred, not skipped. See LeaveWorldState() - the next CPU-pretransformed draw runs it, and
+    // between two world draws there is nothing to put back for.
+    world_state_active_ = true;
+    world_remap_vertex_fog_ = remap_vertex_fog;
 
     return true;
 }

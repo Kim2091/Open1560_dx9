@@ -85,6 +85,10 @@ u32 agiDX9GHashWraps();
 // belongs to. Called from the same 120-frame report block.
 void agiDX9DumpAttribution();
 
+// Drops the light/material and world render-state mirrors described in dx9rsys.cpp. Call whenever
+// the device stops holding what was last sent to it - creation and loss are the only two cases.
+void agiDX9InvalidateLightCache();
+
 class agiDX9Rasterizer final : public agiRasterizer
 {
 public:
@@ -112,6 +116,19 @@ public:
 
     u32 MaxNativeSkinBones() const override;
 
+    // Runs that restore, but only if a world draw has left the device in its state.
+    //
+    // MeshWorld() used to restore at the end of every draw, and with 706-1007 world draws a frame
+    // that was ~16 device calls each - around 13,000 a frame - spent putting the device back for a
+    // CPU-path draw that, between two city meshes, never comes. The restore exists for the screen
+    // path's benefit (agiLastState has to keep describing the device truthfully, see the long note
+    // in RestoreStateAfterWorldDraw), so it belongs at the boundary where the screen path resumes,
+    // not after every submission.
+    //
+    // Called from DrawMesh(), which is the single funnel every CPU-pretransformed submission passes
+    // through, and from EndGroup() so a frame can never end mid-world-state.
+    void LeaveWorldState();
+
     agiDX9Pipeline* Pipe() const
     {
         return static_cast<agiDX9Pipeline*>(agiRefreshable::Pipe());
@@ -129,6 +146,10 @@ private:
     void DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_count, u16* indices, i32 index_count);
 
     IDirect3DTexture9* current_texture_ {};
+
+    // Set by MeshWorld(), cleared by LeaveWorldState(). See LeaveWorldState().
+    bool world_state_active_ {};
+    bool world_remap_vertex_fog_ {};
 
     agiTexEnv tex_env_ {};
 };

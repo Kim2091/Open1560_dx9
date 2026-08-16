@@ -24,6 +24,7 @@
 #include "data7/utimer.h"
 
 #include "dx9context.h"
+#include "dx9rsys.h"
 
 #include "dx9_windows.h"
 
@@ -125,6 +126,11 @@ void agiDX9Viewport::SetBackground(aconst Vector3& color)
 void agiDX9Viewport::Clear(i32 flags)
 {
     ARTS_UTIMED(agiClearViewport);
+
+    // A clear writes D3DRS_ZWRITEENABLE straight to the device, and that is one of the states the
+    // world path now mirrors (see agiDX9Rasterizer::LeaveWorldState). Hand the device back first, so
+    // the mirror is dropped rather than left describing a value this is about to overwrite.
+    Pipe()->Rast()->LeaveWorldState();
 
     IDirect3DDevice9* device = Pipe()->Context()->GetDevice();
 
