@@ -576,24 +576,25 @@ static void WorldSetTransform(IDirect3DDevice9* device, D3DTRANSFORMSTATETYPE st
     D3DMATRIX* cached = nullptr;
     bool* known = nullptr;
 
-    switch (state)
+    // Compared as values rather than switched on. D3DTS_WORLD is D3DTS_WORLDMATRIX(0), which is a
+    // cast of 256 rather than an enumerator of _D3DTRANSFORMSTATETYPE, so a case label for it is
+    // C4063 - fatal here under /W4 /WX.
+    const u32 index = static_cast<u32>(state);
+
+    if (index == static_cast<u32>(D3DTS_WORLD))
     {
-        case D3DTS_WORLD:
-            cached = &g_WorldCache.World;
-            known = &g_WorldCache.WorldKnown;
-            break;
-
-        case D3DTS_VIEW:
-            cached = &g_WorldCache.View;
-            known = &g_WorldCache.ViewKnown;
-            break;
-
-        case D3DTS_PROJECTION:
-            cached = &g_WorldCache.Projection;
-            known = &g_WorldCache.ProjectionKnown;
-            break;
-
-        default: break;
+        cached = &g_WorldCache.World;
+        known = &g_WorldCache.WorldKnown;
+    }
+    else if (index == static_cast<u32>(D3DTS_VIEW))
+    {
+        cached = &g_WorldCache.View;
+        known = &g_WorldCache.ViewKnown;
+    }
+    else if (index == static_cast<u32>(D3DTS_PROJECTION))
+    {
+        cached = &g_WorldCache.Projection;
+        known = &g_WorldCache.ProjectionKnown;
     }
 
     if (cached)
