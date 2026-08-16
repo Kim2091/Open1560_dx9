@@ -136,6 +136,13 @@ static mem::cmd_param PARAM_d3d9_identityproj {
 // Escape hatch for the depth-range change described at BuildProjectionMatrix() and re-asserted in
 // agiDX9Pipeline::BeginFrame(). Off by default: folding the engine's depth guard band into the
 // projection matrix is what stops RTX Remix path tracing in gameplay.
+// -d3d9rhview. Hands RTX Remix a right-handed view matrix and moves the Z flip into the projection.
+// Mathematically identical for rasterisation - see the derivation at BuildProjectionMatrix - so this
+// is an A/B switch for a Remix-side hypothesis rather than a rendering change. Off by default
+// because it does change two fixed-function behaviours that read D3DTS_VIEW directly; see MeshWorld.
+static mem::cmd_param PARAM_d3d9_rhview {
+    "d3d9rhview", "Give RTX Remix a right-handed view matrix, folding the Z flip into the projection"};
+
 mem::cmd_param PARAM_d3d9_legacydepth {
     "d3d9legacydepth", "Fold agiMeshSet::DepthScale/DepthOffset into PROJECTION (breaks RTX Remix)"};
 
@@ -1701,7 +1708,22 @@ static D3DMATRIX ToD3DMatrix(const Matrix34& m)
 // endpoints; against a 24-bit depth buffer it only throws away 1% of the range, and the CPU path's
 // own clamp (mrkni.cpp, KniMinZ/KniMaxZ) already pins depth to [0, 1] regardless. ShadowZBias is
 // untouched and still works - see the note in agiDX9Pipeline::BeginFrame().
-static D3DMATRIX BuildProjectionMatrix(const agiViewParameters& p)
+//
+// `rh_view` folds the Z flip that view_zflip normally applies into this matrix instead, so
+// D3DTS_VIEW can stay a proper rigid transform. Writing the current path out:
+//
+//     v' = v_world . view_zflip = (x, y, -z_v, 1)          [view_zflip negates View's Z column]
+//     w_clip = -z_v . _34        with _34 = +1
+//     z_clip = -z_v . _33 + _43
+//
+// and the right-handed path, with v = v_world . View = (x, y, z_v, 1):
+//
+//     w_clip = z_v . (-1)  = -z_v                          [same]
+//     z_clip = z_v . (-_33) + _43 = -z_v . _33 + _43       [same]
+//
+// x and y are untouched by the flip either way, so clip space comes out bit-identical and screen
+// winding does not change. See PARAM_d3d9_rhview.
+static D3DMATRIX BuildProjectionMatrix(const agiViewParameters& p, bool rh_view = false)
 {
     // NOTE: ProjXZ/ProjYZ deliberately do NOT appear here. The actual mesh transform
     // (agiMeshSet::ARTS_TRANSFORM_DOT, meshrend.cpp) computes output.x/output.y purely from the
@@ -1755,6 +1777,12 @@ static D3DMATRIX BuildProjectionMatrix(const agiViewParameters& p)
     result._34 = 1.0f;
 
     result._43 = p.ProjZW * depth_scale;
+
+    if (rh_view)
+    {
+        result._33 = -result._33;
+        result._34 = -1.0f;
+    }
 
     return result;
 }
@@ -2756,8 +2784,30 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         return true;
     }
 
-    D3DMATRIX view_mat = ToD3DMatrix(view_zflip);
-    D3DMATRIX proj_mat = BuildProjectionMatrix(proj_params);
+    // WHICH VIEW MATRIX RTX REMIX GETS.
+    //
+    // view_zflip negates View's Z column, which makes the matrix handed to D3D9 a REFLECTION -
+    // determinant -1 - rather than a rigid transform. The raster is correct, because the projection
+    // below is tuned to match, but it is the one thing about this camera that differs from what
+    // every other D3D9 game hands Remix, and Remix does reason about handedness (util_matrix.h has
+    // isMirrorTransform, and its camera code recovers a basis from the inverse). The basis it
+    // recovers from a mirrored view has its forward vector negated.
+    //
+    // -d3d9rhview hands it View unmodified and folds the flip into the projection instead. Clip
+    // space is bit-identical either way (the derivation is at BuildProjectionMatrix), so this is an
+    // A/B switch for that hypothesis, not a rendering change.
+    //
+    // Off by default because D3DTS_VIEW is not only consumed by the transform. D3D9 fixed-function
+    // SPECULAR builds its eye vector assuming +Z is forward in view space, which is true of
+    // view_zflip and not of View; and D3DTSS_TCI_CAMERASPACENORMAL texgen generates through
+    // whatever is set here (see dx9ffshade.cpp). Static-rig specular and -ffperpixel are both off by
+    // default, and the sphere-map pass takes view_zflip as an explicit argument rather than reading
+    // the device, so the default configuration is unaffected - but the dynamic rig's specular on
+    // vehicles is the thing to look at if this is turned on.
+    const bool rh_view = PARAM_d3d9_rhview.get_or(false);
+
+    D3DMATRIX view_mat = ToD3DMatrix(rh_view ? view : view_zflip);
+    D3DMATRIX proj_mat = BuildProjectionMatrix(proj_params, rh_view);
 
     WorldSetTransform(device, D3DTS_VIEW, view_mat);
     WorldSetTransform(device, D3DTS_PROJECTION, proj_mat);
