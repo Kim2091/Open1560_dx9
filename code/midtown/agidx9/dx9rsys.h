@@ -85,9 +85,15 @@ u32 agiDX9GHashWraps();
 // belongs to. Called from the same 120-frame report block.
 void agiDX9DumpAttribution();
 
-// Drops the light/material and world render-state mirrors described in dx9rsys.cpp. Call whenever
-// the device stops holding what was last sent to it - creation and loss are the only two cases.
+// Drops the light/material mirror and the render-state cache described in dx9rsys.cpp. Call
+// whenever the device stops holding what was last sent to it - creation and loss.
 void agiDX9InvalidateLightCache();
+
+// Drops the render-state cache alone. Every state write inside agiDX9Rasterizer goes through that
+// cache, so anything OUTSIDE it that writes render state, texture stage state, FVF or a transform
+// has to say so here - otherwise the cache keeps answering for a value the device no longer holds
+// and the next write that matches it is skipped. See agiDX9WorldStateCache for the full argument.
+void agiDX9InvalidateStateCache();
 
 class agiDX9Rasterizer final : public agiRasterizer
 {

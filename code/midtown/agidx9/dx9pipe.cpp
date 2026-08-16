@@ -429,6 +429,10 @@ void agiDX9Pipeline::EndFrame()
         // agiCurState/agiLastState pair's back. Poison the cache so the next frame re-issues
         // everything instead of trusting a stale record - the same hazard MeshWorld documents.
         agiLastState.Reset();
+
+        // And behind agiDX9Rasterizer's render-state cache too, which answers for the device on the
+        // basis that every write inside the rasterizer goes through it. This one did not.
+        agiDX9InvalidateStateCache();
     }
 
     if (ScreenShotRequested())

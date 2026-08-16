@@ -481,6 +481,144 @@ agiDX9Rasterizer::agiDX9Rasterizer(agiPipeline* pipe)
 
 agiDX9Rasterizer::~agiDX9Rasterizer() = default;
 
+// --- World render-state cache -----------------------------------------------------------------
+//
+// MeshWorld() programs the whole fixed-function pipeline from scratch on every submission, and the
+// census counts 706-1007 of those a frame. After the lights and the restore were dealt with, ~27
+// device calls per draw were left, and between two consecutive city meshes almost none of them
+// carries a different value: the view and projection matrices are the same for the entire frame,
+// the lighting and material-source render states are the same for every static-lit draw, and the
+// texture stage setup is the same for every textured one. Only the bound texture, the world matrix
+// and the draw itself genuinely differ.
+//
+// This remembers the last value written for each state and drops the call when it would be a
+// repeat. Under RTX Remix that is the difference between ~27 and ~3 commands crossing the
+// 32-to-64-bit bridge per draw, roughly 19,000 fewer a frame.
+//
+// SCOPE IS THE WHOLE CORRECTNESS ARGUMENT. The cache is only trusted while a run of consecutive
+// world draws is in progress - that is exactly the window in which the redundancy exists - and is
+// dropped by LeaveWorldState() the moment the device is handed back. Everything else in this
+// backend writes device state without going through here (FlushState from agiLastState, the blend
+// and texture-environment helpers shared with the screen path, agiDX9Viewport::Clear, the
+// fullscreen blit), and all of it happens outside a world run. So there is no second cache to keep
+// in step and no writer that can silently invalidate this one: leaving the run invalidates it.
+//
+// The sub-passes that run INSIDE a world draw and write state directly - the reflection and ground
+// environment passes, the -ffperpixel passes, the -ghashcolor tint - drop it explicitly, since they
+// are inside the window rather than outside it.
+struct agiDX9WorldStateCache
+{
+    // D3DRS_BLENDOPALPHA is 209, the highest render state D3D9 defines. D3DTSS_CONSTANT is 32.
+    static constexpr u32 kRenderStates = 210;
+    static constexpr u32 kStageStates = 33;
+    static constexpr u32 kStages = 2;
+
+    DWORD RenderState[kRenderStates];
+    bool RenderStateKnown[kRenderStates];
+
+    DWORD StageState[kStages][kStageStates];
+    bool StageStateKnown[kStages][kStageStates];
+
+    D3DMATRIX World;
+    D3DMATRIX View;
+    D3DMATRIX Projection;
+    bool WorldKnown;
+    bool ViewKnown;
+    bool ProjectionKnown;
+
+    DWORD Fvf;
+    bool FvfKnown;
+};
+
+static agiDX9WorldStateCache g_WorldCache {};
+
+void agiDX9InvalidateStateCache()
+{
+    g_WorldCache = {};
+}
+
+static void WorldSetRenderState(IDirect3DDevice9* device, D3DRENDERSTATETYPE state, DWORD value)
+{
+    const u32 index = static_cast<u32>(state);
+
+    if (index < agiDX9WorldStateCache::kRenderStates)
+    {
+        if (g_WorldCache.RenderStateKnown[index] && (g_WorldCache.RenderState[index] == value))
+            return;
+
+        g_WorldCache.RenderState[index] = value;
+        g_WorldCache.RenderStateKnown[index] = true;
+    }
+
+    device->SetRenderState(state, value);
+}
+
+static void WorldSetTextureStageState(IDirect3DDevice9* device, DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD value)
+{
+    const u32 index = static_cast<u32>(type);
+
+    if ((stage < agiDX9WorldStateCache::kStages) && (index < agiDX9WorldStateCache::kStageStates))
+    {
+        if (g_WorldCache.StageStateKnown[stage][index] && (g_WorldCache.StageState[stage][index] == value))
+            return;
+
+        g_WorldCache.StageState[stage][index] = value;
+        g_WorldCache.StageStateKnown[stage][index] = true;
+    }
+
+    device->SetTextureStageState(stage, type, value);
+}
+
+// Only the three transforms MeshWorld sets every draw. D3DTS_WORLDMATRIX(1..7) is deliberately not
+// cached: it is written only by a skinned submission, whose palette differs every time anyway.
+static void WorldSetTransform(IDirect3DDevice9* device, D3DTRANSFORMSTATETYPE state, const D3DMATRIX& matrix)
+{
+    D3DMATRIX* cached = nullptr;
+    bool* known = nullptr;
+
+    switch (state)
+    {
+        case D3DTS_WORLD:
+            cached = &g_WorldCache.World;
+            known = &g_WorldCache.WorldKnown;
+            break;
+
+        case D3DTS_VIEW:
+            cached = &g_WorldCache.View;
+            known = &g_WorldCache.ViewKnown;
+            break;
+
+        case D3DTS_PROJECTION:
+            cached = &g_WorldCache.Projection;
+            known = &g_WorldCache.ProjectionKnown;
+            break;
+
+        default: break;
+    }
+
+    if (cached)
+    {
+        if (*known && (std::memcmp(cached, &matrix, sizeof(matrix)) == 0))
+            return;
+
+        *cached = matrix;
+        *known = true;
+    }
+
+    device->SetTransform(state, &matrix);
+}
+
+static void WorldSetFVF(IDirect3DDevice9* device, DWORD fvf)
+{
+    if (g_WorldCache.FvfKnown && (g_WorldCache.Fvf == fvf))
+        return;
+
+    g_WorldCache.Fvf = fvf;
+    g_WorldCache.FvfKnown = true;
+
+    device->SetFVF(fvf);
+}
+
 i32 agiDX9Rasterizer::BeginGfx()
 {
     IDirect3DDevice9* device = Pipe()->Context()->GetDevice();
@@ -492,9 +630,9 @@ i32 agiDX9Rasterizer::BeginGfx()
 
     // These never change for our purposes - our vertex format never carries per-vertex specular,
     // and lighting is only used by the (separate) world-space path.
-    device->SetRenderState(D3DRS_LIGHTING, FALSE);
-    device->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
-    device->SetRenderState(D3DRS_DITHERENABLE, TRUE);
+    WorldSetRenderState(device, D3DRS_LIGHTING, FALSE);
+    WorldSetRenderState(device, D3DRS_SPECULARENABLE, FALSE);
+    WorldSetRenderState(device, D3DRS_DITHERENABLE, TRUE);
 
     // Anisotropy. Programmed once here rather than at every texture bind: D3DSAMP_MAXANISOTROPY is
     // sampler state, not texture state, and the value never changes for the life of the device -
@@ -725,26 +863,26 @@ static void ApplyTexEnv(IDirect3DDevice9* device, agiTexEnv tex_env)
     switch (tex_env)
     {
         case agiTexEnv::Disable:
-            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
-            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+            WorldSetTextureStageState(device, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            WorldSetTextureStageState(device, 0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+            WorldSetTextureStageState(device, 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            WorldSetTextureStageState(device, 0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
             break;
 
         case agiTexEnv::Replace:
-            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            WorldSetTextureStageState(device, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            WorldSetTextureStageState(device, 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            WorldSetTextureStageState(device, 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            WorldSetTextureStageState(device, 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
             break;
 
         case agiTexEnv::Modulate:
-            device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
-            device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-            device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-            device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
-            device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-            device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+            WorldSetTextureStageState(device, 0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+            WorldSetTextureStageState(device, 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            WorldSetTextureStageState(device, 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+            WorldSetTextureStageState(device, 0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+            WorldSetTextureStageState(device, 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            WorldSetTextureStageState(device, 0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
             break;
     }
 }
@@ -788,8 +926,8 @@ static void ApplyBlendSet(IDirect3DDevice9* device, agiBlendSet blend_set)
         default: Quitf("bad blend mode"); break;
     }
 
-    device->SetRenderState(D3DRS_SRCBLEND, blend_s);
-    device->SetRenderState(D3DRS_DESTBLEND, blend_d);
+    WorldSetRenderState(device, D3DRS_SRCBLEND, blend_s);
+    WorldSetRenderState(device, D3DRS_DESTBLEND, blend_d);
 }
 
 static D3DCULL ToD3DCull(agiCullMode cull_mode)
@@ -878,7 +1016,7 @@ void agiDX9Rasterizer::FlushState()
     if (zenable != agiLastState.ZEnable)
     {
         agiLastState.ZEnable = zenable;
-        device->SetRenderState(D3DRS_ZENABLE, zenable ? D3DZB_TRUE : D3DZB_FALSE);
+        WorldSetRenderState(device, D3DRS_ZENABLE, zenable ? D3DZB_TRUE : D3DZB_FALSE);
         ++STATS.StateChangeCalls;
     }
 
@@ -888,7 +1026,7 @@ void agiDX9Rasterizer::FlushState()
         {
             agiLastState.ZWrite = zwrite;
 
-            device->SetRenderState(D3DRS_ZWRITEENABLE, zwrite ? TRUE : FALSE);
+            WorldSetRenderState(device, D3DRS_ZWRITEENABLE, zwrite ? TRUE : FALSE);
             ++STATS.StateChangeCalls;
         }
 
@@ -896,7 +1034,7 @@ void agiDX9Rasterizer::FlushState()
         {
             agiLastState.ZFunc = zfunc;
 
-            device->SetRenderState(D3DRS_ZFUNC, ToD3DCmpFunc(zfunc));
+            WorldSetRenderState(device, D3DRS_ZFUNC, ToD3DCmpFunc(zfunc));
             ++STATS.StateChangeCalls;
         }
     }
@@ -905,7 +1043,7 @@ void agiDX9Rasterizer::FlushState()
     {
         agiLastState.SmoothShading = smooth_shading;
 
-        device->SetRenderState(D3DRS_SHADEMODE, smooth_shading ? D3DSHADE_GOURAUD : D3DSHADE_FLAT);
+        WorldSetRenderState(device, D3DRS_SHADEMODE, smooth_shading ? D3DSHADE_GOURAUD : D3DSHADE_FLAT);
         ++STATS.StateChangeCalls;
     }
 
@@ -922,7 +1060,7 @@ void agiDX9Rasterizer::FlushState()
             case agiFillMode::Solid: fill_mode = D3DFILL_SOLID; break;
         }
 
-        device->SetRenderState(D3DRS_FILLMODE, fill_mode);
+        WorldSetRenderState(device, D3DRS_FILLMODE, fill_mode);
         ++STATS.StateChangeCalls;
     }
 
@@ -938,14 +1076,14 @@ void agiDX9Rasterizer::FlushState()
         agiLastState.AlphaEnable = alpha_enable;
         agiLastState.AlphaRef = alpha_ref;
 
-        device->SetRenderState(D3DRS_ALPHABLENDENABLE, alpha_enable ? TRUE : FALSE);
-        device->SetRenderState(D3DRS_ALPHATESTENABLE, alpha_enable ? TRUE : FALSE);
+        WorldSetRenderState(device, D3DRS_ALPHABLENDENABLE, alpha_enable ? TRUE : FALSE);
+        WorldSetRenderState(device, D3DRS_ALPHATESTENABLE, alpha_enable ? TRUE : FALSE);
         ++STATS.StateChangeCalls;
 
         if (alpha_enable)
         {
-            device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
-            device->SetRenderState(D3DRS_ALPHAREF, alpha_ref);
+            WorldSetRenderState(device, D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+            WorldSetRenderState(device, D3DRS_ALPHAREF, alpha_ref);
             ++STATS.StateChangeCalls;
         }
     }
@@ -965,7 +1103,7 @@ void agiDX9Rasterizer::FlushState()
         // Our vertices are already in D3D9 screen space (D3DFVF_XYZRHW), so no winding
         // flip is needed here (unlike the OpenGL backend, which has to compensate for
         // OpenGL's opposite screen-space Y axis).
-        device->SetRenderState(D3DRS_CULLMODE, agiNoCullEnabled() ? D3DCULL_NONE : ToD3DCull(cull_mode));
+        WorldSetRenderState(device, D3DRS_CULLMODE, agiNoCullEnabled() ? D3DCULL_NONE : ToD3DCull(cull_mode));
         ++STATS.StateChangeCalls;
     }
 
@@ -996,7 +1134,7 @@ void agiDX9Rasterizer::FlushState()
         agiLastState.FogEnd = fog_end;
         agiLastState.FogDensity = fog_density;
 
-        device->SetRenderState(D3DRS_FOGENABLE, (fog_mode != agiFogMode::None) ? TRUE : FALSE);
+        WorldSetRenderState(device, D3DRS_FOGENABLE, (fog_mode != agiFogMode::None) ? TRUE : FALSE);
 
         switch (fog_mode)
         {
@@ -1006,18 +1144,18 @@ void agiDX9Rasterizer::FlushState()
                 // Table (per-pixel) fog for pretransformed vertices - interpolates using the
                 // vertex's screen-space depth (agiScreenVtx::z), same source as the OpenGL
                 // backend's GL_FOG_COORD path.
-                device->SetRenderState(D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
-                device->SetRenderState(D3DRS_FOGVERTEXMODE, D3DFOG_NONE);
-                device->SetRenderState(D3DRS_FOGSTART, *reinterpret_cast<const DWORD*>(&fog_start));
-                device->SetRenderState(D3DRS_FOGEND, *reinterpret_cast<const DWORD*>(&fog_end));
+                WorldSetRenderState(device, D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
+                WorldSetRenderState(device, D3DRS_FOGVERTEXMODE, D3DFOG_NONE);
+                WorldSetRenderState(device, D3DRS_FOGSTART, *reinterpret_cast<const DWORD*>(&fog_start));
+                WorldSetRenderState(device, D3DRS_FOGEND, *reinterpret_cast<const DWORD*>(&fog_end));
                 break;
 
             case agiFogMode::Vertex:
                 // With both fog modes set to NONE, D3D9 uses the alpha component of the
                 // per-vertex specular colour directly as the fog factor - exactly the value
                 // already baked into agiScreenVtx::specular by the engine's own fog code.
-                device->SetRenderState(D3DRS_FOGTABLEMODE, D3DFOG_NONE);
-                device->SetRenderState(D3DRS_FOGVERTEXMODE, D3DFOG_NONE);
+                WorldSetRenderState(device, D3DRS_FOGTABLEMODE, D3DFOG_NONE);
+                WorldSetRenderState(device, D3DRS_FOGVERTEXMODE, D3DFOG_NONE);
                 break;
         }
     }
@@ -1026,7 +1164,7 @@ void agiDX9Rasterizer::FlushState()
     {
         agiLastState.FogColor = fog_color;
 
-        device->SetRenderState(D3DRS_FOGCOLOR, fog_color & 0x00FFFFFF);
+        WorldSetRenderState(device, D3DRS_FOGCOLOR, fog_color & 0x00FFFFFF);
     }
 
     agiCurState.ClearTouched();
@@ -1389,13 +1527,13 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
     IDirect3DDevice9* device = Pipe()->Context()->GetDevice();
 
     device->SetTexture(0, current_texture_);
-    device->SetFVF(kScreenVtxFVF);
+    WorldSetFVF(device, kScreenVtxFVF);
 
     // See IsAdditiveGlow(). Only touched for glow draws, so ordinary geometry pays nothing.
     const bool glow = IsAdditiveGlow(agiCurState.GetTexture());
 
     if (glow)
-        device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        WorldSetRenderState(device, D3DRS_FOGENABLE, FALSE);
 
     i32 primitive_count = (prim_type == D3DPT_LINELIST) ? (index_count / 2) : (index_count / 3);
 
@@ -1416,9 +1554,9 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
 
     if (mark_screen)
     {
-        device->SetRenderState(D3DRS_TEXTUREFACTOR, D3DCOLOR_XRGB(255, 0, 255));
-        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
+        WorldSetRenderState(device, D3DRS_TEXTUREFACTOR, D3DCOLOR_XRGB(255, 0, 255));
+        WorldSetTextureStageState(device, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        WorldSetTextureStageState(device, 0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
     }
 
     // Logical pixels -> backbuffer pixels. See the PRESENTATION TRANSFORM note in dx9pipe.h.
@@ -1473,7 +1611,7 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
     // every following draw that happened not to change fog state.
     if (glow)
     {
-        device->SetRenderState(D3DRS_FOGENABLE, (agiLastState.FogMode != agiFogMode::None) ? TRUE : FALSE);
+        WorldSetRenderState(device, D3DRS_FOGENABLE, (agiLastState.FogMode != agiFogMode::None) ? TRUE : FALSE);
     }
 }
 
@@ -1656,67 +1794,10 @@ struct agiDX9LightMirror
 
 static agiDX9LightMirror g_LightMirror {};
 
-// The three render states MeshWorld() used to set only inside a branch and rely on the restore to
-// put back. With the restore deferred (see agiDX9Rasterizer::LeaveWorldState) each of them would
-// otherwise carry from one world draw into the next, so they are programmed on every draw instead -
-// and mirrored, because "every draw" is 706-1007 of them and the value changes on almost none.
-//
-// Tri-state rather than bool: -1 means the device has been reset and nothing is known yet, which is
-// not the same as knowing it is off.
-static i8 g_WorldZWrite = -1;
-static i8 g_WorldFogTable = -1;
-static i8 g_WorldFogEnable = -1;
-static i8 g_WorldVertexBlend = -1;
-
-static void agiDX9InvalidateWorldStates()
-{
-    g_WorldZWrite = -1;
-    g_WorldFogTable = -1;
-    g_WorldFogEnable = -1;
-    g_WorldVertexBlend = -1;
-}
-
-static void SetWorldZWrite(IDirect3DDevice9* device, bool enable)
-{
-    if (g_WorldZWrite == static_cast<i8>(enable))
-        return;
-
-    g_WorldZWrite = static_cast<i8>(enable);
-    device->SetRenderState(D3DRS_ZWRITEENABLE, enable ? TRUE : FALSE);
-}
-
-static void SetWorldFogTable(IDirect3DDevice9* device, bool linear)
-{
-    if (g_WorldFogTable == static_cast<i8>(linear))
-        return;
-
-    g_WorldFogTable = static_cast<i8>(linear);
-    device->SetRenderState(D3DRS_FOGTABLEMODE, linear ? D3DFOG_LINEAR : D3DFOG_NONE);
-}
-
-static void SetWorldFogEnable(IDirect3DDevice9* device, bool enable)
-{
-    if (g_WorldFogEnable == static_cast<i8>(enable))
-        return;
-
-    g_WorldFogEnable = static_cast<i8>(enable);
-    device->SetRenderState(D3DRS_FOGENABLE, enable ? TRUE : FALSE);
-}
-
-static void SetWorldVertexBlend(IDirect3DDevice9* device, bool enable)
-{
-    if (g_WorldVertexBlend == static_cast<i8>(enable))
-        return;
-
-    g_WorldVertexBlend = static_cast<i8>(enable);
-    device->SetRenderState(D3DRS_INDEXEDVERTEXBLENDENABLE, enable ? TRUE : FALSE);
-    device->SetRenderState(D3DRS_VERTEXBLEND, enable ? D3DVBF_0WEIGHTS : D3DVBF_DISABLE);
-}
-
 void agiDX9InvalidateLightCache()
 {
     g_LightMirror = {};
-    agiDX9InvalidateWorldStates();
+    agiDX9InvalidateStateCache();
 }
 
 static void MirroredSetLight(IDirect3DDevice9* device, DWORD index, const D3DLIGHT9& light)
@@ -1988,12 +2069,6 @@ void agiDX9Rasterizer::LeaveWorldState()
     world_state_active_ = false;
 
     RestoreStateAfterWorldDraw(world_remap_vertex_fog_);
-
-    // The device now belongs to the CPU path, and FlushState() writes depth and fog state from
-    // agiLastState without going through the world mirrors. Rather than teach two caches about each
-    // other, drop the world ones at the handover: the next world draw re-establishes all four, which
-    // is four calls per TRANSITION (about 14 a frame in scene) instead of four per draw.
-    agiDX9InvalidateWorldStates();
 }
 
 void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
@@ -2002,13 +2077,13 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
 
     // Pretransformed (agiScreenVtx) draws ignore D3DRS_LIGHTING entirely, but reset it anyway
     // for clarity - and so BeginGfx()'s initial state assumption keeps holding.
-    device->SetRenderState(D3DRS_LIGHTING, FALSE);
-    device->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
+    WorldSetRenderState(device, D3DRS_LIGHTING, FALSE);
+    WorldSetRenderState(device, D3DRS_SPECULARENABLE, FALSE);
 
     // Pretransformed draws are not lit either, so this has no effect on them - but leaving it set
     // would still be a lie about the device's state, and it costs the driver work on every
     // subsequent vertex. Put it back the way BeginGfx() left it.
-    device->SetRenderState(D3DRS_NORMALIZENORMALS, FALSE);
+    WorldSetRenderState(device, D3DRS_NORMALIZENORMALS, FALSE);
 
     // Vertex blending off. Unconditional, and not optional: this is the one piece of state a
     // skinned draw leaves behind that would silently corrupt every following draw rather than merely
@@ -2017,25 +2092,25 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
     // XYZ or XYZRHW draw following a pedestrian would be placed by a leftover thigh bone. Restoring
     // it here rather than at the end of the skinned branch keeps it on the same shared path as every
     // other piece of state MeshWorld programs, which is the drift this function exists to prevent.
-    device->SetRenderState(D3DRS_VERTEXBLEND, D3DVBF_DISABLE);
-    device->SetRenderState(D3DRS_INDEXEDVERTEXBLENDENABLE, FALSE);
+    WorldSetRenderState(device, D3DRS_VERTEXBLEND, D3DVBF_DISABLE);
+    WorldSetRenderState(device, D3DRS_INDEXEDVERTEXBLENDENABLE, FALSE);
 
     // Reset the depth bias so it doesn't leak into pretransformed (agiScreenVtx) draws, which
     // have no need for it and aren't tracked by FlushState()'s dirty-checking anyway.
     constexpr f32 kNoDepthBias = 0.0f;
-    device->SetRenderState(D3DRS_DEPTHBIAS, *reinterpret_cast<const DWORD*>(&kNoDepthBias));
+    WorldSetRenderState(device, D3DRS_DEPTHBIAS, *reinterpret_cast<const DWORD*>(&kNoDepthBias));
 
     // Undo the vertex-fog remap above. FlushState() caches fog state in agiLastState and only
     // re-issues it on a change, so table fog left switched on here would silently apply itself to
     // every following CPU-path draw - whose vertices carry the fog factor in specular alpha and
     // would then be fogged twice.
     if (remap_vertex_fog)
-        device->SetRenderState(D3DRS_FOGTABLEMODE, D3DFOG_NONE);
+        WorldSetRenderState(device, D3DRS_FOGTABLEMODE, D3DFOG_NONE);
 
     // Fog enable is restored unconditionally, because two separate things above may have switched
     // it off for this draw - the vertex-fog remap and the additive-glow suppression - and the
     // programmable path switches it off too (dx9shader.cpp). One truthful restore covers all three.
-    device->SetRenderState(D3DRS_FOGENABLE, (agiLastState.FogMode != agiFogMode::None) ? TRUE : FALSE);
+    WorldSetRenderState(device, D3DRS_FOGENABLE, (agiLastState.FogMode != agiFogMode::None) ? TRUE : FALSE);
 
     // Put the device back exactly as agiLastState describes it.
     //
@@ -2053,22 +2128,22 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
     //
     // Restoring the device to match agiLastState keeps that cache truthful, so it stays correct
     // whether or not FlushState() runs next.
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, agiLastState.AlphaEnable ? TRUE : FALSE);
-    device->SetRenderState(D3DRS_ALPHATESTENABLE, agiLastState.AlphaEnable ? TRUE : FALSE);
+    WorldSetRenderState(device, D3DRS_ALPHABLENDENABLE, agiLastState.AlphaEnable ? TRUE : FALSE);
+    WorldSetRenderState(device, D3DRS_ALPHATESTENABLE, agiLastState.AlphaEnable ? TRUE : FALSE);
 
     if (agiLastState.AlphaEnable)
     {
-        device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
-        device->SetRenderState(D3DRS_ALPHAREF, agiLastState.AlphaRef);
+        WorldSetRenderState(device, D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+        WorldSetRenderState(device, D3DRS_ALPHAREF, agiLastState.AlphaRef);
     }
 
-    device->SetRenderState(D3DRS_CULLMODE, agiNoCullEnabled() ? D3DCULL_NONE : ToD3DCull(agiLastState.CullMode));
+    WorldSetRenderState(device, D3DRS_CULLMODE, agiNoCullEnabled() ? D3DCULL_NONE : ToD3DCull(agiLastState.CullMode));
 
     // Depth writes, restored for the same reason as everything else here: the additive-glow branch
     // above may have switched them off, and FlushState() only re-issues D3DRS_ZWRITEENABLE when
     // agiCurState's value changes, so leaving it off would silently disable depth writes for every
     // following draw that happened not to toggle it.
-    device->SetRenderState(D3DRS_ZWRITEENABLE, agiLastState.ZWrite ? TRUE : FALSE);
+    WorldSetRenderState(device, D3DRS_ZWRITEENABLE, agiLastState.ZWrite ? TRUE : FALSE);
 
     // Blend mode is programmed above now, so it has to be put back too - agiLastState.BlendSet is
     // what FlushState() believes the device is in, and it only re-issues on a *change*, so leaving
@@ -2111,8 +2186,8 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
     D3DMATRIX identity {};
     identity._11 = identity._22 = identity._33 = identity._44 = 1.0f;
 
-    device->SetTransform(D3DTS_WORLD, &identity);
-    device->SetTransform(D3DTS_VIEW, &identity);
+    WorldSetTransform(device, D3DTS_WORLD, identity);
+    WorldSetTransform(device, D3DTS_VIEW, identity);
 
     // PROJECTION is deliberately NOT reset, for RTX Remix's benefit.
     //
@@ -2140,7 +2215,7 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
     // -d3d9identityproj restores the old unconditional reset, for the driver quirk described above
     // (leftover transform state reaching supposedly transform-immune draws) if it ever shows up.
     if (PARAM_d3d9_identityproj.get_or(false))
-        device->SetTransform(D3DTS_PROJECTION, &identity);
+        WorldSetTransform(device, D3DTS_PROJECTION, identity);
 }
 
 // Harvests a world-space glow mesh as a light source. See agiworld/glowlight.h.
@@ -2372,7 +2447,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // Kept as a parameter rather than deleted because the census still reports a nonzero in-scene
     // screen-triangle count, so some 3D content has not moved over yet.
     const f32 depth_bias = PARAM_d3d9_depthbias.get_or(0.0f);
-    device->SetRenderState(D3DRS_DEPTHBIAS, *reinterpret_cast<const DWORD*>(&depth_bias));
+    WorldSetRenderState(device, D3DRS_DEPTHBIAS, *reinterpret_cast<const DWORD*>(&depth_bias));
 
     // FlushState()'s texture/texture-stage bookkeeping (current_texture_/tex_env_) only updates
     // when agiCurState::DrawMode == agiDrawTextured - a piece of global state set deep inside the
@@ -2397,19 +2472,19 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         // including the wrong wrap/clamp mode for this texture.
         ApplyTexFilters(native_tex, agiCurState.GetTexFilter());
 
-        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
-        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-        device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-        device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
-        device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-        device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+        WorldSetTextureStageState(device, 0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+        WorldSetTextureStageState(device, 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        WorldSetTextureStageState(device, 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+        WorldSetTextureStageState(device, 0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+        WorldSetTextureStageState(device, 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        WorldSetTextureStageState(device, 0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
     }
     else
     {
-        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
-        device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-        device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+        WorldSetTextureStageState(device, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        WorldSetTextureStageState(device, 0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+        WorldSetTextureStageState(device, 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        WorldSetTextureStageState(device, 0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
     }
 
     current_texture_ = native_handle;
@@ -2453,13 +2528,13 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // stripped, so its sampled alpha is a constant 1.0 and the stage modulates that by the vertex
     // diffuse alpha - which for a fading glow is small. A GREATER/AlphaRef test against that would
     // discard exactly the faint pixels the additive blend exists to draw.
-    device->SetRenderState(D3DRS_ALPHABLENDENABLE, (alpha_enable || additive_glow) ? TRUE : FALSE);
-    device->SetRenderState(D3DRS_ALPHATESTENABLE, alpha_enable ? TRUE : FALSE);
+    WorldSetRenderState(device, D3DRS_ALPHABLENDENABLE, (alpha_enable || additive_glow) ? TRUE : FALSE);
+    WorldSetRenderState(device, D3DRS_ALPHATESTENABLE, alpha_enable ? TRUE : FALSE);
 
     if (alpha_enable)
     {
-        device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
-        device->SetRenderState(D3DRS_ALPHAREF, alpha_ref);
+        WorldSetRenderState(device, D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+        WorldSetRenderState(device, D3DRS_ALPHAREF, alpha_ref);
     }
 
     // Additive glows must not write depth.
@@ -2479,7 +2554,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // and put back by the restore. The restore no longer runs between two world draws (see
     // LeaveWorldState), so "only touch it when this draw is a glow" would leave the glow's setting
     // on every following world draw until something else happened to change it.
-    SetWorldZWrite(device, !additive_glow && agiLastState.ZWrite);
+    WorldSetRenderState(device, D3DRS_ZWRITEENABLE, (!additive_glow && agiLastState.ZWrite) ? TRUE : FALSE);
 
     // Glow harvesting is unwired along with the rest of Pathway B (see agiDX9Pipeline::BeginGfx).
     // This was the mesh route - vehicle head, tail, brake and reverse lights, which never reach
@@ -2541,8 +2616,8 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // -nocull forces both sides through. A path tracer needs closed shells: a back face it never
     // receives is a hole that light leaks through, and the interior of every building in the city is
     // exactly that shape.
-    device->SetRenderState(
-        D3DRS_CULLMODE, agiNoCullEnabled() ? D3DCULL_NONE : ToD3DCullFlipped(agiCurState.GetCullMode()));
+    WorldSetRenderState(
+        device, D3DRS_CULLMODE, agiNoCullEnabled() ? D3DCULL_NONE : ToD3DCullFlipped(agiCurState.GetCullMode()));
 
     // D3D9 fixed-function lighting does not renormalise normals after the world/view transform, and
     // agiWorldVtx::normal arrives as a unit vector from UnpackNormal[] in *model* space. Any
@@ -2552,7 +2627,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // is driven by a power of that dot product) exaggerates it further. Scaled instances are known
     // to exist here: InitMtx's guard for AllowEyeBackfacing is precisely a scale-tolerance test on
     // the current transform, which would be pointless if every transform were rigid.
-    device->SetRenderState(D3DRS_NORMALIZENORMALS, TRUE);
+    WorldSetRenderState(device, D3DRS_NORMALIZENORMALS, TRUE);
 
     // Vertex fog does not exist on this path and has to be re-expressed as table fog.
     //
@@ -2584,8 +2659,8 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         constexpr f32 kFogStart = 1.0f;
         const f32 fog_end = 255.0f / agiMeshSet::FogValue;
 
-        device->SetRenderState(D3DRS_FOGSTART, *reinterpret_cast<const DWORD*>(&kFogStart));
-        device->SetRenderState(D3DRS_FOGEND, *reinterpret_cast<const DWORD*>(&fog_end));
+        WorldSetRenderState(device, D3DRS_FOGSTART, *reinterpret_cast<const DWORD*>(&kFogStart));
+        WorldSetRenderState(device, D3DRS_FOGEND, *reinterpret_cast<const DWORD*>(&fog_end));
     }
     else if (remap_vertex_fog && !additive_glow)
     {
@@ -2594,8 +2669,8 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         fog_enable = false;
     }
 
-    SetWorldFogTable(device, want_fog_table);
-    SetWorldFogEnable(device, fog_enable);
+    WorldSetRenderState(device, D3DRS_FOGTABLEMODE, want_fog_table ? D3DFOG_LINEAR : D3DFOG_NONE);
+    WorldSetRenderState(device, D3DRS_FOGENABLE, fog_enable ? TRUE : FALSE);
 
     D3DMATRIX world_mat = ToD3DMatrix(world);
 
@@ -2665,8 +2740,15 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
             DrawVehicleReflectionPass(
                 device, vertices, vertex_count, indices, index_count, world, view, view_zflip, *fx, Pipe()->PerPixel());
             DrawGroundEnvPass(device, vertices, vertex_count, indices, index_count, world, *fx);
+
+            // As on the fixed-function branch below - these write render and stage state straight to
+            // the device, so the cache no longer answers for it.
             current_texture_ = nullptr;
+            agiDX9InvalidateStateCache();
         }
+
+        // The shader itself was bound and unbound outside the cache as well.
+        agiDX9InvalidateStateCache();
 
         world_state_active_ = true;
         world_remap_vertex_fog_ = remap_vertex_fog;
@@ -2676,14 +2758,14 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     D3DMATRIX view_mat = ToD3DMatrix(view_zflip);
     D3DMATRIX proj_mat = BuildProjectionMatrix(proj_params);
 
-    device->SetTransform(D3DTS_VIEW, &view_mat);
-    device->SetTransform(D3DTS_PROJECTION, &proj_mat);
+    WorldSetTransform(device, D3DTS_VIEW, view_mat);
+    WorldSetTransform(device, D3DTS_PROJECTION, proj_mat);
 
     // D3DTS_WORLD and D3DTS_WORLDMATRIX(0) are the same slot, and DrawNativeTransform passes the
     // palette's first bone as `world`, so this is bone 0 for a skinned draw and the ordinary world
     // matrix for everything else. A palette of one needs nothing further: it is a plain world
     // transform, which is exactly what submitting a skinned model one bone at a time amounts to.
-    device->SetTransform(D3DTS_WORLD, &world_mat);
+    WorldSetTransform(device, D3DTS_WORLD, world_mat);
 
     if (blend)
     {
@@ -2707,7 +2789,8 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // whatever palette slot that lands on. The restore used to catch it after every draw; it no
     // longer runs between world draws, so a pedestrian would place the next building by a thigh
     // bone. Almost every draw is unskinned, so the mirror means this costs nothing in practice.
-    SetWorldVertexBlend(device, blend);
+    WorldSetRenderState(device, D3DRS_INDEXEDVERTEXBLENDENABLE, blend ? TRUE : FALSE);
+    WorldSetRenderState(device, D3DRS_VERTEXBLEND, blend ? D3DVBF_0WEIGHTS : D3DVBF_DISABLE);
 
     // Meshes loaded without MESH_SET_NORMAL carry no normals, so there is nothing for hardware
     // lighting to work from - their agiWorldVtx::normal is filler. The CPU path draws them
@@ -2718,21 +2801,22 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // without changing a single pixel of how it is shaded.
     if (!hardware_lighting)
     {
-        device->SetRenderState(D3DRS_LIGHTING, FALSE);
-        device->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
+        WorldSetRenderState(device, D3DRS_LIGHTING, FALSE);
+        WorldSetRenderState(device, D3DRS_SPECULARENABLE, FALSE);
     }
     else
     {
-        device->SetRenderState(D3DRS_LIGHTING, TRUE);
+        WorldSetRenderState(device, D3DRS_LIGHTING, TRUE);
 
         // Specular is legitimate for the dynamic rig - SetupD3D9Material() takes its specular
         // colour and power from the engine's own agiMtlDef (agiCurState.GetMtl()), i.e. real
         // authored material data for cars and movers. The static city rig has no specular concept
         // at all, so it only gets one when explicitly asked for. See SetupD3D9StaticMaterial().
-        device->SetRenderState(D3DRS_SPECULARENABLE, (!static_lighting || agiDX9WantsStaticSpecular()) ? TRUE : FALSE);
+        WorldSetRenderState(
+            device, D3DRS_SPECULARENABLE, (!static_lighting || agiDX9WantsStaticSpecular()) ? TRUE : FALSE);
 
-        device->SetRenderState(D3DRS_COLORVERTEX, TRUE);
-        device->SetRenderState(D3DRS_DIFFUSEMATERIALSOURCE, D3DMCS_COLOR1);
+        WorldSetRenderState(device, D3DRS_COLORVERTEX, TRUE);
+        WorldSetRenderState(device, D3DRS_DIFFUSEMATERIALSOURCE, D3DMCS_COLOR1);
 
         // Ambient must come from the vertex colour, not the material. agiMeshLighterTriple
         // (agiworld/meshlight.cpp, mmxTriple) computes
@@ -2746,9 +2830,9 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         // ambient-occluded underside of geometry - and it is a flat additive lift, so it cannot be
         // dialled out by the ambient value alone. D3DMCS_COLOR1 puts ambient back inside the
         // product and matches the CPU rig term for term.
-        device->SetRenderState(D3DRS_AMBIENTMATERIALSOURCE, D3DMCS_COLOR1);
-        device->SetRenderState(D3DRS_SPECULARMATERIALSOURCE, D3DMCS_MATERIAL);
-        device->SetRenderState(D3DRS_EMISSIVEMATERIALSOURCE, D3DMCS_MATERIAL);
+        WorldSetRenderState(device, D3DRS_AMBIENTMATERIALSOURCE, D3DMCS_COLOR1);
+        WorldSetRenderState(device, D3DRS_SPECULARMATERIALSOURCE, D3DMCS_MATERIAL);
+        WorldSetRenderState(device, D3DRS_EMISSIVEMATERIALSOURCE, D3DMCS_MATERIAL);
     }
 
     // Fixed-function per-pixel Blinn-Phong for the sun. Only for the static city rig: the dynamic
@@ -2765,7 +2849,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     else if (static_lighting)
     {
         const Vector3& ambient = agiMeshLighterAmbient;
-        device->SetRenderState(D3DRS_AMBIENT, D3DCOLOR_COLORVALUE(ambient.x, ambient.y, ambient.z, 1.0f));
+        WorldSetRenderState(device, D3DRS_AMBIENT, D3DCOLOR_COLORVALUE(ambient.x, ambient.y, ambient.z, 1.0f));
 
         SetupD3D9StaticLights(device, per_pixel != nullptr);
         SetupD3D9StaticMaterial(device);
@@ -2773,14 +2857,14 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     else
     {
         const Vector3& scene_ambient = agiLighter::SceneAmbient;
-        device->SetRenderState(
-            D3DRS_AMBIENT, D3DCOLOR_COLORVALUE(scene_ambient.x, scene_ambient.y, scene_ambient.z, 1.0f));
+        WorldSetRenderState(
+            device, D3DRS_AMBIENT, D3DCOLOR_COLORVALUE(scene_ambient.x, scene_ambient.y, scene_ambient.z, 1.0f));
 
         SetupD3D9Lights(device);
         SetupD3D9Material(device);
     }
 
-    device->SetFVF(blend ? kWorldSkinFVF : (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1));
+    WorldSetFVF(device, blend ? kWorldSkinFVF : (D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE | D3DFVF_TEX1));
 
     i32 primitive_count = index_count / 3;
 
@@ -2805,9 +2889,9 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     // read when a stage selects TFACTOR, which nothing else does.
     if (PARAM_ghashcolor.get_or(false))
     {
-        device->SetRenderState(D3DRS_TEXTUREFACTOR, agiDX9GHashColor(geometry_hash));
-        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
+        WorldSetRenderState(device, D3DRS_TEXTUREFACTOR, agiDX9GHashColor(geometry_hash));
+        WorldSetTextureStageState(device, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        WorldSetTextureStageState(device, 0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
     }
 
     if (blend)
@@ -2841,7 +2925,10 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         agiDX9Census.PerPixelPasses += per_pixel->DrawSunPasses(
             device, vertices, vertex_count, indices, index_count, sizeof(agiWorldVtx), native_handle, view_zflip);
 
+        // Writes render and stage state straight to the device (dx9ffshade.cpp), so what the cache
+        // remembers is no longer what the device holds.
         current_texture_ = nullptr;
+        agiDX9InvalidateStateCache();
     }
 
     // Second passes, in the order the original composited them: chrome over the paint, ground map
@@ -2852,7 +2939,10 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
         DrawVehicleReflectionPass(
             device, vertices, vertex_count, indices, index_count, world, view, view_zflip, *fx, Pipe()->PerPixel());
         DrawGroundEnvPass(device, vertices, vertex_count, indices, index_count, world, *fx);
+
+        // Same as the per-pixel passes above - their own pipeline, written straight to the device.
         current_texture_ = nullptr;
+        agiDX9InvalidateStateCache();
     }
 
     // Deferred, not skipped. See LeaveWorldState() - the next CPU-pretransformed draw runs it, and

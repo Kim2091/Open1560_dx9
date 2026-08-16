@@ -127,10 +127,13 @@ void agiDX9Viewport::Clear(i32 flags)
 {
     ARTS_UTIMED(agiClearViewport);
 
-    // A clear writes D3DRS_ZWRITEENABLE straight to the device, and that is one of the states the
-    // world path now mirrors (see agiDX9Rasterizer::LeaveWorldState). Hand the device back first, so
-    // the mirror is dropped rather than left describing a value this is about to overwrite.
+    // Hand the device back to the CPU path before clearing: a clear that touches Z has to run with
+    // depth writes on, and the world path may have left them off for a glow.
     Pipe()->Rast()->LeaveWorldState();
+
+    // This writes D3DRS_ZWRITEENABLE and D3DRS_SCISSORTESTENABLE straight to the device rather than
+    // through agiDX9Rasterizer's cache, so the cache has to be told.
+    agiDX9InvalidateStateCache();
 
     IDirect3DDevice9* device = Pipe()->Context()->GetDevice();
 
