@@ -103,8 +103,8 @@ static mem::cmd_param PARAM_ghashcolor {"ghashcolor", "Tint world draws by RTX R
 // texcoords they are a brand new mesh every frame. Either way they push a second copy of every car
 // body and every stretch of road into a renderer that does reflections properly by itself.
 //
-// Off by default - this costs real visuals (see A3 in docs/dx9_rendering_pathways.md) and only
-// earns its keep when capturing for Remix.
+// Off by default - this costs real visuals (chrome on the cars, the ground map on the road) and
+// only earns its keep when capturing for Remix.
 static mem::cmd_param PARAM_d3d9_nofx {
     "d3d9nofx", "Skip the reflection and ground-env second passes (they duplicate geometry for RTX Remix)"};
 
@@ -2037,7 +2037,7 @@ static void SetupD3D9Lights(IDirect3DDevice9* device)
 //
 // Pathway A is the parity path, so this is off by default. It stays available because it is a
 // reasonable thing to want on a modern display - but per-pixel specular over real normals belongs
-// to Pathway B (see docs/dx9_rendering_pathways.md), not to a per-vertex FF approximation.
+// to a programmable path, not to a per-vertex fixed-function approximation.
 static mem::cmd_param PARAM_d3d9_specular {"d3d9specular", "Add a specular term to the static city lighting rig"};
 
 bool agiDX9WantsStaticSpecular()
@@ -2532,7 +2532,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
 
     IDirect3DDevice9* device = Pipe()->Context()->GetDevice();
 
-    // Depth bias, now off by default - see docs/dx9_rendering_pathways.md, A4.
+    // Depth bias, now off by default.
     //
     // This existed to win one specific fight: wheel/tyre geometry sitting millimetres above the
     // road was losing the depth test against the road, because the road was still drawn by the CPU

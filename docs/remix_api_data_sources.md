@@ -12,8 +12,7 @@ radius; this material is emissive; the sun is here) and cannot get them from a D
 
 The code is not gone, only unreferenced: everything described here can be read at commit
 `0dac83657` and its ancestors, principally `code/midtown/agiworld/glowlight.h`,
-`code/midtown/agidx9/dx9shader.cpp` and `code/midtown/agidx9/dx9probe.cpp`. Design rationale, which
-this document does not repeat, is in `dx9_rendering_pathways.md` §B0–§B0c.
+`code/midtown/agidx9/dx9shader.cpp` and `code/midtown/agidx9/dx9probe.cpp`.
 
 A caveat on the Remix side: this document is written from the engine outward. It says what data
 exists, where to get it, and what will go wrong when you do. It does not attempt to specify exact

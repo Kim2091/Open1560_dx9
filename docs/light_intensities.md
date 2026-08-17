@@ -5,8 +5,11 @@ measured at in-game. Written as a tuning worksheet: the values here are **not** 
 they are claimed to be *what is currently there*, so that a tuning pass has a baseline to move from
 rather than a search.
 
-Nothing in this document is a defaults change. See `dx9_rendering_pathways.md` §B0/§B0c for why the
-system is shaped this way.
+Nothing in this document is a defaults change.
+
+**These values are currently inert.** The programmable path they feed is not wired up (see the note
+in `agiDX9Pipeline::BeginGfx`), so nothing reads them at runtime. They are kept as the measured
+baseline a tuning pass would start from if it is turned back on.
 
 ---
 
@@ -59,9 +62,9 @@ For a street lamp (gain 166.7, reach 20):
 | 18 u | 0.00026 | 0.04 | effectively gone |
 
 So a lamp's visually meaningful range is roughly **8–15 units**, and everything inside ~7 units is
-saturated. The one-unit denominator clamp is a stand-in for a finite source radius; §2.3 of
-`future_renderer.md` proposes replacing it with a proper sphere-area light, which would remove the
-near-field blowout and make these numbers behave linearly.
+saturated. The one-unit denominator clamp is a stand-in for a finite source radius; a proper
+sphere-area light would replace it, removing the near-field blowout and making these numbers behave
+linearly.
 
 ---
 
@@ -194,7 +197,7 @@ MM1 ships colour maps only.
 
 Vehicle `AoAmount` is 0.5, everything else 1.0. Nothing is metallic anywhere — deliberate, because
 the environment term is a two-lobe hemisphere and a metal with nothing to reflect renders black.
-This is the single biggest thing that environment probes (`future_renderer.md` §4) would unlock.
+This is the single biggest thing that real environment probes would unlock.
 
 ---
 

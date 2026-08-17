@@ -14,6 +14,7 @@ The intention is to allow the fixing of bugs, implementation of new features and
 
 Notable changes include:
 * OpenGL Renderer
+* DirectX 9 Renderer (see below)
 * SDL Gamepad Support
 * Audio Fixes
 * Crash Fixes
@@ -22,3 +23,122 @@ Notable changes include:
 * Improved Debug Menu
 * Improved Performance
 * Improved/Fixed Text Rendering
+
+## DirectX 9 renderer
+
+`code/midtown/agidx9` is a second hardware backend alongside the OpenGL one. It exists mainly so the
+game can be path traced by [NVIDIA RTX Remix](https://github.com/NVIDIAGameWorks/rtx-remix), which
+reconstructs a scene from the fixed-function draw state a D3D9 game submits.
+
+That goal decides how the backend is built. Remix can only reconstruct geometry it receives in
+**model space with real `SetTransform(WORLD/VIEW/PROJECTION)` calls**. A draw that arrives already
+transformed on the CPU (`D3DFVF_XYZRHW`) carries no world-space information and is skipped, and a
+draw issued through a vertex shader is opaque to it, since Remix cannot know what the shader did to
+the position. So this backend moves as much of the frame as possible onto a world-space path
+(`agiDX9Rasterizer::MeshWorld`), and keeps the fixed-function pipeline rather than a programmable
+one. In a city, world-space submission currently accounts for roughly **98-99%** of scene triangles;
+the remainder is HUD, text and the minimap, which are meant to be 2D. `-ghash` makes the renderer
+report that split, and its Remix geometry-hash stability, every 120 frames.
+
+A programmable path (`dx9shader.cpp`, `dx9probe.cpp`, `game/hlsl`) was written and then unwired for
+the same reason. It still compiles, nothing calls it, and the switches that fed it are listed as
+inert below.
+
+### Selecting it
+
+Pass `-d3d9`. Fullscreen, resolution and colour depth otherwise come from the game's own graphics
+settings; `-width`/`-height` override the resolution for one run.
+
+### How it presents
+
+The engine draws in a coordinate space of the pipeline's resolution ("logical pixels"), but the D3D9
+device is created at the **window** size, which in fullscreen is the whole display. Those two
+disagree whenever the game is not running at the desktop resolution, and in the menus they always
+disagree, because the menu pipeline is deliberately built at a fixed 640x480 - the size the menu
+system's widget art and bitmap fonts were authored for, and the only size at which the whole menu
+scales as one image.
+
+Rather than render to a texture and blit it (what the OpenGL backend does, and what would hide
+gameplay from Remix), the gap is closed as a coordinate transform: screen-space vertices and viewport
+rectangles are mapped from logical pixels onto the blit rectangle. Remix ignores both kinds of thing,
+so this costs it nothing. Rasterisation still happens at full device resolution - only the layout is
+640x480. `-scaling` picks the rectangle; the default preserves the 4:3 aspect and pillarboxes.
+
+### Command line switches
+
+Every switch below is also visible at runtime with `-help`, which lists all registered parameters
+with their descriptions. Boolean switches take `0` or `1`, and default to off unless stated.
+
+**Selection and display**
+
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `-d3d9` | off | Select the DirectX 9 renderer. |
+| `-d3d9dll <name>` | `d3d9_remix.dll`, then `d3d9.dll` | Which DLL to take `Direct3DCreate9` from. |
+| `-width <n>` / `-height <n>` | selected mode | Pipeline resolution. |
+| `-depth <n>` | 32 | Colour depth. |
+| `-vsync <0/1>` | 1 | Wait for vertical blank. |
+| `-scaling <0-3>` | 0 | 0 stretch keeping aspect, 1 stretch, 2 centred, 3 centred integer-scaled. |
+| `-border <0/1>` | 1 | Window border, windowed only. |
+| `-menunative` | off | Compose the menus at the selected resolution instead of 640x480. Backgrounds then fill the screen while widgets, sliders and fonts stay their authored pixel size - see "How it presents". |
+
+**Renderer**
+
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `-aniso <n>` | 16 | Anisotropic filtering, clamped to the device maximum. `1` disables it. Applied to minification only. |
+| `-d3d9frameclear <0/1>` | 1 | Clear colour and depth at the start of each frame. |
+| `-d3d9scenetarget` | off | Render the scene into an offscreen target and blit it back. Exercises the render-target framework; **invisible to Remix**. |
+| `-d3d9specular` | off | Add a specular term to the static city lighting rig. The original rig has no specular concept at all. |
+| `-d3d9nofx` | off | Skip the chrome and ground-map second passes. They duplicate geometry, which matters for a Remix capture, and cost real visuals otherwise. |
+| `-d3d9depthbias <f>` | 0.0 | Depth bias for hardware-transformed geometry. Should no longer be needed. |
+| `-noskin` | off | Disable hardware matrix-palette skinning; submit one draw per bone instead. |
+| `-ffperpixel` | off | Per-pixel Blinn-Phong for the sun, through the texture-blending unit. Costs extra passes and is **not Remix compatible**. |
+| `-ffperpixelsteps <0-6>` | 4 | Blinn exponent for the above, as squaring steps (2^n). |
+| `-ffperpixelreflect` | off | Generate vehicle reflection coordinates per pixel instead of per vertex. |
+
+**World geometry**
+
+These act on the world-space path, so they apply to this backend only.
+
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `-nocull` | off | Disable backface, LOD and distance culling. A path tracer wants closed shells; a back face it never receives is a hole light leaks through. |
+| `-smoothnormals <0/1>` | 1 | Rebuild smooth vertex normals in float. The engine stores normals as an index into a 198-entry table, coarse enough that a facet's corners often quantise to one direction and shade flat. |
+| `-flatnormals` | off | Shade from facet geometry, ignoring stored vertex normals. |
+| `-nativecpucull` | off | Cull backfacing facets on the CPU. **Breaks Remix hash stability.** |
+| `-pedskin` | off | Skin pedestrians on the CPU. **Breaks Remix hash stability.** |
+| `-reflectamount <f>` | 0.35 | Vehicle sphere-map reflection strength. |
+| `-reflectfresnelbias <f>` | 1.0 | Vehicle reflection fresnel bias. |
+| `-reflectfresnelscale <f>` | 0.0 | Vehicle reflection fresnel scale. |
+| `-reflectspecular <f>` | 0.0 | Vehicle reflection sun-glint strength. |
+| `-trafficrefl` | off | Sphere-map reflections on AI and traffic vehicles too. |
+| `-worldlinewidth <f>` | 0.02 | World-space half-width of spark and debug lines. |
+| `-worldlinegrow <f>` | 0.0015 | Extra line half-width per unit of view depth. |
+
+**Diagnostics and escape hatches**
+
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `-ghash` | off | Report Remix geometry-hash stability for world draws: distinct hashes, how many are new this frame, and which textures the churn belongs to. |
+| `-ghashcolor` | off | Tint world draws by geometry hash, as Remix's own Geometry Hash debug view does. A stable mesh holds one colour; CPU-pretransformed geometry is marked flat magenta. |
+| `-d3d9legacydepth` | off | Fold `agiMeshSet::DepthScale`/`DepthOffset` back into the projection matrix. **Breaks Remix** - it produces a frustum with no far plane, which is why it is not the default. |
+| `-d3d9rhview` | off | Hand Remix a right-handed view matrix, folding the Z flip into the projection instead. Clip space is identical either way, so this is an A/B switch rather than a rendering change. |
+| `-d3d9identityproj` | off | Reset `PROJECTION` to identity after world draws. **Breaks Remix.** |
+
+**Inert - the unwired programmable path**
+
+These are still registered so an existing `Open1560-Shaders.ini` does not start warning about unknown
+keys, but nothing reads them at runtime: `-d3d9quality`, `-d3d9sun`, `-d3d9reflect`, `-d3d9tonemap`,
+`-d3d9exposure`, `-d3d9heightfog`, `-d3d9flashpower`, `-d3d9glowlights`, `-d3d9glowpower`,
+`-d3d9cellsize`, `-d3d9lightspec`, `-d3d9cellpack`, `-glowheadlights`, `-glowvehiclelights`,
+`-glowtrafficlights`, `-glowstreetlamps`, `-glowgenericlights`, `-glowreachscale`, `-glowreachmin`,
+`-lighthead`, `-lightvehicle`, `-lighttraffic`, `-lightlamp`, `-lightgeneric`, `-glowdebug`.
+
+### Open1560-Shaders.ini
+
+The renderer writes a fully commented `Open1560-Shaders.ini` next to the executable on first run.
+Every key in it is one of the switches above, applied through the same mechanism - so anything
+tunable on the command line is tunable from the file and vice versa, and the command line wins, which
+lets a setting be overridden for one run without editing the file. Delete it to regenerate it. It
+predates the tables above and covers mostly the inert keys; the tables are the complete set.

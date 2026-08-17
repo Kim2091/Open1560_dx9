@@ -1920,8 +1920,9 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
     // deliberately no cross-frame cache of the result: agiMeshSet's layout is fixed by
     // check_size(agiMeshSet, 0x64) so the arrays cannot live on the mesh, and a side table keyed on
     // the mesh pointer would have to outguess a lifetime the assembly partly owns - for a saving of
-    // one linear pass. When the dynamic vertex/index buffers of dx9_rendering_pathways.md §1.2
-    // land, they are the right owner for it: device buffers with a BeginGfx/EndGfx lifetime.
+    // one linear pass. If this backend ever grows device-owned dynamic vertex/index buffers in
+    // place of DrawIndexedPrimitiveUP, those are the right owner for it: they would have exactly
+    // the BeginGfx/EndGfx lifetime such a cache needs.
     //
     // The facet index is emitted as u16 because the engine's own facet storage is i16 (nextFacet is
     // i16[16384]), so a mesh above that has never been submittable by any path here.
@@ -2019,8 +2020,8 @@ b32 agiMeshSet::DrawNativeTransform(u32 flags, bool static_lighting, const agiNa
     // vertices plus up to ~192 KB of indices, per call, in an already-deep draw chain against a
     // 1 MB stack. Real meshes are far smaller and this has not been observed to fire. If it ever
     // needs fixing, the fix is a buffer that is neither the game heap nor the stack - a
-    // module-level array sized once for the worst case, or the dynamic D3D9 vertex/index buffers
-    // proposed in docs/dx9_rendering_pathways.md - not std::vector.
+    // module-level array sized once for the worst case, or device-owned dynamic D3D9 vertex and
+    // index buffers - not std::vector.
     //
     const agiViewParameters& view_params = ViewParams();
 

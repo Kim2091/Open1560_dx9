@@ -18,13 +18,15 @@
 
 #pragma once
 
-// Pathway B - the programmable (vs_3_0/ps_3_0) world-geometry path.
-// See docs/dx9_rendering_pathways.md and game/hlsl/world.{vs,ps}.hlsl.
+// Pathway B - the programmable (vs_3_0/ps_3_0) world-geometry path. See game/hlsl/world.{vs,ps}.hlsl.
+//
+// NOT WIRED UP. Nothing calls Init(), so none of this runs - see the note in agiDX9Pipeline::BeginGfx
+// for why the work went to fixed function instead, and what it would take to turn this back on.
 //
 // This is deliberately a *sibling* of the fixed-function path rather than a replacement. Pathway A
 // stays the default because RTX Remix reconstructs its scene from fixed-function draw state - a
 // draw issued through a vertex shader is opaque to it, since it cannot know what the shader did to
-// the position. Pathway B is for looking good natively, and is opted into with -d3d9shaders.
+// the position. Pathway B is for looking good natively.
 
 #include "vector7/vector3.h"
 

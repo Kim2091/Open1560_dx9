@@ -19,7 +19,10 @@
 #pragma once
 
 // Loads Open1560-Shaders.ini, the tuning file for the programmable rendering path (Pathway B) and
-// the glow-driven lighting that feeds it. See docs/dx9_rendering_pathways.md.
+// the glow-driven lighting that feeds it.
+//
+// Pathway B is not wired up (see agiDX9Pipeline::BeginGfx), so most keys in this file are inert.
+// The file itself documents which. See the D3D9 section of the README for the live switches.
 //
 // It does not introduce a settings system of its own: every key is simply an existing
 // mem::cmd_param, applied through mem::cmd_param::set() exactly as a command-line switch would be.

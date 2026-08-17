@@ -27,8 +27,8 @@ struct IDirect3DCubeTexture9;
 //
 // WHY THIS IS SYNTHESISED RATHER THAN CAPTURED. The obvious way to build a reflection probe is to
 // render the scene into six faces, and it is the wrong way here. Six extra scene renders a frame is
-// not affordable on a backend that still has no frustum culling on the world path
-// (dx9_rendering_pathways.md §1.3) and re-uploads every mesh through DrawIndexedPrimitiveUP, and
+// not affordable on a backend that still has no frustum culling on the world path and re-uploads
+// every mesh through DrawIndexedPrimitiveUP, and
 // the result would be dominated by sky anyway - a car sees sky above the horizon, road below it,
 // and buildings only in a thin band. So the probe is computed analytically from the same sun,
 // sky and ground the rest of the frame is lit by. It costs a fraction of a millisecond, only when

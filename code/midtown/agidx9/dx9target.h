@@ -22,16 +22,15 @@ struct IDirect3DDevice9;
 struct IDirect3DTexture9;
 struct IDirect3DSurface9;
 
-// Render-to-texture for the programmable path. This is the infrastructure
-// docs/handoff_dx9_renderer.md §6 calls the highest-leverage missing piece: shadow maps,
-// post-processing (bloom, a real tonemap pass, antialiasing) and environment probes all need
-// somewhere to render that is not the backbuffer, and none of them can start without it.
+// Render-to-texture for the programmable path. Shadow maps, post-processing (bloom, a real
+// tonemap pass, antialiasing) and environment probes all need somewhere to render that is not the
+// backbuffer, and none of them can start without it.
 //
 // NOTE ON RTX REMIX. Anything that composites through one of these is Pathway B only, and is
 // fundamentally invisible to Remix - Remix reconstructs a scene from the draws it sees and does its
 // own rendering, so a post-processed image blitted over the top is at best ignored and at worst
-// mistaken for UI. That is not a defect to fix later; it is the same divide as the two pathways
-// (see dx9_rendering_pathways.md §0). Pathway A must keep drawing to the real backbuffer.
+// mistaken for UI. That is not a defect to fix later; it is the same divide that separates the two
+// pathways. The fixed-function path must keep drawing to the real backbuffer.
 
 // Anything holding D3DPOOL_DEFAULT allocations must derive from this.
 //

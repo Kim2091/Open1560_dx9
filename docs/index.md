@@ -19,18 +19,13 @@ title: Open1560
     * See a list of changes [here](./changes.md).
 * How do I work with the Open1560 code?
     * See the build instructions [here](./building.md).
-* How does the DirectX 9 renderer work, and how do I build it quickly?
-    * See the [renderer handoff](./handoff_dx9_renderer.md) — project structure, the assembly/C++
-      seam, fast build workflow, and the roadmap.
-* What are the two D3D9 rendering pathways?
-    * See the [rendering pathways design](./dx9_rendering_pathways.md) — fixed-function (RTX Remix
-      compatible) versus programmable (PBR shaders), and the rationale for keeping both.
-* How bright is each kind of light, and what should I tune?
+* How does the DirectX 9 renderer work, and what can I configure?
+    * See the [DirectX 9 renderer section of the README](https://github.com/0x1F9F1/Open1560#directx-9-renderer)
+      — what it draws, how it presents, and every command line switch it reads.
+* How bright is each kind of light?
     * See the [light intensity reference](./light_intensities.md) — every value that feeds a light's
-      brightness, what it was measured at in-game, and a suggested order for a tuning pass.
-* What is planned for the programmable renderer next?
-    * See the [future renderer plan](./future_renderer.md) — sun shadows, area lights, environment
-      probes, water and road reflections without screen space, procedural rain puddles, and AO.
+      brightness and what it was measured at in-game. These feed the programmable path, which is not
+      wired up, so they are a measured baseline rather than live settings.
 * What files make up a city, and what is in them?
     * See the [city format reference](./city_format.md) — the cell table, portals, geometry
       containers, bounds, bangers, facades and the AI road network, field by field, with the closed

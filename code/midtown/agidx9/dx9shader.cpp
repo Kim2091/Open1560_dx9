@@ -1208,7 +1208,7 @@ void agiDX9WorldShader::Setup(IDirect3DDevice9* device, const agiDX9WorldDrawInf
     //
     // Pathway B only, deliberately: agiMeshLighterSun is still what the CPU rig and the D3DLIGHT9
     // fixed-function path read, and rewriting the global would change Pathway A's output, which is
-    // the parity baseline (dx9_rendering_pathways.md §2). -d3d9sun 0 restores the engine's own.
+    // the parity baseline. -d3d9sun 0 restores the engine's own.
     if (PARAM_d3d9_sun.get_or(true))
         agiDX9ComputeSunLight(dirs[0], cols[0]);
 
