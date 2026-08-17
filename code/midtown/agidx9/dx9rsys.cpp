@@ -502,17 +502,26 @@ agiDX9Rasterizer::~agiDX9Rasterizer() = default;
 // repeat. Under RTX Remix that is the difference between ~27 and ~3 commands crossing the
 // 32-to-64-bit bridge per draw, roughly 19,000 fewer a frame.
 //
-// SCOPE IS THE WHOLE CORRECTNESS ARGUMENT. The cache is only trusted while a run of consecutive
-// world draws is in progress - that is exactly the window in which the redundancy exists - and is
-// dropped by LeaveWorldState() the moment the device is handed back. Everything else in this
-// backend writes device state without going through here (FlushState from agiLastState, the blend
-// and texture-environment helpers shared with the screen path, agiDX9Viewport::Clear, the
-// fullscreen blit), and all of it happens outside a world run. So there is no second cache to keep
-// in step and no writer that can silently invalidate this one: leaving the run invalidates it.
+// WHO IS ALLOWED TO WRITE DEVICE STATE IS THE WHOLE CORRECTNESS ARGUMENT. Every write issued from
+// inside agiDX9Rasterizer goes through one of these wrappers, including the ones that put the
+// device back at the end of a world run - LeaveWorldState() does not drop the cache, it RECONCILES
+// it, by restoring through the same wrappers, so the record stays true across the boundary rather
+// than being thrown away at it.
 //
-// The sub-passes that run INSIDE a world draw and write state directly - the reflection and ground
-// environment passes, the -ffperpixel passes, the -ghashcolor tint - drop it explicitly, since they
-// are inside the window rather than outside it.
+// That leaves exactly two kinds of writer to account for, and both are handled explicitly:
+//
+//   - Code outside the rasterizer that writes the device directly: agiDX9Viewport::Clear, the
+//     fullscreen blit in dx9target.cpp, the reflection and ground-environment passes, the
+//     -ffperpixel passes, the Pathway B shader bind/unbind and the -ghashcolor tint. Each calls
+//     agiDX9InvalidateStateCache() when it is done.
+//
+//   - IDirect3DDevice9::Reset(), which returns the whole device to its defaults behind everyone's
+//     back. agiDX9Context calls agiDX9OnDeviceReset() for it. This is not a theoretical case - the
+//     menu/race transition, a window resize and a lost device recovered mid-race all reset.
+//
+// A cache that has not heard about one of those does not just go stale. Because its whole job is to
+// SKIP a call it believes redundant, a stale entry SUPPRESSES the write that would have repaired
+// the device, and the wrong state persists until something happens to ask for a different value.
 struct agiDX9WorldStateCache
 {
     // D3DRS_BLENDOPALPHA is 209, the highest render state D3D9 defines. D3DTSS_CONSTANT is 32.
@@ -525,6 +534,9 @@ struct agiDX9WorldStateCache
 
     DWORD StageState[kStages][kStageStates];
     bool StageStateKnown[kStages][kStageStates];
+
+    IDirect3DTexture9* Texture[kStages];
+    bool TextureKnown[kStages];
 
     D3DMATRIX World;
     D3DMATRIX View;
@@ -544,6 +556,35 @@ void agiDX9InvalidateStateCache()
     g_WorldCache = {};
 }
 
+// See the long note on the declaration in dx9rsys.h for why a reset the mirrors do not hear about
+// is worse than a stale mirror.
+void agiDX9OnDeviceReset(IDirect3DDevice9* device)
+{
+    agiDX9InvalidateStateCache();
+    agiDX9InvalidateLightCache();
+    agiDX9InvalidateSamplerCache();
+
+    // The engine's own record of what was last sent, which FlushState() compares against and only
+    // re-issues on a difference. Reset() poisons it so the next FlushState() re-issues everything
+    // rather than trusting a description of the previous device. Same call agiPipeline::BeginAllGfx
+    // makes after bringing a pipeline up, and agiDX9Pipeline::EndFrame after the fullscreen blit.
+    agiLastState.Reset();
+
+    if (device == nullptr)
+        return;
+
+    // D3DSAMP_MAXANISOTROPY is programmed once in BeginGfx() because it never changes for the life
+    // of the device - but a Reset() ends that life as far as sampler state is concerned, and the
+    // device-lost recovery in agiDX9Context::BeginFrame() resets without any BeginGfx() following
+    // it. Put it back from the value BeginGfx() resolved; ApplyTexFilters() still decides per bind
+    // whether to actually select D3DTEXF_ANISOTROPIC.
+    if (g_MaxAnisotropy > 1)
+    {
+        for (DWORD stage = 0; stage < 8; ++stage)
+            device->SetSamplerState(stage, D3DSAMP_MAXANISOTROPY, g_MaxAnisotropy);
+    }
+}
+
 static void WorldSetRenderState(IDirect3DDevice9* device, D3DRENDERSTATETYPE state, DWORD value)
 {
     const u32 index = static_cast<u32>(state);
@@ -558,6 +599,40 @@ static void WorldSetRenderState(IDirect3DDevice9* device, D3DRENDERSTATETYPE sta
     }
 
     device->SetRenderState(state, value);
+}
+
+// The last per-draw device call that was still issued unconditionally.
+//
+// Both submission paths bind stage 0 on every draw - MeshWorld() from agiCurState, DrawMesh() from
+// current_texture_ - and the engine sorts by texture, so consecutive draws usually want the binding
+// that is already there. Every one of those is a command across the Remix 32-to-64-bit bridge for
+// no change in state, which is the same cost this cache was built to remove from the render states.
+//
+// Bound by the same scope rule as the rest of the cache: anything that writes a texture straight to
+// the device does so inside a world run and drops the cache afterwards, and a texture being released
+// forgets its slot (agiDX9ForgetTexture) so a recycled allocation at the same address cannot be
+// mistaken for the binding that is already live.
+static void WorldSetTexture(IDirect3DDevice9* device, DWORD stage, IDirect3DTexture9* texture)
+{
+    if (stage < agiDX9WorldStateCache::kStages)
+    {
+        if (g_WorldCache.TextureKnown[stage] && (g_WorldCache.Texture[stage] == texture))
+            return;
+
+        g_WorldCache.Texture[stage] = texture;
+        g_WorldCache.TextureKnown[stage] = true;
+    }
+
+    device->SetTexture(stage, texture);
+}
+
+void agiDX9ForgetTexture(IDirect3DTexture9* texture)
+{
+    for (u32 stage = 0; stage < agiDX9WorldStateCache::kStages; ++stage)
+    {
+        if (g_WorldCache.TextureKnown[stage] && (g_WorldCache.Texture[stage] == texture))
+            g_WorldCache.TextureKnown[stage] = false;
+    }
 }
 
 static void WorldSetTextureStageState(IDirect3DDevice9* device, DWORD stage, D3DTEXTURESTAGESTATETYPE type, DWORD value)
@@ -1534,7 +1609,7 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
 
     IDirect3DDevice9* device = Pipe()->Context()->GetDevice();
 
-    device->SetTexture(0, current_texture_);
+    WorldSetTexture(device, 0, current_texture_);
     WorldSetFVF(device, kScreenVtxFVF);
 
     // See IsAdditiveGlow(). Only touched for glow draws, so ordinary geometry pays nothing.
@@ -2188,7 +2263,7 @@ void agiDX9Rasterizer::RestoreStateAfterWorldDraw(bool remap_vertex_fog)
     agiDX9TexDef* restore_tex = static_cast<agiDX9TexDef*>(agiLastState.Texture);
     IDirect3DTexture9* restore_handle = restore_tex ? restore_tex->GetHandle() : nullptr;
 
-    device->SetTexture(0, restore_handle);
+    WorldSetTexture(device, 0, restore_handle);
     current_texture_ = restore_handle;
 
     // Sampler filter *and address* state is global to stage 0, and agiDX9TexDef::SetFilters()
@@ -2491,7 +2566,7 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     agiDX9TexDef* native_tex = static_cast<agiDX9TexDef*>(agiCurState.GetTexture());
     IDirect3DTexture9* native_handle = native_tex ? native_tex->GetHandle() : nullptr;
 
-    device->SetTexture(0, native_handle);
+    WorldSetTexture(device, 0, native_handle);
 
     if (native_handle)
     {

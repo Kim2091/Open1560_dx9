@@ -25,6 +25,7 @@
 #include "vector7/vector2.h"
 
 #include "dx9context.h"
+#include "dx9rsys.h" // agiDX9ForgetTexture
 
 #include "dx9_windows.h"
 
@@ -322,6 +323,12 @@ void agiDX9TexDef::EndGfx()
 {
     if (texture_)
     {
+        // Before the Release, not after. The stage-binding cache in dx9rsys.cpp compares raw
+        // pointers, and D3D9 is free to hand this exact address back out for the next texture
+        // created - at which point a surviving entry would report the new texture as already bound
+        // and skip the SetTexture that would have bound it.
+        agiDX9ForgetTexture(texture_);
+
         texture_->Release();
         texture_ = nullptr;
     }
@@ -347,11 +354,25 @@ void agiDX9TexDef::Set(Vector2& arg1, Vector2& arg2)
 // texture A as POINT, then texture B whose own cache still reads LINEAR from its BeginGfx(), and B
 // skips the call and silently rasterises with A's POINT filter. Tracking the device's actual last
 // applied values fixes that, and lets address mode be handled the same way.
+//
+// It also has to be dropped whenever the device is reset, for the same reason: a Reset() puts every
+// sampler back to the D3D9 defaults (POINT/POINT/NONE, WRAP/WRAP) while these still describe the
+// device as it was before, so every call they would have made is skipped and the whole scene
+// silently renders point-filtered and wrapping. See agiDX9InvalidateSamplerCache() below.
 static u32 LastMinFilter = ~0u;
 static u32 LastMagFilter = ~0u;
 static u32 LastMipFilter = ~0u;
 static u32 LastAddressU = ~0u;
 static u32 LastAddressV = ~0u;
+
+void agiDX9InvalidateSamplerCache()
+{
+    LastMinFilter = ~0u;
+    LastMagFilter = ~0u;
+    LastMipFilter = ~0u;
+    LastAddressU = ~0u;
+    LastAddressV = ~0u;
+}
 
 void agiDX9TexDef::SetFilters(u32 min, u32 mag, u32 mip)
 {

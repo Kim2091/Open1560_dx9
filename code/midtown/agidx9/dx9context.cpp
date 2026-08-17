@@ -18,6 +18,7 @@
 
 #include "dx9context.h"
 
+#include "dx9rsys.h"
 #include "dx9target.h"
 
 #include "dx9_windows.h"
@@ -344,6 +345,9 @@ void agiDX9Context::CreateDevice()
 
     if (FAILED(hr))
         Quitf("IDirect3D9::CreateDevice failed, code %x", static_cast<u32>(hr));
+
+    // A brand new device holds nothing any mirror in agidx9 remembers. See agiDX9OnDeviceReset().
+    agiDX9OnDeviceReset(device_);
 }
 
 void agiDX9Context::ReleaseDevice()
@@ -393,6 +397,12 @@ bool agiDX9Context::ResetDevice()
 
     if (!agiDX9RestoreDefaultPoolResources(device_))
         Warningf("D3D9: some default-pool resources could not be recreated after Reset");
+
+    // Reset() returned every render state, sampler, transform, light and material to its D3D9
+    // default. Say so, before anything draws through a cache that still describes the device as it
+    // was - a mirror that has not heard about a reset SUPPRESSES the writes that would repair it.
+    // See agiDX9OnDeviceReset().
+    agiDX9OnDeviceReset(device_);
 
     return true;
 }

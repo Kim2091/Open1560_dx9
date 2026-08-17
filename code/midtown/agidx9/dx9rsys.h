@@ -31,6 +31,7 @@ extern mem::cmd_param PARAM_d3d9_legacydepth;
 class Matrix34;
 class agiViewParameters;
 struct IDirect3DTexture9;
+struct IDirect3DDevice9;
 
 // Per-frame tally of how geometry reaches the device. "World" submissions are model-space vertices
 // plus real SetTransform(WORLD/VIEW/PROJECTION) calls - the only kind RTX Remix can reconstruct a
@@ -94,6 +95,31 @@ void agiDX9InvalidateLightCache();
 // has to say so here - otherwise the cache keeps answering for a value the device no longer holds
 // and the next write that matches it is skipped. See agiDX9WorldStateCache for the full argument.
 void agiDX9InvalidateStateCache();
+
+// Drops one texture from the stage-binding cache. Call before releasing an IDirect3DTexture9: the
+// cache compares raw pointers, and a freed allocation can be handed straight back out for the next
+// texture, at which point a stale entry would report the new texture as already bound and skip the
+// SetTexture that would have bound it.
+void agiDX9ForgetTexture(IDirect3DTexture9* texture);
+
+// EVERY MIRROR THIS BACKEND KEEPS OF DEVICE STATE, DROPPED IN ONE CALL. Call it immediately after
+// any IDirect3DDevice9::Reset() or CreateDevice().
+//
+// A Reset() puts render states, texture stage states, sampler states, transforms, lights and
+// materials all back to the D3D9 defaults, and every cache here is a "have I already sent this?"
+// mirror whose entire purpose is to SKIP the call when it believes the device already agrees. So a
+// reset the mirrors do not hear about does not merely make them stale - it makes them suppress
+// exactly the writes that would have repaired the device, and the state stays wrong until something
+// asks for a different value by chance.
+//
+// The paths that reset are not rare: the menu <-> race transition resets the parked device
+// (agiDX9Pipeline::EndGfx), agiDX9Context::Resize resets it, and a lost device recovered in
+// BeginFrame() resets it mid-session with no BeginGfx() following to put anything back. What it
+// looked like: D3DRS_LIGHTING defaults to TRUE and D3DRS_DITHERENABLE to FALSE, samplers default to
+// POINT with WRAP addressing - so after one alt-tab in a race, or on the way back into the menus,
+// the scene renders point-filtered with clamped textures tiling, and the three render states
+// BeginGfx() writes are dropped because the cache still holds the values it wrote to the old device.
+void agiDX9OnDeviceReset(IDirect3DDevice9* device);
 
 class agiDX9Rasterizer final : public agiRasterizer
 {

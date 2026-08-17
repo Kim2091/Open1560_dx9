@@ -26,6 +26,13 @@
 
 struct IDirect3DTexture9;
 
+// Forget what stage 0's sampler state was last set to. Sampler state is global to the device and
+// SetFilters() only issues a call when the value it wants differs from what it last wrote - so
+// after a device Reset(), which returns every sampler to the D3D9 defaults (POINT/NONE/WRAP), the
+// mirror describes a device that no longer exists and every write it would have made is skipped.
+// Called from agiDX9OnDeviceReset() (dx9rsys.h), which is the one place that knows a reset happened.
+void agiDX9InvalidateSamplerCache();
+
 class agiDX9TexDef final : public agiTexDef
 {
 public:
