@@ -1066,11 +1066,35 @@ void agiDX9Rasterizer::FlushState()
 
     if (texture != agiLastState.Texture)
     {
-        agiLastState.Texture = texture;
-
         if (texture)
         {
-            if (IDirect3DTexture9* handle = texture->GetHandle(); handle != current_texture_)
+            IDirect3DTexture9* handle = texture->GetHandle();
+
+            // NOT-YET-RESIDENT IS A TRANSIENT, NOT A BINDING - and recording it as one latches the
+            // texture black for the rest of the process.
+            //
+            // agiDX9TexDef::GetHandle() legitimately returns null while a texture is still paging
+            // in: it kicks off PageInSurface() and answers null for that call. This used to write
+            // agiLastState.Texture = texture *before* asking, so a null answer left the pair in an
+            // impossible state - agiLastState saying "this texture is bound", current_texture_
+            // saying "nothing is bound". DrawMesh() then dropped the draw on its null-texture guard,
+            // and because agiLastState now matched, EVERY following flush took the `texture ==
+            // agiLastState.Texture` fast path and never called GetHandle() again. One unlucky frame
+            // and that bitmap never drew again.
+            //
+            // That is the black menu art. It hits large background bitmaps rather than small widget
+            // art because they are the ones still paging when first bound, and it explains why the
+            // art "came back" whenever something else was drawn between two bitmaps - an
+            // intervening texture moved agiLastState.Texture, so the next bind was forced to
+            // re-resolve. The world path never showed it because MeshWorld() calls GetHandle()
+            // afresh on every draw and so heals itself.
+            //
+            // Recording null instead means the next flush sees a difference again and retries, which
+            // is what "not ready yet" should do. The draw for this frame is still dropped - that is
+            // correct, there is nothing to draw with - but it is dropped once instead of forever.
+            agiLastState.Texture = handle ? texture : nullptr;
+
+            if (handle != current_texture_)
             {
                 current_texture_ = handle;
 
@@ -1085,6 +1109,7 @@ void agiDX9Rasterizer::FlushState()
         }
         else
         {
+            agiLastState.Texture = nullptr;
             current_texture_ = nullptr;
         }
     }
@@ -1302,6 +1327,14 @@ struct agiDX9NameTally
 static agiDX9NameTally g_GHashChurnBy {};
 static agiDX9NameTally g_ScreenInSceneBy {};
 
+// Screen draws thrown away by DrawMesh()'s null-texture guard, named by the texture that was asked
+// for. A draw that never reaches the device is invisible in every other count here - the census
+// tallies what was submitted - so a bitmap silently failing to appear left no trace at all. This is
+// the line to look at first when menu or HUD art is missing: if the missing image is named here, it
+// asked for a texture that was not resident, and the answer is in GetHandle()/paging rather than
+// anywhere in the draw path.
+static agiDX9NameTally g_ScreenDroppedNoTex {};
+
 static void agiDX9TallyAdd(agiDX9NameTally& tally, const char* name)
 {
     if (!name || !*name)
@@ -1369,9 +1402,11 @@ void agiDX9DumpAttribution()
     // actually recognise in a capture.
     agiDX9TallyDump("DX9 GHASH CHURN BY TEXTURE:", g_GHashChurnBy);
     agiDX9TallyDump("DX9 IN-SCENE SCREEN DRAWS BY TEXTURE:", g_ScreenInSceneBy);
+    agiDX9TallyDump("DX9 SCREEN DRAWS DROPPED, NO TEXTURE:", g_ScreenDroppedNoTex);
 
     g_GHashChurnBy = {};
     g_ScreenInSceneBy = {};
+    g_ScreenDroppedNoTex = {};
 }
 
 u32 agiDX9GHashTableUsed()
@@ -1576,7 +1611,15 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
     FlushState();
 
     if ((current_texture_ == nullptr) && (tex_env_ != agiTexEnv::Disable))
+    {
+        // Name what was thrown away. See g_ScreenDroppedNoTex - a dropped draw is invisible to every
+        // other counter in the census, so missing art used to leave no evidence anywhere.
+        agiDX9TexDef* wanted = static_cast<agiDX9TexDef*>(agiCurState.GetTexture());
+
+        agiDX9TallyAdd(g_ScreenDroppedNoTex, wanted ? wanted->Tex.Name : nullptr);
+
         return;
+    }
 
     ARTS_UTIMED(agiRasterization);
     ++STATS.GeomCalls;
