@@ -2758,22 +2758,42 @@ bool agiDX9Rasterizer::MeshWorld(agiWorldVtx* vertices, i32 vertex_count, u16* i
     bool fog_enable = (agiLastState.FogMode != agiFogMode::None) && !additive_glow;
     const bool want_fog_table = remap_vertex_fog && !additive_glow && (agiMeshSet::FogValue > 0.0f);
 
-    if (want_fog_table)
+    // D3DRS_FOGTABLEMODE IS ONLY THIS PATH'S TO WRITE WHILE IT IS REMAPPING VERTEX FOG. Outside
+    // that, FlushState() owns it and has already programmed it for the fog mode actually in use.
+    //
+    // Writing it unconditionally is what turned the whole city into a flat sheet of fog colour.
+    // agiFogMode::Pixel is the normal mode here (agisdl/sdlsetup.cpp sets the SpecialFlags bit that
+    // makes mmCullCity::Cull select it), and for Pixel this is not a remap - so an unconditional
+    // write put D3DFOG_NONE over the D3DFOG_LINEAR that FlushState had just set. With FOGVERTEXMODE
+    // also NONE and FOGENABLE on, "both modes NONE" means something specific in D3D9: take the fog
+    // factor from the vertex specular alpha. This path's FVF is XYZ|NORMAL|DIFFUSE|TEX1 - agiWorldVtx
+    // carries no specular at all - so every vertex read a factor of 0 and every world pixel came out
+    // 100% fog colour. The HUD, text and minimap were untouched, because agiScreenVtx does carry
+    // specular and the screen path never comes through here.
+    if (remap_vertex_fog)
     {
-        constexpr f32 kFogStart = 1.0f;
-        const f32 fog_end = 255.0f / agiMeshSet::FogValue;
+        if (want_fog_table)
+        {
+            constexpr f32 kFogStart = 1.0f;
+            const f32 fog_end = 255.0f / agiMeshSet::FogValue;
 
-        WorldSetRenderState(device, D3DRS_FOGSTART, *reinterpret_cast<const DWORD*>(&kFogStart));
-        WorldSetRenderState(device, D3DRS_FOGEND, *reinterpret_cast<const DWORD*>(&fog_end));
-    }
-    else if (remap_vertex_fog && !additive_glow)
-    {
-        // No usable range to rebuild the ramp from - drawing unfogged is a far smaller error than
-        // drawing in solid fog colour.
-        fog_enable = false;
+            WorldSetRenderState(device, D3DRS_FOGSTART, *reinterpret_cast<const DWORD*>(&kFogStart));
+            WorldSetRenderState(device, D3DRS_FOGEND, *reinterpret_cast<const DWORD*>(&fog_end));
+            WorldSetRenderState(device, D3DRS_FOGTABLEMODE, D3DFOG_LINEAR);
+        }
+        else
+        {
+            // Either an additive glow, which wants no fog at all, or no usable range to rebuild the
+            // ramp from - and drawing unfogged is a far smaller error than drawing in solid fog
+            // colour. Put the table mode back to what the screen path expects for vertex fog either
+            // way, so a following draw in this same run does not inherit the branch above.
+            WorldSetRenderState(device, D3DRS_FOGTABLEMODE, D3DFOG_NONE);
+
+            if (!additive_glow)
+                fog_enable = false;
+        }
     }
 
-    WorldSetRenderState(device, D3DRS_FOGTABLEMODE, want_fog_table ? D3DFOG_LINEAR : D3DFOG_NONE);
     WorldSetRenderState(device, D3DRS_FOGENABLE, fog_enable ? TRUE : FALSE);
 
     D3DMATRIX world_mat = ToD3DMatrix(world);
