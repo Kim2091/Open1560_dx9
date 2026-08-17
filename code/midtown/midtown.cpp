@@ -894,9 +894,11 @@ static void ApplicationHelper(i32 argc, char** argv)
 #undef ARG
 #undef ARGN
 
-// -menu640. Puts the menu pipeline back on the fixed 640x480 it used to be built at, which is what
-// the original game did and what every menu asset was authored for. See the note in CreatePipeline.
-static mem::cmd_param PARAM_menu640 {"menu640", "Run the menus at a fixed 640x480 pipeline"};
+// -menunative. Composes the menu at the selected display resolution instead of at the fixed 640x480
+// the menu system is built around. Off by default because the menu system is NOT resolution
+// independent - see the note in CreatePipeline for what breaks.
+static mem::cmd_param PARAM_menu_native {
+    "menunative", "Compose the menus at the selected resolution (see the note in CreatePipeline)"};
 
 // Builds the pipeline at the renderer's selected mode, with -width/-height taking precedence. When
 // no mode has been detected the backend keeps whatever it chose for itself in its own Init().
@@ -954,39 +956,44 @@ Ptr<agiPipeline> CreatePipeline(i32 argc, char** argv)
             default: Quitf("Unknown renderer type %i", static_cast<int>(info.Type));
         }
 
-        // The menus get the selected resolution too, the same way gameplay does.
+        // THE MENU PIPELINE IS 640x480, AND THAT IS DELIBERATE. Do not "fix" it to the selected
+        // resolution; that was tried (see below) and it is what broke the menus.
         //
-        // This used to be an unconditional SetRes(640, 480) - not the selected mode, and not even
-        // -width/-height, which the branch above has always honoured. That is why the menus ran at
-        // 640x480 no matter what the game was set to, and why the pipeline is torn down and rebuilt
-        // on every transition between the menus and a race (the two ResetSwapChain entries per race
-        // in a Remix log, and the paired "Window Resolution"/"UI Position" entries in Open1560.log).
+        // The menu system is not resolution independent. Only *some* of it scales with the pipeline
+        // size: menu geometry is normalised against UI_ScaleX/UI_StartX (MenuManager::GetScale) and
+        // backgrounds are requested as a fraction of the UI area, so those grow. Everything sized in
+        // pixels does not - widget art, slider and scrollbar furniture, and above all the bitmap
+        // fonts, which PUMenuBase asks for at a hardcoded 24 or 32 points. Compose at 1366x768 and
+        // the background fills the screen while the buttons, sliders and text stay the size they
+        // were at 640x480, sitting small in the middle of it. Resampling every background up to the
+        // UI area also puts art through agiSurfaceDesc::Reload's scaler at sizes it was never asked
+        // for before, which is the likeliest source of the black menu backgrounds reported with it.
         //
-        // It is not the reason the menus rendered into a corner of the screen - agiDX9Pipeline's
-        // presentation transform covers that, and covers it at any resolution, including the menu
-        // resolution this now stops being. What this changes is that the menu is *composed* at the
-        // display's resolution instead of upscaled from 640x480, so its art is resampled to size
-        // (agiBitmap::Init resolves a scale of 1.0 against UI_Width) rather than magnified.
+        // The way this is meant to work is the way agigl does it, and the answer is not here at all
+        // - it is in presentation. agigl composes the whole frame in the pipeline's 640x480 logical
+        // space and normalises every screen vertex against GetWidth()/GetHeight() (glrsys.cpp
+        // ~286), so the GL viewport magnifies the finished frame to blit_width_ x blit_height_ and
+        // the entire menu - background, widgets, fonts, the showroom viewport - scales as one image
+        // with the 4:3 pillarbox intact. Rasterisation still happens at native pixel density, so
+        // this is not a 640x480 image stretched; only the layout is 640x480.
         //
-        // Everything downstream is already resolution-independent and was only ever exercised at
-        // one resolution: menu geometry is normalised against UI_ScaleX/UI_StartX
-        // (MenuManager::GetScale), backgrounds and widgets are placed relative to
-        // PUMenuBase::menu_width_, and the event handler's mouse coordinates are normalised through
-        // its own scale_x_, so none of it is tied to 640x480. The assets are - they are 4:3 art from
-        // 1999 - which is what agiPipeline::BeginAllGfx's pillarbox is for: at 1920x1080 the UI area
-        // becomes 1440x1080 at x=240, and the aspect ratio is preserved.
+        // agidx9 has the same thing: agiDX9Pipeline's presentation transform maps logical pixels
+        // onto the blit rect for screen vertices (dx9rsys.cpp) and viewport rectangles (dx9view.cpp).
+        // See the PRESENTATION TRANSFORM note in dx9pipe.h. It is the identity while the pipeline
+        // matches the window, which is exactly why composing the menu at the display resolution
+        // bypassed it and left the scaling to a menu system that cannot do it.
         //
-        // -menu640 restores the old fixed size.
-        if (PARAM_menu640.get_or(false))
-            pipe->SetRes(640, 480);
-        else
+        // -menunative opts back into composing at the selected resolution, with the above intact.
+        if (PARAM_menu_native.get_or(false))
             ResolvePipelineRes(info, pipe.get());
+        else
+            pipe->SetRes(640, 480);
 
         if (pipe->Validate())
         {
-            // Retry at 640x480 before giving up. The old code could not fail this way - it only ever
-            // asked for 640x480, which every device supports - so a mode that validates for gameplay
-            // but not here must not become a dead end at the main menu.
+            // Retry at 640x480 before giving up. Only reachable under -menunative, which is the one
+            // way this branch asks for a mode that a device might refuse; a mode that validates for
+            // gameplay but not here must not become a dead end at the main menu.
             pipe->SetRes(640, 480);
 
             if (pipe->Validate())

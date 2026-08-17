@@ -31,27 +31,28 @@ PUMenuBase::PUMenuBase(
 {
     if (background)
     {
-        // Both branches ask for the background at the size of the UI area, which is what makes a
-        // menu fill the screen once the pipeline is not fixed at 640x480 any more.
-        //
         // The scale arguments are a FRACTION OF THE UI AREA, not of the window: agiBitmap::Init
         // resolves 1.0 as UI_Width/UI_Height and reloads the image resampled to that, while 0.0
-        // means "keep the file's own size". The flat branch passed 0.0, so its background stayed
-        // 640x480 while the widgets over it were placed against UI_ScaleX/UI_StartX
-        // (MenuManager::GetScale) across the whole UI area - a 640x480 picture centred under
-        // full-size controls.
+        // means "keep the file's own size". At the 640x480 menu pipeline that CreatePipeline()
+        // builds, the UI area *is* the file's own size, so the two say the same thing and the flat
+        // branch keeps the original's request.
         //
-        // That mismatch could not show while CreatePipeline() (midtown.cpp) pinned the menu
-        // pipeline to 640x480, because then UI_Width was 640 and the two arguments meant the same
-        // thing. It becomes visible the moment the menus run at the display resolution, which is
-        // why this belongs with that change and not before it.
-        //
-        // The art is resampled up rather than redrawn, so it is softer than it was at 640x480. That
-        // is inherent in 4:3 assets from 1999, and it is a resample of the source image rather than
-        // the nearest-neighbour magnification of a whole 640x480 frame that it replaces.
-        const i32 flags = MenuMgr()->Is3D() ? 0 : BITMAP_TRANSPARENT;
-
-        bg_bitmap_ = as_rc Pipe()->GetBitmap(background, 1.0f, 1.0f, flags);
+        // Asking for 1.0 here instead was tried, to make a flat menu fill a menu pipeline built at
+        // the display resolution. It is not the fix for that - the widgets and fonts over the
+        // background do not scale with it (see CreatePipeline) - and it pushes every menu
+        // background through agiSurfaceDesc::Reload's resampler at sizes it was never asked for
+        // before, which is the likeliest source of the black menu backgrounds reported alongside
+        // it (Reload is closed original code, so this is inference from when it started rather than
+        // a read of the scaler). Scaling the menu is presentation's job: agigl magnifies the 640x480
+        // frame through its viewport, and agidx9 through the presentation transform in dx9pipe.h.
+        if (MenuMgr()->Is3D())
+        {
+            bg_bitmap_ = as_rc Pipe()->GetBitmap(background, 1.0f, 1.0f, 0);
+        }
+        else
+        {
+            bg_bitmap_ = as_rc Pipe()->GetBitmap(background, 0.0f, 0.0f, BITMAP_TRANSPARENT);
+        }
 
         if (!bg_bitmap_)
         {
