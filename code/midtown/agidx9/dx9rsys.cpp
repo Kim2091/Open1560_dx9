@@ -1335,6 +1335,21 @@ static agiDX9NameTally g_ScreenInSceneBy {};
 // anywhere in the draw path.
 static agiDX9NameTally g_ScreenDroppedNoTex {};
 
+// Every screen-space draw that DOES reach the device, named by texture, and the companion to the
+// tally above: between them, a menu image is either dropped, submitted, or never asked for at all,
+// and those are three different bugs with three different places to look.
+//
+// This is what the dropped-draw tally could not answer on its own. A run of the black-background
+// menus produced no dropped draws whatsoever, which proves the guard is not eating them but says
+// nothing about whether the background was ever submitted - the census counts triangles, and one
+// quad looks like any other. Naming them separates "submitted and rendering black" (a texture,
+// blend or stage-state problem) from "never submitted" (the menu code never asked), and only the
+// first of those is the renderer's.
+//
+// Capped at 24 names like the others, so a race - where the HUD, text and minimap all come through
+// here - reports the busiest and then a "(+more)".
+static agiDX9NameTally g_ScreenDrawsBy {};
+
 static void agiDX9TallyAdd(agiDX9NameTally& tally, const char* name)
 {
     if (!name || !*name)
@@ -1403,10 +1418,12 @@ void agiDX9DumpAttribution()
     agiDX9TallyDump("DX9 GHASH CHURN BY TEXTURE:", g_GHashChurnBy);
     agiDX9TallyDump("DX9 IN-SCENE SCREEN DRAWS BY TEXTURE:", g_ScreenInSceneBy);
     agiDX9TallyDump("DX9 SCREEN DRAWS DROPPED, NO TEXTURE:", g_ScreenDroppedNoTex);
+    agiDX9TallyDump("DX9 SCREEN DRAWS SUBMITTED BY TEXTURE:", g_ScreenDrawsBy);
 
     g_GHashChurnBy = {};
     g_ScreenInSceneBy = {};
     g_ScreenDroppedNoTex = {};
+    g_ScreenDrawsBy = {};
 }
 
 u32 agiDX9GHashTableUsed()
@@ -1623,6 +1640,15 @@ void agiDX9Rasterizer::DrawMesh(u32 prim_type, agiVtx* vertices, i32 vertex_coun
 
     ARTS_UTIMED(agiRasterization);
     ++STATS.GeomCalls;
+
+    // Name what does reach the device. See g_ScreenDrawsBy - the counterpart to the dropped tally
+    // above, and the only way to tell a menu image that renders black from one that was never
+    // submitted at all.
+    {
+        agiDX9TexDef* submitted = static_cast<agiDX9TexDef*>(agiCurState.GetTexture());
+
+        agiDX9TallyAdd(g_ScreenDrawsBy, submitted ? submitted->Tex.Name : nullptr);
+    }
 
     if (prim_type == D3DPT_LINELIST)
     {
