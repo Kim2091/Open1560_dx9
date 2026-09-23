@@ -523,8 +523,9 @@ static void ApplyConfigOverrides()
 // filled identifies the layout exactly. Each bridge fills a fixed set of named fields (read from
 // their src/client/remix_api.cpp), and those land in a different set of slots in each layout.
 //
-// Anything else is refused rather than guessed at. A future bridge that forwards more functions will
-// land here until its layout is added below - the log line gives its filled-slot mask to do that.
+// A bridge built on the current layout that forwards MORE of it is accepted as that layout - see the
+// end of IdentifyBridge. Anything else is refused rather than guessed at, and the log line gives its
+// filled-slot mask so its layout can be added below.
 namespace
 {
     using AnyFn = void(REMIXAPI_PTR*)();
@@ -604,15 +605,34 @@ static const BridgeLayout* IdentifyBridge(const AnyFn (&slots)[kMaxSlots])
             return &layout;
     }
 
+    // A newer build of the current layout: Remix Plus keeps adding bridge forwarding for functions its
+    // header already declares (texture creation, first seen as slots 15 and 16), which fills more of
+    // the same table without moving anything. So for the layout of the vendored header alone, every
+    // slot it fills must still be filled and anything extra is accepted. A bridge that INSERTED a
+    // function instead would shift every slot after it, which breaks this pattern and is refused.
+    const BridgeLayout& current = kBridgeLayouts[ARTS_SIZE(kBridgeLayouts) - 1];
+
+    if ((filled & current.FilledSlots) == current.FilledSlots)
+        return &current;
+
     return nullptr;
 }
 
 void agiDX9RemixApiInit()
 {
-    if (s_init_tried || !PARAM_remixapi.get_or(false))
+    if (s_init_tried)
         return;
 
     s_init_tried = true;
+
+    // Off is the default, so say so: otherwise a game running under Remix with the API switched off
+    // looks exactly like one where the API is broken - no lights, no sky, and nothing in the log.
+    if (!PARAM_remixapi.get_or(false))
+    {
+        Displayf("Remix API: off. Set remixapi = 1 in the [RemixAPI] section of Open1560_RemixAPI.ini (or pass "
+                 "-remixapi) to send lights and drive the Remix Plus sky.");
+        return;
+    }
 
     // The module Direct3DCreate9 came from first. Then the names the bridge client can be loaded
     // under, which covers a chaining proxy: a d3d9.dll that loads Remix behind itself has no Remix
@@ -705,6 +725,17 @@ void agiDX9RemixApiInit()
     agiGlowHarvestEnabled = true;
 
     Displayf("Remix API: connected through the %s", layout->Name);
+
+    u64 filled = 0;
+
+    for (u32 i = 0; i < kFilledSlotCount; ++i)
+        filled |= slots[i] ? (1ull << i) : 0ull;
+
+    if (const u64 extra = filled & ~layout->FilledSlots)
+    {
+        Displayf("Remix API: this bridge also forwards interface slots %08X%08X, which this game does not use",
+            static_cast<u32>(extra >> 32), static_cast<u32>(extra));
+    }
 
     ApplyConfigOverrides();
 }
