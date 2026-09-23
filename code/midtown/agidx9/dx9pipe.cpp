@@ -29,6 +29,7 @@
 #include "agiworld/cardworld.h"
 #include "agiworld/glowlight.h"
 #include "agiworld/meshrend.h"
+#include "agiworld/skyenv.h"
 #include "data7/utimer.h"
 #include "eventq7/active.h"
 #include "pcwindis/dxinit.h"
@@ -36,6 +37,8 @@
 
 #include "dx9bitmap.h"
 #include "dx9context.h"
+#include "dx9remix.h"
+#include "dx9remixsky.h"
 #include "dx9rsys.h"
 #include "dx9texdef.h"
 #include "dx9view.h"
@@ -91,6 +94,11 @@ i32 agiDX9Pipeline::BeginGfx()
         !dxiIsFullScreen(), (device_flags_1_ & 0x1) != 0, s_parked_device);
 
     s_parked_device = nullptr;
+
+    // The Remix API, once per process and only with -remixapi. Here rather than earlier because the
+    // bridge binds API calls to the most recently created D3D9 device, so one has to exist first.
+    // Before any texture is created, so every glow texture gets its colour grid (dx9texdef.cpp).
+    agiDX9RemixApiInit();
 
     screen_format_ = agiSurfaceDesc::FromFormat(PixelFormat_A8R8G8B8);
     opaque_format_ = agiSurfaceDesc::FromFormat(PixelFormat_X8R8G8B8);
@@ -248,7 +256,19 @@ void agiDX9Pipeline::EndGfx()
     // d3d9shaders = 1.
     //
     // Both describe a city that no longer exists, so clearing them loses nothing.
+    //
+    // The Remix API's lights go first, for the same reason: they are the runtime's copies of the
+    // glow registry's entries. Destroying them here, while the parked device keeps the bridge alive,
+    // is what stops the last race's street lamps lighting the menu.
+    agiDX9RemixApiReleaseAll();
     agiResetGlowLights();
+
+    // The race's time and weather belong to the city too (agiworld/skyenv.h). The next city
+    // publishes its own; until then the Remix sky has nothing to drive, and gives the player's
+    // "Textured Sky" setting back.
+    agiSkyEnv.TimeOfDay = -1;
+    agiSkyEnv.Weather = -1;
+    agiDX9RemixSkyEndGfx();
 
     // Same hazard, same reason: this borrows mmCullCity's sphere map, and the arena reset frees the
     // whole city underneath it. mmCullCity::Cull() republishes it for the next city.
@@ -285,9 +305,16 @@ void agiDX9Pipeline::BeginFrame()
 {
     ARTS_UTIMED(agiBeginFrame);
 
-    // Not calling agiUpdateGlowLights() - Pathway B is unwired (see BeginGfx), nothing harvests
-    // into the registry any more, and ageing an empty set every frame is pure cost. The teardown
-    // reset in EndGfx() is kept regardless, because it is a safety net rather than an optimisation.
+    // Age the live light set and retire lights whose sprite has not been drawn recently. See
+    // agiworld/glowlight.h - lights persist across frames rather than being rebuilt, so a momentary
+    // culling or LOD hiccup does not make them blink out. Only while something harvests into it
+    // (the Remix API); otherwise the set is empty and ageing it is pure cost.
+    if (agiGlowHarvestEnabled)
+        agiUpdateGlowLights();
+
+    // Keeps the game's sky dome off while RTX Remix Plus draws the sky. See dx9remixsky.cpp.
+    agiDX9RemixSkyBeginFrame();
+
     agiPipeline::BeginFrame();
 
     if (!dx9_context_->BeginFrame())
@@ -447,6 +474,12 @@ void agiDX9Pipeline::EndFrame()
     if (std::exchange(d3d_scene_active_, false))
         device->EndScene();
 
+    // Remix API lights for this frame. After every draw, so each glow drawn this frame has already
+    // refreshed its registry slot and is sent where it is now rather than where it was last frame;
+    // before Present, because Present is where Remix ends the frame and clears its drawn lights.
+    agiDX9RemixApiSubmitFrame();
+    agiDX9RemixSkyEndFrame();
+
     dx9_context_->Present();
 
     // Submission census. Reports how much of the frame actually went out as world-space geometry
@@ -504,6 +537,7 @@ void agiDX9Pipeline::EndFrame()
             }
 
             agiDX9DumpAttribution();
+            agiDX9RemixApiLogStats(census_frames);
         }
 
         agiDX9Census = {};

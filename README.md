@@ -130,19 +130,96 @@ These act on the world-space path, so they apply to this backend only.
 | `-d3d9nostatecache` | off | Send every render state, transform, texture binding, light and material to the device even when unchanged. Diagnostic: if the picture changes with it on, something is writing the device behind the state filter. |
 | `-d3d9attribution` | off | Name screen draws by texture in the periodic census log (dropped, submitted, in-scene). Costs a string search per screen draw, so it is off unless you are chasing a missing or CPU-pretransformed surface. |
 
+**RTX Remix API**
+
+The game's street lamps, traffic signals and vehicle lights are glow sprites that light nothing in
+the original. With `-remixapi`, each one is sent to Remix as a real light through the Remix API.
+This works with NVIDIA's RTX Remix bridge and with
+[Remix Plus](https://github.com/RemixProjGroup/dxvk-remix), and needs `exposeRemixApi = True` in
+`bridge.conf` (in the `.trex` folder next to the game's `d3d9.dll`); without that line the bridge
+refuses and the log says so. The log also names which bridge it found. The design, what each bridge
+does and does not forward to a 32-bit game, and the phases still to come are in
+[docs/remix_api_plan.md](docs/remix_api_plan.md).
+
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `-remixapi` | off | Connect to the Remix API and send glow lights. |
+| `-remixlightpower <f>` | 1.5 | Overall brightness of those lights. The `-light*` multipliers below scale on top of it. |
+| `-remixlightradius <f>` | 0.15 | Size of each light's emitter, in world units. Brightness does not depend on it; it sets how soft the shadows are. |
+| `-remixmaxlights <n>` | 192 | Most lights sent per frame; the brightest are kept. |
+| `-remixheadlights` | on | Send headlights as spot lights: one per lamp, placed at the lamp and aimed down the beam the game draws. |
+| `-remixbeamsoftness <f>` | 0.3 | How gradual a headlight beam's edge is, 0 (hard) to 1. |
+| `-remixconfig <k=v\|...>` | none | Remix options (`rtx.conf` keys) applied once the API connects, separated by `\|`, e.g. `rtx.fallbackLightMode=0`. |
+| `-remixapidebug` | off | Log the first 64 lights as they are created. |
+| `-glowheadlights`, `-glowvehiclelights`, `-glowtrafficlights`, `-glowstreetlamps`, `-glowgenericlights` | on | Which kinds of glow emit light at all. |
+| `-lighthead`, `-lightvehicle`, `-lighttraffic`, `-lightlamp`, `-lightgeneric` | 2.0, 1.25, 2.0, 10.0, 1.0 | Per-kind brightness. |
+| `-glowreachscale <f>`, `-glowreachmin <f>` | 14, 20 | Convert a flare's drawn size into how far it throws. Brightness goes with the square of this. |
+| `-glowdebug` | off | Log each glow texture as it is first harvested. |
+
+**RTX Remix Plus sky.** On Remix Plus, the race's time of day and weather also drive its physical
+sky ("Numos"): the sun's position, a moon and stars at night, volumetric clouds, and a weather
+preset per game weather, with fog density matched to the game's own and lightning fired on the
+game's thunder. The game's own sky dome is hidden through its Textured Sky option while this runs,
+and restored afterwards. See [section 9 of the plan](docs/remix_api_plan.md#9-the-remix-plus-sky-phase-8).
+
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `-remixsky <0/1>` | 1 | Drive the Remix Plus sky from the race settings (needs `-remixapi`). |
+| `-remixskyclear`, `-remixskyfog`, `-remixskyrain`, `-remixskysnow` | `clear`, `foggy`, `rainstorm`, `snow` | Weather preset used for each game weather. |
+| `-remixskyfogmatch <0/1>` | 1 | Set each preset's fog density from the game's own fog distances. |
+| `-remixskyfogdensity <f>` | 1.0 | Multiplier on that matched density. |
+| `-remixlightningsync <0/1>` | 1 | Lightning on the game's thunder instead of at random. |
+| `-remixprecipitation <0/1>` | 0 | Remix Plus's own rain and snow. Hide the game's particle textures with Remix's texture tagging if you turn this on. |
+| `-remixsunrotation <f>` | 0 | Degrees added to the sun and moon azimuth. |
+
+A census line, `DX9 REMIXAPI`, reports live lights and how many were created, re-sent and destroyed
+every 120 frames.
+
 **Inert - the unwired programmable path**
 
-These are still registered so an existing `Open1560-Shaders.ini` does not start warning about unknown
-keys, but nothing reads them at runtime: `-d3d9quality`, `-d3d9sun`, `-d3d9reflect`, `-d3d9tonemap`,
+These are still registered so settings carried over from an old `Open1560-Shaders.ini` do not start
+warning about unknown keys, but nothing reads them at runtime: `-d3d9quality`, `-d3d9sun`, `-d3d9reflect`, `-d3d9tonemap`,
 `-d3d9exposure`, `-d3d9heightfog`, `-d3d9flashpower`, `-d3d9glowlights`, `-d3d9glowpower`,
-`-d3d9cellsize`, `-d3d9lightspec`, `-d3d9cellpack`, `-glowheadlights`, `-glowvehiclelights`,
-`-glowtrafficlights`, `-glowstreetlamps`, `-glowgenericlights`, `-glowreachscale`, `-glowreachmin`,
-`-lighthead`, `-lightvehicle`, `-lighttraffic`, `-lightlamp`, `-lightgeneric`, `-glowdebug`.
+`-d3d9cellsize`, `-d3d9lightspec`, `-d3d9cellpack`.
 
-### Open1560-Shaders.ini
+### Open1560_RemixAPI.ini
 
-The renderer writes a fully commented `Open1560-Shaders.ini` next to the executable on first run.
-Every key in it is one of the switches above, applied through the same mechanism - so anything
-tunable on the command line is tunable from the file and vice versa, and the command line wins, which
-lets a setting be overridden for one run without editing the file. Delete it to regenerate it. It
-predates the tables above and covers mostly the inert keys; the tables are the complete set.
+The renderer writes a fully commented `Open1560_RemixAPI.ini` next to the executable on first run,
+organised around what the game sends to Remix: `[RemixAPI]`, `[GlowReach]`, one section per glow
+kind, `[RemixSky]`, `[Geometry]` and `[Debug]`. Keys outside the glow sections are the switches above,
+applied through the same mechanism, so the command line wins and a setting can be overridden for one
+run without editing the file. Delete it to regenerate it.
+
+It replaces `Open1560-Shaders.ini`. On the first run with the new name, any settings in the old file
+are written into the matching lines of the new one: a custom `lightlamp`, for example, becomes the
+`intensity` line of `[Glow.StreetLamps]`. Keys with no line of their own go into a `[Migrated]`
+section at the end. After that the old file is not read, and the log says it can be deleted.
+
+**Glow light sections** give each light a precise position and look. A kind section applies to every
+light of that kind:
+
+| Section | Lights |
+| --- | --- |
+| `[Glow.StreetLamps]` | Warm, unsaturated glows: street lamps and other static lighting |
+| `[Glow.TrafficSignals]` | Pure-hue glows: traffic signals |
+| `[Glow.VehicleLamps]` | Tail and brake lamps (`FXLTGLOWRED`, `FXLTGLOWAMBER`) |
+| `[Glow.Headlights]` | Headlights, as spot lights measured off the beam mesh (`FXLTCONE`) |
+| `[Glow.OtherGlows]` | Neutral whites: reverse lamps, coronas |
+
+A `[Glow:<TEXTURE>]` section, such as `[Glow:FXLTGLOWRED]`, targets every flare drawn with one glow
+texture, whatever kind it sorts into. It inherits its kind's values and overrides only the keys it
+sets. Set `glowdebug = 1` to log each glow texture's name as it is first seen. Up to 64 such sections.
+
+| Key | Meaning |
+| --- | --- |
+| `enabled` | `1`/`0`. In a kind section this is the kind's switch (`glowstreetlamps` and so on; for headlights, `remixheadlights`). |
+| `intensity` | Brightness, on top of `remixlightpower`. In a kind section this is the kind's switch (`lightlamp` and so on). In a texture section it replaces the kind's. |
+| `offset` | `X Y Z` in the object's own space, before it is placed in the world, in engine units (about a metre). X is across, Y is up, and Z runs along the object, with **+Z toward the rear** of a vehicle (vehicles drive toward -Z). An offset on a tail light stays on the lamp however the car turns. |
+| `outward` | `1` makes the X offset point away from the object's centre line, so one value moves both lamps of a pair out (positive) or in (negative). A lamp on the centre line stays put. |
+| `radius` | Size of the emitter, overriding `remixlightradius`. Changes shadow softness, not brightness. |
+| `color` | `R G B` multiplier on the light's colour. |
+| `cone` | Headlights only: the beam's half-angle in degrees. Unset, it is measured off the beam mesh. |
+| `softness` | Headlights only: how gradual the beam's edge is, `0` (hard) to `1`. |
+
+Offsets exist because the light starts at the centre of the flare, and the flare is drawn on the lamp:
+a path-traced light there can end up inside the car body or the lamp housing, which shadows it.
