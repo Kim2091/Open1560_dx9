@@ -109,18 +109,25 @@ easy to trip over.
    `agiDX9Pipeline::BeginGfx`, after the context exists. The device is parked, not destroyed,
    across pipeline restarts, so the binding survives going from the menu into a race.
 6. **Every `CreateLight` mints a new bridge handle; only `DestroyLight` frees it.** The server keeps
-   a map from bridge handle to runtime handle. So:
-   - Updating a light by calling `CreateLight` again with the same hash would leak one server-side
-     map entry per call: at 50 moving lights and 60 fps, 3,000 entries a second for the whole
-     session. An update is therefore **destroy, then create**.
-   - **The re-created light needs a new hash.** Remix Plus does not destroy immediately: it queues
-     the erase, by hash, for the start of the next frame. A light re-created under the same hash
-     would be wiped a frame later, and every moving light would go dark. Each light's hash carries
-     a generation that is bumped on every re-send (`LightHash` in `dx9remix.cpp`), so the old
-     light's erase never touches its successor, on either runtime.
-   - The cost: each re-send is a new light to the runtime, so the denoiser starts it fresh. Moving
-     lights are re-sent on every frame they move. If that shows up as shimmer on vehicle lights, see
-     section 8.
+   a map from bridge handle to runtime handle, which is the light's hash. Every handle of one light
+   therefore names the same runtime light, and destroying any of them erases it.
+   - **Remix Plus: update in place.** Its runtime applies a `CreateLight` at once, with a hash it
+     already has overwriting that light (`LightManager::addExternalLight`) and keeping its temporal
+     data. It registers every created light as persistent, lit each frame whether drawn or not. But
+     it holds a `DestroyLight` until Present and applies the erase at the start of the next frame.
+     Replacing a moving light (destroy the old, create a successor under a new hash) therefore left
+     the old one lit for a frame beside the new. Every moving car trailed a copy of its lights one
+     frame behind, and each successor was a new light to the denoiser, fading in from nothing.
+     Changed lights are now re-sent with `CreateLight` under the same hash (`UpdateLight` in
+     `dx9remix.cpp`). The superseded bridge handles are kept (about 40 bytes each in the bridge
+     server). After 120 updates, about two seconds of driving, the light moves to its next
+     generation's hash, and all the old handles are destroyed together. The retiring light is first
+     updated in place to no light at all, so the frame its erase waits for shows no ghost. A mock of
+     that runtime, a light moving a metre a frame: before, a second, stale light in 599 of 600
+     frames; after, none, with at most 121 bridge entries per light.
+   - **NVIDIA: destroy, then create under a new hash.** Its runtime erases on destroy and does not
+     replace a light on a repeated hash. Each light's hash carries a generation, bumped on every
+     re-send there (`LightHash`), so the old light's erase never touches its successor.
 7. **Lights must be drawn every frame.** Upstream clears its list of drawn API lights at the end of
    every frame. Remix Plus queues each draw and applies it at the start of the next frame, after
    that frame's erases. Drawing every live light every frame is right for both. A created light
@@ -224,6 +231,18 @@ street lamp or a tail lamp, which is small, bright and throws in all directions.
    by more than 3%, or `remixlightradius` changed. A parked car's tail lights and every street lamp
    are sent once and then only drawn.
 6. Draw every live light.
+
+All of this runs at the end of the 3D scene (`agiDX9Pipeline::EndScene`), not at the end of the
+frame. Remix path traces the frame at its first UI draw: an orthographic projection with depth
+writes off, or a texture in `rtx.uiTextures`, which the HUD normally is. `asCullManager::Update`
+draws every camera inside one scene and the HUD after it, so lights sent from `EndFrame` landed in
+the next frame, one frame's travel behind their lamps. `EndFrame` still sends them if a frame had
+no scene.
+
+A lamp is identified from frame to frame by its position in its owner's model space as well as by
+its predicted world position (`agiAddGlowLightRGB`), so frame-time jitter or a missed frame at
+speed no longer gives it a new identity and leaves the old light behind. A moving light whose
+sprite was not drawn this frame is not sent.
 
 The position is the last harvested one, never extrapolated. Submission runs after all of the
 frame's draws, so a light still being drawn is current. Pushing a fading light along its old
@@ -369,8 +388,8 @@ stubs both today (fact 4). When a Remix Plus bridge forwards them:
 - Add its table layout to `kBridgeLayouts` (its filled-slot mask changes the moment it fills a new
   field, so it is refused until then, which is the safe failure).
 - For that layout, re-send a changed light with `UpdateLightDefinition` on its existing handle
-  instead of destroy-and-create. The light keeps one hash and one identity, the denoiser keeps its
-  history, and the generation in the hash stops changing.
+  instead of the repeated `CreateLight` (fact 6). That mints no bridge handles, so the hash never
+  has to change.
 - Optionally drop the per-light `DrawLightInstance` loop for one `AutoInstancePersistentLights`
   call, if persistent registration is also forwarded. Measure first: per-light draws are cheap.
 
@@ -561,3 +580,62 @@ The loader, the migration and the tuning table were run on Linux against a copy 
 `Open1560-Shaders.ini`: settings land on their own lines, bad values are reported and leave earlier
 values alone, and outward offsets mirror correctly.
 
+
+---
+
+## 11. Wet roads
+
+`agidx9/dx9remixwet.cpp`. Remix Plus has no wetness of its own, and a D3D9 draw has no way to ask
+for it, so the layer is geometry added through the API: `CreateMaterial`, `CreateMesh` and
+`DrawInstance`, which every known bridge forwards.
+
+**The mask.** A tileable texture pair, generated by the game the first time a race needs it and
+cached in `Open1560_RemixWet\` under a name derived from every setting that changes the pixels:
+
+- **Albedo + opacity:** near-black water in puddles, a dark film where damp, and the wet mask in
+  alpha.
+- **Roughness:** 0.03 in puddles, 0.28 where damp.
+
+Uncompressed RGBA8 DDS with a full box-filtered mip chain (the albedo sRGB).
+
+The puddle field is periodic value-noise fBm, domain-warped by two more periodic fields so the
+shapes are irregular, and still seamless because the warp is added. Its threshold is read off the
+field's own histogram, so `remixwetcoverage` is the exact share of the tile under water at full
+wetness. Puddles grow from their deepest points as wetness rises, and a finer grain field makes the
+damp film uneven.
+
+The level is baked in rather than applied as a material constant: once the albedo texture has an
+alpha channel, Remix takes opacity from it and ignores `opacityConstant`
+(`opaque_surface_material_interaction.slangh`). The weather is fixed for a race, so that is one
+texture pair per race.
+
+**The geometry.** `agiMeshSet::DrawLitEnv` flags its hardware-path draws as ground
+(`agiNativeGroundDraw`, `agi/rsys.h`), and `MeshWorld` hands each to the layer. The first time a
+road piece is seen, its triangles facing up within `remixwetslope` become one API mesh:
+
+- world-space positions, lifted 5 mm, with an identity instance transform;
+- texture coordinates from world X and Z over `remixwettile`, so puddles stay put on the ground and
+  run continuously across road pieces;
+- keyed by a hash of the world matrix, positions and indices, so paged cells find their mesh again;
+- at most `remixwetmaxnew` (24) created per frame.
+
+Each frame a piece is drawn, its twin is drawn once as `DECAL_STATIC`, double-sided, from inside the
+road's own draw, so it is in the scene before the HUD can trigger Remix's path trace.
+
+**The material.** Alpha blended (`BlendType::kAlpha`) by the mask, alpha test `kAlways`, and
+repeat wrapping on both axes. `CreateMaterial` with a hash the runtime already holds is ignored
+("repeated material registration"), but meshes look their material up by handle at draw time. So
+if the level ever needed changing mid-race, destroying and re-creating the material under the same
+hash would update every piece.
+
+**Global gloss.** `rtx.legacyMaterial.roughnessConstant` is eased from `remixwetdryroughness` (0.7)
+toward `remixwetgloss` (0.45) by the wetness, since cars and buildings are wet too, and put back at
+`EndGfx`.
+
+**Lifetime.** Decided at the race's first ground draw, once the city has published its weather
+(`agiSkyEnv`). Everything is destroyed at `EndGfx`.
+
+**Limits:**
+- No notion of cover: roads under an overpass get wet too.
+- One repeating tile.
+- No animated ripples, which need runtime shader support.

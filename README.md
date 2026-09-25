@@ -104,8 +104,12 @@ These act on the world-space path, so they apply to this backend only.
 
 | Switch | Default | Effect |
 | --- | --- | --- |
+| `-d3d9meshcache <0/1>` | 1 | Keep world meshes on the GPU between frames. A mesh drawn twice is built once, copied into a managed vertex and index buffer, and drawn from there, instead of being rebuilt on the CPU and resent with `DrawIndexedPrimitiveUP` for every texture batch of every frame. Under Remix that also stops the whole city crossing the bridge and being hashed again each frame. Remix sees the same vertices and indices either way, so replacements keep working. The census line `DX9 MESHCACHE` reports how many world draws came from it. |
+| `-d3d9meshcachemb <n>` | 64 | Memory the mesh cache may use, in MB. When full, it drops the meshes drawn least recently. |
 | `-nocull` | off | Disable backface, LOD and distance culling. A path tracer wants closed shells; a back face it never receives is a hole light leaks through. |
 | `-smoothnormals <0/1>` | 1 | Rebuild smooth vertex normals in float. The engine stores normals as an index into a 198-entry table, coarse enough that a facet's corners often quantise to one direction and shade flat. |
+| `-geonormals <0/1/2>` | 2 | Where world vertex normals come from. A mesh has normals only if its baked `.bms` does, and most city scenery was shipped without them. Those went out with a straight-up filler normal, which RTX Remix shaded every wall with. The rest store one of 198 directions per corner, about 14 degrees apart, which shades curved panels in bands. `0` submits what was shipped; `1` rebuilds missing normals from the geometry; `2` rebuilds all of them (area-weighted, crease-aware, facing the way the engine's backface test does). The census line `DX9 NORMALS` reports coverage. |
+| `-geonormalangle <deg>` | 45 | Crease angle for the rebuild: faces meeting more sharply keep a hard edge. |
 | `-flatnormals` | off | Shade from facet geometry, ignoring stored vertex normals. |
 | `-nativecpucull` | off | Cull backfacing facets on the CPU. **Breaks Remix hash stability.** |
 | `-pedskin` | off | Skin pedestrians on the CPU. **Breaks Remix hash stability.** |
@@ -147,7 +151,8 @@ does and does not forward to a 32-bit game, and the phases still to come are in
 | `-remixlightpower <f>` | 1.5 | Overall brightness of those lights. The `-light*` multipliers below scale on top of it. |
 | `-remixlightradius <f>` | 0.15 | Size of each light's emitter, in world units. Brightness does not depend on it; it sets how soft the shadows are. |
 | `-remixmaxlights <n>` | 192 | Most lights sent per frame; the brightest are kept. |
-| `-remixheadlights` | on | Send headlights as spot lights: one per lamp, placed at the lamp and aimed down the beam the game draws. |
+| `-remixheadlights` | on | Send headlights as spot lights: one per lamp, placed at the lamp and aimed down the beam the game draws. Covers the white flares on the front of vehicles too, so turning it off leaves no light at the headlamps. |
+| `-glowfrontheadlights` | on | Count white and warm flares on the front of a vehicle as headlights rather than street lamps or other glows. |
 | `-remixbeamsoftness <f>` | 0.3 | How gradual a headlight beam's edge is, 0 (hard) to 1. |
 | `-remixconfig <k=v\|...>` | none | Remix options (`rtx.conf` keys) applied once the API connects, separated by `\|`, e.g. `rtx.fallbackLightMode=0`. |
 | `-remixapidebug` | off | Log the first 64 lights as they are created. |
@@ -172,6 +177,26 @@ and restored afterwards. See [section 9 of the plan](docs/remix_api_plan.md#9-th
 | `-remixprecipitation <0/1>` | 0 | Remix Plus's own rain and snow. Hide the game's particle textures with Remix's texture tagging if you turn this on. |
 | `-remixsunrotation <f>` | 0 | Degrees added to the sun and moon azimuth. |
 
+**Wet roads.** While it rains, a puddle-and-damp layer is laid over the roads through the Remix
+API, and the path tracer reflects the city in it. The game generates the puddle pattern from noise
+(domain-warped, tiling, cached in `Open1560_RemixWet\`), and every road piece gets a world-space
+decal twin textured with it: roads, pavements, plazas and rooftops, anything upward-facing in the city's own world-space geometry. Standing water is near-black and mirror-smooth, damp tarmac a darker,
+glossier film. Everything else gets a little glossier too. Works on any bridge `-remixapi`
+connects to. Roads under cover get wet as well. See
+[section 11 of the plan](docs/remix_api_plan.md#11-wet-roads).
+
+| Switch | Default | Effect |
+| --- | --- | --- |
+| `-remixwet <0/1>` | 1 | Wet roads in wet weather (needs `-remixapi`). |
+| `-remixwetlevel <f>` | -1 | Wetness 0 to 1 in every weather, overriding the per-weather values; -1 follows the weather. |
+| `-remixwetrain`, `-remixwetsnow`, `-remixwetfog`, `-remixwetclear` | 1.0, 0.35, 0, 0 | Wetness for each game weather, 0 to 1. |
+| `-remixwetcoverage <f>` | 0.2 | Share of the road under standing water at full wetness. |
+| `-remixwettile <f>` | 64 | Size of the repeating puddle pattern, in world units. |
+| `-remixwetseed <n>` | 1 | Puddle pattern seed. |
+| `-remixwetpuddleroughness`, `-remixwetdamproughness` | 0.03, 0.28 | Roughness of standing water and of damp road. |
+| `-remixwetgloss <f>` | 0.45 | Remix's default roughness for game textures at full wetness (0 leaves it alone). |
+| `-remixwetdryroughness <f>` | 0.7 | The value it is put back to when the race ends. |
+
 A census line, `DX9 REMIXAPI`, reports live lights and how many were created, re-sent and destroyed
 every 120 frames.
 
@@ -186,7 +211,7 @@ warning about unknown keys, but nothing reads them at runtime: `-d3d9quality`, `
 
 The renderer writes a fully commented `Open1560_RemixAPI.ini` next to the executable on first run,
 organised around what the game sends to Remix: `[RemixAPI]`, `[GlowReach]`, one section per glow
-kind, `[RemixSky]`, `[Geometry]` and `[Debug]`. Keys outside the glow sections are the switches above,
+kind, `[RemixSky]`, `[RemixWet]`, `[Geometry]`, `[Performance]` and `[Debug]`. Keys outside the glow sections are the switches above,
 applied through the same mechanism, so the command line wins and a setting can be overridden for one
 run without editing the file. Delete it to regenerate it.
 

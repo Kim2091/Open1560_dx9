@@ -37,8 +37,10 @@
 
 #include "dx9bitmap.h"
 #include "dx9context.h"
+#include "dx9meshcache.h"
 #include "dx9remix.h"
 #include "dx9remixsky.h"
+#include "dx9remixwet.h"
 #include "dx9rsys.h"
 #include "dx9texdef.h"
 #include "dx9view.h"
@@ -269,6 +271,11 @@ void agiDX9Pipeline::EndGfx()
     agiSkyEnv.TimeOfDay = -1;
     agiSkyEnv.Weather = -1;
     agiDX9RemixSkyEndGfx();
+    agiDX9RemixWetEndGfx();
+
+    // Device buffers, and geometry of a city that is about to be freed. Before the context, which
+    // parks the device the buffers belong to.
+    agiDX9MeshCacheReleaseAll();
 
     // Same hazard, same reason: this borrows mmCullCity's sphere map, and the arena reset frees the
     // whole city underneath it. mmCullCity::Cull() republishes it for the next city.
@@ -311,6 +318,13 @@ void agiDX9Pipeline::BeginFrame()
     // (the Remix API); otherwise the set is empty and ageing it is pure cost.
     if (agiGlowHarvestEnabled)
         agiUpdateGlowLights();
+
+    remix_frame_sent_ = false;
+
+    agiDX9RemixWetBeginFrame();
+
+    // Makes room in the world mesh cache, if it needs it - the only point in a frame it may.
+    agiDX9MeshCacheBeginFrame();
 
     // Keeps the game's sky dome off while RTX Remix Plus draws the sky. See dx9remixsky.cpp.
     agiDX9RemixSkyBeginFrame();
@@ -419,6 +433,32 @@ void agiDX9Pipeline::EndScene()
     dx9_context_->GetDevice()->SetViewport(&viewport);
 
     agiPipeline::EndScene();
+
+    // The 3D part of the frame is over - every camera, the rear view mirror included, has drawn, so
+    // every glow has refreshed its registry slot - and the HUD is still to come. See SendRemixFrame.
+    SendRemixFrame();
+}
+
+// Sends this frame's Remix API lights and sky, once per frame, at the end of the 3D scene.
+//
+// NOT AT THE END OF THE FRAME. Remix path traces the frame the moment it meets its first UI draw
+// (d3d9_rtx.cpp, isRenderingUI: an orthographic projection with depth writes off, or a texture in
+// rtx.uiTextures - and tagging the HUD's textures as UI is a normal part of setting a game up), and
+// only falls back to Present when there is none. Everything sent after that point is applied to the
+// NEXT frame. asCullManager::Update draws all the 3D inside one BeginScene/EndScene and the HUD,
+// text and minimap after it, so lights sent from EndFrame arrived one frame late whenever the HUD
+// triggered the path trace: every light one frame's travel behind its lamp, which at speed is a
+// metre or more - the "lights fall behind when you speed up" that survived the tracking fixes.
+//
+// EndScene is the last point where everything the lights describe has been drawn and nothing that
+// can trigger the path trace has. EndFrame still calls this, for frames with no scene at all.
+void agiDX9Pipeline::SendRemixFrame()
+{
+    if (std::exchange(remix_frame_sent_, true))
+        return;
+
+    agiDX9RemixApiSubmitFrame();
+    agiDX9RemixSkyEndFrame();
 }
 
 void agiDX9Pipeline::EndFrame()
@@ -474,11 +514,8 @@ void agiDX9Pipeline::EndFrame()
     if (std::exchange(d3d_scene_active_, false))
         device->EndScene();
 
-    // Remix API lights for this frame. After every draw, so each glow drawn this frame has already
-    // refreshed its registry slot and is sent where it is now rather than where it was last frame;
-    // before Present, because Present is where Remix ends the frame and clears its drawn lights.
-    agiDX9RemixApiSubmitFrame();
-    agiDX9RemixSkyEndFrame();
+    // Normally already sent from EndScene - see SendRemixFrame. This covers a frame without a scene.
+    SendRemixFrame();
 
     dx9_context_->Present();
 
@@ -538,6 +575,20 @@ void agiDX9Pipeline::EndFrame()
 
             agiDX9DumpAttribution();
             agiDX9RemixApiLogStats(census_frames);
+            agiDX9RemixWetLogStats(census_frames);
+            // Where the submitted vertex normals came from. See -geonormals in agiworld/meshrend.cpp.
+            // "against stored" should stay at or near zero: it counts meshes whose own stored normals
+            // disagreed with the winding the rebuild takes as outward.
+            Displayf("DX9 NORMALS: frame=%u draws without stored normals=%u/%u | since last: rebuilt from geometry=%u "
+                     "meshes (%u against stored, %u too large)",
+                census_frames, agiMeshNormalDrawsFlat, agiMeshNormalDraws, agiMeshGeoNormalBuilds,
+                agiMeshGeoNormalFlips, agiMeshGeoNormalSkipped);
+
+            agiMeshGeoNormalBuilds = 0;
+            agiMeshGeoNormalFlips = 0;
+            agiMeshGeoNormalSkipped = 0;
+
+            agiDX9MeshCacheLogStats(census_frames, agiDX9Census.WorldCachedCalls, agiDX9Census.WorldCalls);
         }
 
         agiDX9Census = {};
